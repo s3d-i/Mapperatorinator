@@ -237,7 +237,7 @@ class Processor(object):
         out_context_data = self.get_out_context(
             out_context=gen_out_context,
             generation_config=generation_config,
-            given_context=in_context,
+            given_context=gen_in_context,
             beatmap_path=beatmap_path,
             extra_in_context=extra_in_context,
             song_length=song_length,
