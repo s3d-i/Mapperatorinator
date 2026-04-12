@@ -101,6 +101,14 @@ def compile_device_and_seed(args: InferenceConfig, verbose=True):
         print(message)
 
     message = None
+    if args.precision == "bf16" and args.device != "cuda":
+        message = f"Precision bf16 is not supported on {args.device}. Falling back to fp32."
+        args.precision = "fp32"
+
+    if verbose and message is not None:
+        print(message)
+
+    message = None
     if args.attn_implementation == "auto":
         if args.precision in ("bf16", "fp16") and args.device == "cuda" and is_flash_attn_2_available():
             message = "Using Flash Attention for attention (auto-selected)."
