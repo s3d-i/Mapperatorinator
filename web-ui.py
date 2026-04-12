@@ -170,6 +170,9 @@ class Api:
 processes = {}
 cancelled_jobs = set()
 process_lock = threading.Lock()
+# CUDA cannot be safely used from forked subprocesses.
+# Use an explicit spawn context for all inference worker processes.
+MP_CTX = mp.get_context("spawn")
 
 
 def _ensure_inference_server(args):
@@ -401,8 +404,8 @@ def start_inference():
 
     # Spawn the worker process.
     try:
-        q = mp.Queue()
-        p = mp.Process(target=_inference_worker, args=(cfg, q), daemon=True)
+        q = MP_CTX.Queue()
+        p = MP_CTX.Process(target=_inference_worker, args=(cfg, q), daemon=True)
         p.start()
 
         with process_lock:
