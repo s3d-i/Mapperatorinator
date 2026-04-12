@@ -31,12 +31,60 @@ class SuperTimingGenerator:
         self.bpm_change_threshold = args.timer_bpm_threshold
         self.types_first = args.train.data.types_first
         self.iterations = args.timer_iterations
+        self.dynamic_iterations = getattr(args, "timer_dynamic_iterations", True)
+        self.min_iterations = getattr(args, "timer_min_iterations", 8)
+        self.check_interval = getattr(args, "timer_check_interval", 2)
+        self.stability_tolerance = getattr(args, "timer_stability_tolerance", 12)
+        self.stability_patience = getattr(args, "timer_stability_patience", 2)
 
         self.frame_seq_len = args.train.data.src_seq_len - 1
         self.frame_size = args.train.model.spectrogram.hop_length
         self.sample_rate = args.train.model.spectrogram.sample_rate
         self.samples_per_sequence = self.frame_seq_len * self.frame_size
         self.miliseconds_per_sequence = self.samples_per_sequence * MILISECONDS_PER_SECOND / self.sample_rate
+
+    @staticmethod
+    def _nearest_peak_distances(reference_peaks: np.ndarray, candidate_peaks: np.ndarray) -> np.ndarray:
+        if len(reference_peaks) == 0 or len(candidate_peaks) == 0:
+            return np.array([], dtype=np.float32)
+
+        idx = np.searchsorted(reference_peaks, candidate_peaks, side="left")
+        left = np.full(len(candidate_peaks), np.inf, dtype=np.float32)
+        right = np.full(len(candidate_peaks), np.inf, dtype=np.float32)
+
+        has_left = idx > 0
+        if np.any(has_left):
+            left[has_left] = candidate_peaks[has_left] - reference_peaks[idx[has_left] - 1]
+
+        has_right = idx < len(reference_peaks)
+        if np.any(has_right):
+            right[has_right] = reference_peaks[idx[has_right]] - candidate_peaks[has_right]
+
+        return np.minimum(np.abs(left), np.abs(right))
+
+    def _timing_peaks(self, beats_hist: np.ndarray, measures_hist: np.ndarray, timing_points_hist: np.ndarray, iterations: int) -> np.ndarray:
+        if iterations <= 0:
+            return np.array([], dtype=np.int32)
+
+        beats = gaussian_filter1d(beats_hist.astype(float), 10) / iterations * 50
+        measures = gaussian_filter1d(measures_hist.astype(float), 10) / iterations * 50
+        timing_points = gaussian_filter1d(timing_points_hist.astype(float), 10) / iterations * 50
+        signal = beats + measures + timing_points * 2
+        peakind, _ = find_peaks(signal, distance=50, prominence=0.1, rel_height=1, width=2, wlen=50)
+        return peakind
+
+    def _is_converged(self, previous_peaks: np.ndarray, current_peaks: np.ndarray) -> tuple[bool, float, float]:
+        if len(previous_peaks) == 0 or len(current_peaks) == 0:
+            return False, float("inf"), 1.0
+
+        nearest = self._nearest_peak_distances(previous_peaks, current_peaks)
+        if len(nearest) == 0:
+            return False, float("inf"), 1.0
+
+        median_shift = float(np.median(nearest))
+        peak_count_delta = abs(len(current_peaks) - len(previous_peaks)) / max(len(current_peaks), len(previous_peaks))
+        converged = median_shift <= self.stability_tolerance and peak_count_delta <= 0.1
+        return converged, median_shift, float(peak_count_delta)
 
     def generate(
             self,
@@ -55,9 +103,15 @@ class SuperTimingGenerator:
         if verbose:
             print("Generating timing")
 
-        iterations = self.iterations
-        iterator = tqdm(list(range(iterations))) if verbose else range(iterations)
-        for _ in iterator:
+        max_iterations = max(1, self.iterations)
+        min_iterations = min(max_iterations, max(1, self.min_iterations))
+        check_interval = max(1, self.check_interval)
+        stable_streak = 0
+        previous_peaks = np.array([], dtype=np.int32)
+        effective_iterations = 0
+
+        iterator = tqdm(range(max_iterations)) if verbose else range(max_iterations)
+        for iteration in iterator:
             audio_offset = np.random.randint(-(self.miliseconds_per_sequence // 2), self.miliseconds_per_sequence // 2)
             begin_pad = max(0, audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
             begin_remove = max(0, -audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
@@ -107,10 +161,36 @@ class SuperTimingGenerator:
                 last_beat_time = time
                 last_group_type = group.event_type
 
+            effective_iterations = iteration + 1
+            if (self.dynamic_iterations and
+                    effective_iterations >= min_iterations and
+                    (effective_iterations % check_interval == 0 or effective_iterations == max_iterations)):
+                current_peaks = self._timing_peaks(beats_hist, measures_hist, timing_points_hist, effective_iterations)
+                converged, median_shift, peak_count_delta = self._is_converged(previous_peaks, current_peaks)
+                stable_streak = stable_streak + 1 if converged else 0
+
+                if verbose:
+                    print(
+                        "Super timing convergence "
+                        f"iter={effective_iterations}/{max_iterations} "
+                        f"peaks={len(current_peaks)} "
+                        f"shift_median_ms={median_shift:.2f} "
+                        f"peak_count_delta={peak_count_delta:.3f} "
+                        f"stable_streak={stable_streak}/{self.stability_patience}"
+                    )
+
+                previous_peaks = current_peaks
+
+                if stable_streak >= self.stability_patience:
+                    if verbose:
+                        print(f"Super timing early stop at iteration {effective_iterations}/{max_iterations}")
+                    break
+
         # Smooth and normalize histograms
-        beats_hist = gaussian_filter1d(beats_hist.astype(float), 10) / iterations * 50
-        measures_hist = gaussian_filter1d(measures_hist.astype(float), 10) / iterations * 50
-        timing_points_hist = gaussian_filter1d(timing_points_hist.astype(float), 10) / iterations * 50
+        effective_iterations = max(1, effective_iterations)
+        beats_hist = gaussian_filter1d(beats_hist.astype(float), 10) / effective_iterations * 50
+        measures_hist = gaussian_filter1d(measures_hist.astype(float), 10) / effective_iterations * 50
+        timing_points_hist = gaussian_filter1d(timing_points_hist.astype(float), 10) / effective_iterations * 50
 
         # Sort the ticks per beats points
         tpbs = sorted(tpbs, key=lambda x: x[0])

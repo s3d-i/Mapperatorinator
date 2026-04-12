@@ -71,6 +71,11 @@ class InferenceConfig:
     timer_bpm_threshold: float = 0.7  # Threshold requirement for BPM change in timer, higher values will result in less BPM changes
     timer_cfg_scale: float = 1.0  # Scale of classifier-free guidance for timer
     timer_iterations: int = 20  # Number of iterations for timer
+    timer_dynamic_iterations: bool = True  # Early-stop timer iterations when timing peaks converge
+    timer_min_iterations: int = 8  # Minimum number of timer iterations before early-stop can trigger
+    timer_check_interval: int = 2  # Run timer convergence checks every N iterations
+    timer_stability_tolerance: int = 12  # Peak median shift threshold in milliseconds for timer convergence
+    timer_stability_patience: int = 2  # Consecutive stable convergence checks required to early-stop
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     resnap_events: bool = True  # Resnap notes to the timing after generation
