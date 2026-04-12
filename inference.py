@@ -7,6 +7,7 @@ import uuid
 from functools import reduce
 from pathlib import Path
 import random
+import time
 
 import hydra
 import torch
@@ -396,6 +397,21 @@ def generate(
         verbose=True,
         logger=None,
 ):
+    perf_levels = {"off": 0, "basic": 1, "detailed": 2}
+
+    def normalize_perf_level(level: str) -> str:
+        level = str(level).lower()
+        return level if level in perf_levels else "basic"
+
+    perf_level = normalize_perf_level(getattr(args, "perf_log_level", "basic"))
+
+    def perf_enabled(level: str = "basic") -> bool:
+        return verbose and perf_levels[perf_level] >= perf_levels[level]
+
+    def context_list_string(contexts: list[ContextType]) -> str:
+        return ",".join(context.value if isinstance(context, ContextType) else str(context) for context in contexts)
+
+    total_start = time.perf_counter()
     audio_path = args.audio_path if audio_path is None else audio_path
     beatmap_path = args.beatmap_path if beatmap_path is None else beatmap_path
     output_path = args.output_path if output_path is None else output_path
@@ -416,23 +432,55 @@ def generate(
     processor = Processor(args, model, tokenizer)
     postprocessor = Postprocessor(args, logger=logger)
 
+    if perf_enabled("basic"):
+        logger.info(
+            "[perf] run "
+            f"device={args.device} precision={args.precision} attn={args.attn_implementation} "
+            f"perf={perf_level} "
+            f"super_timing={args.super_timing} parallel={args.parallel} max_batch_size={args.max_batch_size} "
+            f"in=[{context_list_string(args.in_context)}] out=[{context_list_string(args.output_type)}] "
+            f"gamemode={args.gamemode} keycount={args.keycount}"
+        )
+
+    audio_start = time.perf_counter()
     audio = preprocessor.load(audio_path)
+    audio_ms = (time.perf_counter() - audio_start) * 1000
+    if perf_enabled("detailed"):
+        logger.info(f"[perf] audio_load_ms={audio_ms:.1f} samples={len(audio)}")
+
+    segment_start = time.perf_counter()
     sequences = preprocessor.segment(audio)
+    segment_ms = (time.perf_counter() - segment_start) * 1000
+    if perf_enabled("basic"):
+        logger.info(
+            "[perf] segment "
+            f"ms={segment_ms:.1f} seq_count={len(sequences[0])} "
+            f"window_ms={preprocessor.miliseconds_per_sequence:.1f} stride_ms={preprocessor.miliseconds_per_stride:.1f}"
+        )
+
     extra_in_context = {}
     output_type = args.output_type.copy()
 
     # Auto generate timing if not provided in in_context and required for the model and this output_type
     timing_events, timing_times, timing = None, None, None
     if args.super_timing and ContextType.NONE in args.in_context:
+        timing_start = time.perf_counter()
         super_timing_generator = SuperTimingGenerator(args, model, tokenizer)
         timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
         timing = postprocessor.generate_timing(timing_events)
+        timing_ms = (time.perf_counter() - timing_start) * 1000
+        if perf_enabled("basic"):
+            logger.info(
+                "[perf] timing_source=super_timing "
+                f"ms={timing_ms:.1f} timing_events={len(timing_events)} timing_points={len(timing)}"
+            )
         extra_in_context[ContextType.TIMING] = timing
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
     elif (ContextType.NONE in args.in_context and ContextType.MAP in output_type and
           not any((ContextType.NONE in ctx["in"] or len(ctx["in"]) == 0) and ContextType.MAP in ctx["out"] for ctx in
                   args.train.data.context_types)):
+        timing_start = time.perf_counter()
         # Generate timing and convert in_context to timing context
         timing_events, timing_times = processor.generate(
             sequences=sequences,
@@ -443,6 +491,12 @@ def generate(
         )[0]
         timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
         timing = postprocessor.generate_timing(timing_events)
+        timing_ms = (time.perf_counter() - timing_start) * 1000
+        if perf_enabled("basic"):
+            logger.info(
+                "[perf] timing_source=model "
+                f"ms={timing_ms:.1f} timing_events={len(timing_events)} timing_points={len(timing)}"
+            )
         extra_in_context[ContextType.TIMING] = timing
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
@@ -450,9 +504,12 @@ def generate(
             args.train.data.add_timing and any(t in args.in_context for t in [ContextType.GD, ContextType.NO_HS])):
         # Exact timing is provided in the other beatmap, so we don't need to generate it
         timing = [tp for tp in Beatmap.from_path(Path(beatmap_path)).timing_points if tp.parent is None]
+        if perf_enabled("basic"):
+            logger.info(f"[perf] timing_source=reference timing_points={len(timing)}")
 
     # Generate beatmap
     if len(output_type) > 0:
+        generation_start = time.perf_counter()
         result = processor.generate(
             sequences=sequences,
             generation_config=generation_config,
@@ -462,20 +519,40 @@ def generate(
             extra_in_context=extra_in_context,
             verbose=verbose,
         )
+        generation_ms = (time.perf_counter() - generation_start) * 1000
+        if perf_enabled("basic"):
+            logger.info(
+                "[perf] main_generate "
+                f"ms={generation_ms:.1f} out=[{context_list_string(output_type)}] context_count={len(result)}"
+            )
 
         events, _ = reduce(merge_events, result)
+        if perf_enabled("detailed"):
+            logger.info(f"[perf] merge_events total_events={len(events)}")
 
         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
+            timing_from_events_start = time.perf_counter()
             timing = postprocessor.generate_timing(events)
+            timing_from_events_ms = (time.perf_counter() - timing_from_events_start) * 1000
+            if perf_enabled("detailed"):
+                logger.info(
+                    "[perf] timing_source=postprocessor "
+                    f"ms={timing_from_events_ms:.1f} timing_points={len(timing)}"
+                )
 
         # Resnap timing events
         if args.resnap_events and timing is not None:
+            resnap_start = time.perf_counter()
             events = postprocessor.resnap_events(events, timing)
+            resnap_ms = (time.perf_counter() - resnap_start) * 1000
+            if perf_enabled("detailed"):
+                logger.info(f"[perf] resnap_ms={resnap_ms:.1f}")
     else:
         events = timing_events
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
+        diffusion_start = time.perf_counter()
         diffusion_pipeline = DiffisionPipeline(args, diff_model, diff_tokenizer, refine_model)
         events = diffusion_pipeline.generate(
             events=events,
@@ -483,35 +560,57 @@ def generate(
             timing=timing,
             verbose=verbose,
         )
+        diffusion_ms = (time.perf_counter() - diffusion_start) * 1000
+        if perf_enabled("basic"):
+            logger.info(f"[perf] diffusion_ms={diffusion_ms:.1f}")
 
+    postprocess_start = time.perf_counter()
     result = postprocessor.generate(
         events=events,
         beatmap_config=beatmap_config,
         timing=timing,
     )
+    postprocess_ms = (time.perf_counter() - postprocess_start) * 1000
+    if perf_enabled("basic"):
+        logger.info(f"[perf] postprocess_ms={postprocess_ms:.1f}")
 
     if args.add_to_beatmap:
+        merge_start = time.perf_counter()
         result = postprocessor.add_to_beatmap(result, beatmap_path)
-        if verbose:
+        merge_ms = (time.perf_counter() - merge_start) * 1000
+        if perf_enabled("basic"):
             logger.info(f"Merged generated content with reference beatmap")
+        if perf_enabled("detailed"):
+            logger.info(f"[perf] merge_with_reference_ms={merge_ms:.1f}")
 
     result_path = None
     osz_path = None
+    io_ms = 0.0
 
     if output_path is not None and output_path != "":
+        io_start = time.perf_counter()
         if args.add_to_beatmap and args.overwrite_reference_beatmap:
             result_path = beatmap_path
         else:
             result_path = os.path.join(output_path, f"beatmap{str(uuid.uuid4().hex)}.osu")
         postprocessor.write_result(result, result_path)
+        io_ms += (time.perf_counter() - io_start) * 1000
         if verbose:
             logger.info(f"Generated beatmap saved to {result_path}")
 
     if args.export_osz:
+        io_start = time.perf_counter()
         osz_path = os.path.join(output_path, f"beatmap{str(uuid.uuid4().hex)}.osz")
         postprocessor.export_osz(result_path, audio_path, osz_path, args.background)
+        io_ms += (time.perf_counter() - io_start) * 1000
         if verbose:
             logger.info(f"Generated .osz saved to {osz_path}")
+
+    if perf_enabled("basic"):
+        total_ms = (time.perf_counter() - total_start) * 1000
+        if perf_enabled("detailed"):
+            logger.info(f"[perf] io_ms={io_ms:.1f}")
+        logger.info(f"[perf] total_ms={total_ms:.1f}")
 
     return result, result_path, osz_path
 

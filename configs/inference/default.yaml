@@ -63,6 +63,7 @@ timer_min_iterations: 8  # Minimum number of timer iterations before early-stop 
 timer_check_interval: 2  # Run timer convergence checks every N iterations
 timer_stability_tolerance: 12  # Peak median shift threshold in milliseconds for timer convergence
 timer_stability_patience: 2  # Consecutive stable convergence checks required to early-stop
+perf_log_level: "basic"  # Perf logs verbosity (off/basic/detailed)
 use_server: false        # Use server for optimized multiprocess inference (adds about 8% overhead)
 max_batch_size: 16       # Maximum batch size for inference
 resnap_events: true      # Resnap events to the timing after generation

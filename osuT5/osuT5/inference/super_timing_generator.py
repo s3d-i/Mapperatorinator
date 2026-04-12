@@ -1,5 +1,6 @@
 import numpy as np
 import numpy.typing as npt
+import time
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 from tqdm import tqdm
@@ -36,12 +37,24 @@ class SuperTimingGenerator:
         self.check_interval = getattr(args, "timer_check_interval", 2)
         self.stability_tolerance = getattr(args, "timer_stability_tolerance", 12)
         self.stability_patience = getattr(args, "timer_stability_patience", 2)
+        self.perf_log_level = self._normalize_perf_level(getattr(args, "perf_log_level", "basic"))
 
         self.frame_seq_len = args.train.data.src_seq_len - 1
         self.frame_size = args.train.model.spectrogram.hop_length
         self.sample_rate = args.train.model.spectrogram.sample_rate
         self.samples_per_sequence = self.frame_seq_len * self.frame_size
         self.miliseconds_per_sequence = self.samples_per_sequence * MILISECONDS_PER_SECOND / self.sample_rate
+
+    @staticmethod
+    def _normalize_perf_level(level: str) -> str:
+        level = str(level).lower()
+        if level in {"off", "basic", "detailed"}:
+            return level
+        return "basic"
+
+    def _perf_enabled(self, level: str, verbose: bool) -> bool:
+        levels = {"off": 0, "basic": 1, "detailed": 2}
+        return verbose and levels[self.perf_log_level] >= levels[level]
 
     @staticmethod
     def _nearest_peak_distances(reference_peaks: np.ndarray, candidate_peaks: np.ndarray) -> np.ndarray:
@@ -92,6 +105,7 @@ class SuperTimingGenerator:
             generation_config: GenerationConfig,
             verbose: bool = False,
     ):
+        total_start = time.perf_counter()
         # Prepare beat histograms
         num_miliseconds = len(audio) * MILISECONDS_PER_SECOND // self.sample_rate
         beats_hist = np.zeros([num_miliseconds], dtype=int)
@@ -109,13 +123,22 @@ class SuperTimingGenerator:
         stable_streak = 0
         previous_peaks = np.array([], dtype=np.int32)
         effective_iterations = 0
+        segment_total_ms = 0.0
+        model_total_ms = 0.0
+        grouping_total_ms = 0.0
 
         iterator = tqdm(range(max_iterations)) if verbose else range(max_iterations)
         for iteration in iterator:
+            iteration_start = time.perf_counter()
             audio_offset = np.random.randint(-(self.miliseconds_per_sequence // 2), self.miliseconds_per_sequence // 2)
             begin_pad = max(0, audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
             begin_remove = max(0, -audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
+            segment_start = time.perf_counter()
             sequences = self.preprocessor.segment(audio[begin_remove:], begin_pad, 0)
+            segment_ms = (time.perf_counter() - segment_start) * 1000
+            segment_total_ms += segment_ms
+
+            model_start = time.perf_counter()
             events, _ = self.processor.generate(
                 sequences=sequences,
                 generation_config=generation_config,
@@ -123,7 +146,13 @@ class SuperTimingGenerator:
                 out_context=[ContextType.MAP] if self.args.train.data.add_timing else [ContextType.TIMING],
                 verbose=False,
             )[0]
+            model_ms = (time.perf_counter() - model_start) * 1000
+            model_total_ms += model_ms
+
+            grouping_start = time.perf_counter()
             groups, _ = get_groups(events, types_first=self.types_first)
+            grouping_ms = (time.perf_counter() - grouping_start) * 1000
+            grouping_total_ms += grouping_ms
             last_beat_time = None
             last_group_type = None
             last_measure_time = None
@@ -168,12 +197,18 @@ class SuperTimingGenerator:
                 current_peaks = self._timing_peaks(beats_hist, measures_hist, timing_points_hist, effective_iterations)
                 converged, median_shift, peak_count_delta = self._is_converged(previous_peaks, current_peaks)
                 stable_streak = stable_streak + 1 if converged else 0
+                iteration_ms = (time.perf_counter() - iteration_start) * 1000
 
-                if verbose:
+                if self._perf_enabled("detailed", verbose):
                     print(
-                        "Super timing convergence "
+                        "[perf][super_timing] convergence "
                         f"iter={effective_iterations}/{max_iterations} "
                         f"peaks={len(current_peaks)} "
+                        f"seqs={len(sequences[0])} "
+                        f"iter_ms={iteration_ms:.1f} "
+                        f"segment_ms={segment_ms:.1f} "
+                        f"model_ms={model_ms:.1f} "
+                        f"group_ms={grouping_ms:.1f} "
                         f"shift_median_ms={median_shift:.2f} "
                         f"peak_count_delta={peak_count_delta:.3f} "
                         f"stable_streak={stable_streak}/{self.stability_patience}"
@@ -182,10 +217,11 @@ class SuperTimingGenerator:
                 previous_peaks = current_peaks
 
                 if stable_streak >= self.stability_patience:
-                    if verbose:
-                        print(f"Super timing early stop at iteration {effective_iterations}/{max_iterations}")
+                    if self._perf_enabled("basic", verbose):
+                        print(f"[perf][super_timing] early_stop iter={effective_iterations}/{max_iterations}")
                     break
 
+        analysis_start = time.perf_counter()
         # Smooth and normalize histograms
         effective_iterations = max(1, effective_iterations)
         beats_hist = gaussian_filter1d(beats_hist.astype(float), 10) / effective_iterations * 50
@@ -403,6 +439,20 @@ class SuperTimingGenerator:
 
             event_times.append(beat_time)
             event_times.append(beat_time)
+
+        analysis_ms = (time.perf_counter() - analysis_start) * 1000
+        total_ms = (time.perf_counter() - total_start) * 1000
+        if self._perf_enabled("basic", verbose):
+            print(
+                "[perf][super_timing] summary "
+                f"iterations={effective_iterations}/{max_iterations} "
+                f"segment_ms={segment_total_ms:.1f} "
+                f"model_ms={model_total_ms:.1f} "
+                f"group_ms={grouping_total_ms:.1f} "
+                f"analysis_ms={analysis_ms:.1f} "
+                f"total_ms={total_ms:.1f} "
+                f"peaks={len(peakind)} beats={len(beat_times)} events={len(events)}"
+            )
 
         # # plot beats+measures+timing_points histograms
         # import matplotlib as mpl

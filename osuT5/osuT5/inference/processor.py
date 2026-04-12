@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+import time
 
 import rosu_pp_py as rosu
 import numpy as np
@@ -159,6 +160,18 @@ class Processor(object):
 
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
+        self.perf_log_level = self._normalize_perf_level(getattr(args, "perf_log_level", "basic"))
+
+    @staticmethod
+    def _normalize_perf_level(level: str) -> str:
+        level = str(level).lower()
+        if level in {"off", "basic", "detailed"}:
+            return level
+        return "basic"
+
+    def _perf_enabled(self, level: str, verbose: bool) -> bool:
+        levels = {"off": 0, "basic": 1, "detailed": 2}
+        return verbose and levels[self.perf_log_level] >= levels[level]
 
     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
         generate_kwargs2 = generate_kwargs | dict(
@@ -219,6 +232,9 @@ class Processor(object):
             events: List of Event object lists.
             event_times: Corresponding event times of Event object lists in miliseconds.
         """
+        requested_in_context = in_context or []
+        requested_out_context = out_context or []
+
         gen_in_context, gen_out_context, req_special_tokens = self._get_viable_template(
             in_context=in_context,
             out_context=out_context,
@@ -243,6 +259,14 @@ class Processor(object):
             song_length=song_length,
             verbose=verbose,
         )
+        if self._perf_enabled("detailed", verbose):
+            context_to_str = lambda contexts: ",".join(context.value for context in contexts)
+            print(
+                "[perf][processor] template "
+                f"mode={'parallel' if self.parallel else 'sequential'} seq_count={len(sequences[0])} "
+                f"in_req=[{context_to_str(requested_in_context)}] in_gen=[{context_to_str(gen_in_context)}] "
+                f"out_req=[{context_to_str(requested_out_context)}] out_gen=[{context_to_str(gen_out_context)}]"
+            )
 
         # Start generation
         inputs = dict(
@@ -322,11 +346,14 @@ class Processor(object):
             verbose: bool = True,
     ):
         song_length = sequences[2]
+        window_count = len(sequences[0])
 
         for i, context in enumerate(out_context):
             if context["finished"]:
                 continue
 
+            context_start = time.perf_counter()
+            events_before = len(context["events"])
             if verbose:
                 print(f"Generating {context['context_type'].value}")
             iterator = tqdm(list(zip(*sequences[:2]))) if verbose else zip(*sequences[:2])
@@ -368,6 +395,14 @@ class Processor(object):
                 # Only support batch size 1
                 predicted_tokens = result[0, max_len:].cpu()
                 self.add_predicted_tokens_to_context(context, predicted_tokens, frame_time, trim_lookback, trim_lookahead)
+
+            if self._perf_enabled("basic", verbose):
+                context_ms = (time.perf_counter() - context_start) * 1000
+                print(
+                    "[perf][processor][sequential] "
+                    f"context={context['context_type'].value} windows={window_count} "
+                    f"events_added={len(context['events']) - events_before} ms={context_ms:.1f}"
+                )
 
     def generate_parallel(
             self,
@@ -697,17 +732,20 @@ class Processor(object):
             model_kwargses: list[dict[str, torch.Tensor]],
             verbose: bool = True,
     ):
+        inference_start = time.perf_counter()
         cond_prompt, uncond_prompt, max_len = self.stack_prompts(cond_prompts, uncond_prompts)
 
         # Split prompts and uncond_prompt into batches
         max_batch_size = max(1, self.max_batch_size // self.num_beams // (2 if self.cfg_scale > 1 else 1))
         num_samples = cond_prompt.size(0)
         model_kwarg_keys = list(model_kwargses[0].keys())
+        batch_count = 0
 
         # Process each batch
         iterator = tqdm(list(range(0, num_samples, max_batch_size))) if verbose else range(0, num_samples,
                                                                                            max_batch_size)
         for i in iterator:
+            batch_count += 1
             frames_batch = frames[i:i + max_batch_size]
             cond_prompt_batch = cond_prompt[i:i + max_batch_size]
             uncond_prompt_batch = uncond_prompt[i:i + max_batch_size] if uncond_prompt is not None else None
@@ -728,6 +766,14 @@ class Processor(object):
             )
 
             yield result
+
+        if self._perf_enabled("basic", verbose):
+            inference_ms = (time.perf_counter() - inference_start) * 1000
+            print(
+                "[perf][processor][parallel] "
+                f"samples={num_samples} max_batch_size={max_batch_size} batches={batch_count} "
+                f"prompt_len={max_len} ms={inference_ms:.1f}"
+            )
 
         torch.cuda.empty_cache()
 

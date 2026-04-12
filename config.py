@@ -76,6 +76,7 @@ class InferenceConfig:
     timer_check_interval: int = 2  # Run timer convergence checks every N iterations
     timer_stability_tolerance: int = 12  # Peak median shift threshold in milliseconds for timer convergence
     timer_stability_patience: int = 2  # Consecutive stable convergence checks required to early-stop
+    perf_log_level: str = "basic"  # Perf logs verbosity (off/basic/detailed)
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     resnap_events: bool = True  # Resnap notes to the timing after generation
