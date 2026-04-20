@@ -402,6 +402,19 @@ This rule is enforced both:
 - in tokenization
 - in constrained decode masks
 
+When the decoder is in a state that expects `TS`, each legal `TS_x` must satisfy:
+
+```text
+0 <= current_time_rel + pending_delta + x < write_duration
+```
+
+That is, every emitted `TS` must still leave the potential next `EV` inside the current write region.
+
+If no `TS` token is legal under this bound:
+
+- `EOS` becomes the only legal continuation when grammar allows `EOS`
+- otherwise decoding must continue through the non-`TS` legal path defined by the FSM
+
 ### Decoder FSM
 
 The constrained decoder must track at least:
@@ -429,6 +442,8 @@ Core transition rules:
 7. `EV` must respect lane legality under current `open_hold_mask`
 8. after `EV`, update `open_hold_mask`
 9. TS canonical decomposition must be enforced by the decode mask
+10. when a state expects `TS`, the TS legality mask must prevent pending time from pushing the next possible event outside `[0, write_duration)`
+11. if no `TS` is legal and grammar permits `EOS`, `EOS` is the only legal continuation
 
 ### Max Decode Length Handling
 
@@ -523,11 +538,42 @@ Rules:
 - extrapolation outside audio bounds follows the nearest red timing point
 - extrapolation must not create fake `timing_change_pulse`
 
+## Audio Representation
+
+Stage 1 caches canonical 10ms log-mel features and derives model input frames deterministically from that cache.
+
+### Canonical Cached Features
+
+- sample rate: `16k`
+- mel bins: `80`
+- hop: `10ms`
+- cached feature type: log-mel
+
+The cached 10ms log-mel representation is the only canonical audio feature cache for Stage 1.
+
+### Deterministic 20ms Encoder Frames
+
+The encoder consumes 20ms audio frames produced by deterministic pair packing from the cached 10ms mel sequence.
+
+For adjacent 10ms mel frames `m_t` and `m_{t+1}`:
+
+```text
+packed_audio_frame_t = concat(m_t, m_{t+1})
+```
+
+Therefore:
+
+- each packed frame covers exactly `20ms`
+- each packed frame is `160` dimensions wide
+- packing order is fixed and must be consistent across train/val/infer
+
+This is not a learned downsampling layer. It is a deterministic representation transform.
+
 ## Model Architecture
 
 Stage 1 uses a shared fused encoder:
 
-- audio frame projection
+- audio frame projection from packed 160-dim audio frames via a learned `Linear(160 -> d_model)`
 - timing frame projection
 - broadcast difficulty embedding
 - fused frame projection
