@@ -601,7 +601,7 @@ Cache directories must encode config/version identity, for example:
 
 - `cache/mel_sr16000_hop10_mel80_v1/`
 - `cache/timing_track_20ms_8ch_sigma30_v1/`
-- `cache/mapper_tokens_4k_2to6_ts10_1000_6state_v1/`
+- `cache/mapper_tokens_4k_2to6_ts10_1000_4state_v1/`
 
 Required version/config fields:
 
