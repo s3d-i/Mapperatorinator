@@ -6,13 +6,16 @@ Build a small, fast, 4K-only mapper that generates playable 2–6* osu!mania hit
 
 - audio
 - target difficulty
-- oracle timing derived from the reference `.osu`
+- dense timing track
+
+In Phase 1, the dense timing track is oracle-rendered from the reference `.osu` red timing points.
+The mapper never receives raw red timing points, redline tables, or timing-point tokens as input.
 
 This Stage 1 system is intentionally narrow:
 
 - 4K only
 - 2.0* to 6.0* only
-- oracle timing only
+- oracle-rendered dense timing track only
 - hitobject generation only
 
 It does **not** solve timing inference, planner/control learning, style conditioning, or out-of-range generalization.
@@ -46,7 +49,11 @@ It does **not** solve timing inference, planner/control learning, style conditio
 - Decoder language is a canonical `(TS+ EV)*` event stream with forced condition prefix.
 - Window ownership is defined on half-open absolute intervals: `[write_start, write_end)`.
 - Decoder target timestamps are relative to `write_start`.
-- Export uses oracle **red timing points only**. Model output is `HitObjects` only.
+- Mapper input uses a dense 20ms timing track.
+- For Phase 1 oracle training/evaluation, this timing track is deterministically rendered from reference `.osu` red timing points.
+- Raw red timing points are not model inputs.
+- Model output is `HitObjects` only.
+- For oracle evaluation export, reference red timing points may be copied into the exported `.osu` file only as file-format timing metadata. This does not mean the mapper consumed red timing points.
 
 ## Difficulty Source
 
@@ -247,8 +254,7 @@ For the first window:
 Padding/extrapolation rules:
 
 - audio before `0ms`: silence
-- timing before `0ms`: extrapolate from the first red timing point
-- `timing_change_pulse`: only on real timing changes, never synthesized by extrapolation
+- oracle dense timing before `0ms`: render by extrapolating from the first valid red timing point
 - `open_hold_mask_at_write_start = 0000`
 
 ### Last Window
@@ -262,8 +268,7 @@ For the final window:
 Padding/extrapolation rules:
 
 - audio after `audio_duration`: silence
-- timing after `audio_duration`: extrapolate from the last red timing point
-- no fake `timing_change_pulse` during extrapolation
+- oracle dense timing after `audio_duration`: render by extrapolating from the last valid red timing point
 
 The decoder must obey:
 
@@ -515,22 +520,215 @@ Stage 1 does not train, tokenize, decode, or export `END_TAP` or `END_START`. Ma
 
 ## Timing Track
 
+### Timing Track v1
+
+Stage 1 uses a fixed compressed dense timing representation:
+
+```text
+timing_track_20ms_v1
+shape per window: [600, 5]
+frame hop: 20ms
+input duration: 12000ms
+```
+
+Each 12s input window has exactly:
+
+```text
+12000 / 20 = 600 frames
+```
+
+Each frame is defined by its center time:
+
+```text
+frame_i covers:
+  [input_start + 20*i, input_start + 20*(i+1))
+frame_time_i:
+  input_start + 20*i + 10
+```
+
 The dense timing track is aligned to 20ms encoder frames and contains:
 
 - `beat_pulse`
-- `measure_pulse`
-- `timing_change_pulse`
 - `beat_phase_sin`
 - `beat_phase_cos`
-- `measure_phase_sin`
-- `measure_phase_cos`
 - `local_bpm_log_norm`
+- `timing_confidence`
 
-Rules:
+Stage 1 does not expose raw red timing points to the mapper.
+For Phase 1, this track is oracle-rendered from reference `.osu` red timing points.
+For later predicted-timing phases, the timing model must output this same dense timing interface, or an equivalent representation that is deterministically rendered into this interface.
+The mapper input contract is the dense timing track, not red timing points.
 
-- pulse channels use Gaussian or triangular support, not one-hot spikes
-- extrapolation outside audio bounds follows the nearest red timing point
-- extrapolation must not create fake `timing_change_pulse`
+
+### Channel Semantics
+
+#### 0. `beat_pulse`
+
+`beat_pulse` is a soft pulse around beat boundaries.
+Use triangular support, not one-hot spikes.
+
+Recommended config:
+
+```text
+pulse_width_ms = 40
+```
+
+For frame time `t`, define distance to nearest beat:
+
+```text
+d = distance_ms_to_nearest_beat(t)
+```
+
+Then:
+
+```text
+beat_pulse = max(0, 1 - d / pulse_width_ms)
+```
+
+So:
+
+```text
+d = 0ms   -> 1.0
+d = 20ms  -> 0.5
+d >= 40ms -> 0.0
+```
+
+Do not add separate pulse channels for `1/2`, `1/3`, `1/4`, `1/6`, or `1/8` subdivisions in Stage 1.
+
+#### 1–2. `beat_phase_sin`, `beat_phase_cos`
+
+For the active timing section:
+
+```text
+beat_pos = (t - timing_offset) / beat_length_ms
+beat_phase = frac(beat_pos)
+```
+
+Then:
+
+```text
+beat_phase_sin = sin(2pi * beat_phase)
+beat_phase_cos = cos(2pi * beat_phase)
+```
+
+These channels tell the mapper where the frame is inside the current beat.
+
+#### 3. `local_bpm_log_norm`
+
+For the active timing section:
+
+```text
+bpm = 60000 / beat_length_ms
+```
+
+Normalize using training-split statistics:
+
+```text
+local_bpm_log_norm =
+  (log(bpm) - bpm_log_mean) / bpm_log_std
+```
+
+Then clip:
+
+```text
+local_bpm_log_norm = clip(local_bpm_log_norm, -4, 4)
+```
+
+The saved model/checkpoint must store:
+
+- `bpm_log_mean`
+- `bpm_log_std`
+
+Do not recompute these from validation or inference data.
+
+#### 4. `timing_confidence`
+
+For Phase 1 oracle timing:
+
+```text
+timing_confidence = 1.0
+```
+
+For Phase 2 timing-noise robustness, `timing_confidence` may be reduced when timing is intentionally corrupted.
+For Phase 4 predicted timing, `timing_confidence` comes from the timing model.
+
+This is the only future-facing confidence channel in Stage 1.
+Do not add per-channel confidence, uncertainty intervals, beat-type confidence, or BPM confidence yet.
+
+### Oracle Dense Timing Rendering
+
+Phase 1 oracle timing is produced by a deterministic renderer:
+
+```text
+reference .osu red timing points
+  -> dense timing_track_20ms_v1
+```
+
+The mapper never receives:
+
+- red timing point offsets
+- `beatLength` tables
+- `uninherited` flags
+- `TimingPoints` lines
+- raw `.osu` timing metadata
+
+The renderer uses only valid red timing points:
+
+- `uninherited = true`
+- `beat_length_ms > 0`
+
+Maps with no valid red timing point are filtered and reported.
+Inherited green timing points are ignored in Stage 1.
+
+#### Active Timing Section
+
+For a frame time `t`:
+
+```text
+active_red = last red timing point with offset <= t
+```
+
+If `t` is before the first red timing point:
+
+```text
+active_red = first red timing point
+```
+
+If `t` is after the last red timing point:
+
+```text
+active_red = last red timing point
+```
+
+This is extrapolation, not synthesis.
+No fake timing-change signal is created because `timing_change_pulse` does not exist in v1.
+
+### Audio + Timing Alignment
+
+Audio packed frame `i`:
+
+```text
+covers [input_start + 20*i, input_start + 20*(i+1))
+```
+
+Timing frame `i`:
+
+```text
+evaluated at input_start + 20*i + 10
+```
+
+Both streams have the same length:
+
+```text
+600 frames per 12s input window
+```
+
+The encoder receives:
+
+```text
+packed_audio: [600, 160]
+timing_track: [600, 5]
+```
 
 ## Audio Representation
 
@@ -568,15 +766,27 @@ This is not a learned downsampling layer. It is a deterministic representation t
 Stage 1 uses a shared fused encoder:
 
 - audio frame projection from packed 160-dim audio frames via a learned `Linear(160 -> d_model)`
-- timing frame projection
+- timing frame projection from dense 5-dim `timing_track_20ms_v1` frames via a learned `Linear(5 -> d_model)`
 - broadcast difficulty embedding
 - fused frame projection
 - shared transformer encoder
 - autoregressive decoder with cross-attention
 
+Suggested model input fusion:
+
+```text
+audio_emb  = Linear(160 -> d_model)(packed_audio_frame)
+timing_emb = Linear(5 -> d_model)(timing_track_frame)
+diff_emb   = difficulty embedding broadcast over frames
+fused = Linear(3 * d_model -> d_model)(
+  concat(audio_emb, timing_emb, diff_emb)
+)
+```
+
 Not included in Stage 1:
 
 - separate audio/timing encoders
+- timing-specific transformer encoder
 - beam search
 - wide difficulty-range conditioning
 
@@ -600,7 +810,7 @@ If speed is insufficient, the first ablation is to shrink width/depth, not expan
 Cache directories must encode config/version identity, for example:
 
 - `cache/mel_sr16000_hop10_mel80_v1/`
-- `cache/timing_track_20ms_8ch_sigma30_v1/`
+- `cache/timing_track_20ms_5ch_tri40_v1/`
 - `cache/mapper_tokens_4k_2to6_ts10_1000_4state_v1/`
 
 Required version/config fields:
@@ -609,6 +819,18 @@ Required version/config fields:
 - `mel_config_hash`
 - `timing_render_config_hash`
 - `tokenizer_version`
+
+Required timing config fields:
+
+- `timing_track_version = timing_track_20ms_v1`
+- `timing_frame_hop_ms = 20`
+- `timing_frame_center_offset_ms = 10`
+- `timing_channels = [beat_pulse, beat_phase_sin, beat_phase_cos, local_bpm_log_norm, timing_confidence]`
+- `pulse_shape = triangular`
+- `pulse_width_ms = 40`
+- `bpm_log_mean = saved from training split`
+- `bpm_log_std = saved from training split`
+- `red_timing_source = reference_osu_red_points_for_oracle_phase`
 
 Split keys:
 
@@ -680,6 +902,46 @@ Report:
 - hold crossing rate at write boundaries
 - duplicate/collision risk after stitch
 
+### Dense Timing Track Audit
+
+Mandatory before training.
+
+Report:
+
+- `timing_track_nan_count`
+- `timing_track_inf_count`
+- `phase_unit_norm_error_mean`
+- `phase_unit_norm_error_max`
+- `beat_pulse_nonzero_ratio`
+- `local_bpm_log_norm_mean`
+- `local_bpm_log_norm_std`
+- `local_bpm_log_norm_min`
+- `local_bpm_log_norm_max`
+- `invalid_red_timing_map_count`
+
+For beat phase channels:
+
+```text
+phase_unit_norm = sqrt(sin^2 + cos^2)
+```
+
+Expected:
+
+```text
+phase_unit_norm ~= 1
+```
+
+Generate debug plots for a small fixed sample:
+
+- audio energy / mel summary
+- `beat_pulse`
+- beat phase
+- `local_bpm_log_norm`
+- ground-truth hitobjects
+
+Do not add large timing-model metrics to Phase 1.
+Phase 1 only needs to verify that oracle dense timing was rendered correctly.
+
 ## Evaluation
 
 Metrics must be reported both overall and per difficulty bin:
@@ -736,7 +998,7 @@ Interpretation:
 
 ### Difficulty Control Diagnostics
 
-For fixed validation audio+timing, sweep:
+For fixed validation audio+dense timing, sweep:
 
 - `2.0*`
 - `3.0*`
@@ -790,41 +1052,141 @@ If duplicate events or same-lane collisions appear after stitch, this is treated
 
 ### Export
 
-Stage 1 export uses:
-
-- oracle red timing points from the reference map
-- model-generated `HitObjects`
-
+Stage 1 mapper export emits generated `HitObjects` only.
+For Phase 1 oracle evaluation, exported `.osu` files may copy reference red timing points so that generated `HitObjects` can be played and evaluated under the same oracle timing used to render the dense timing track.
+This copied timing metadata is export-only.
+The mapper never consumes raw red timing points as input.
 Stage 1 export does **not** copy inherited green lines by default.
-
-This keeps evaluation aligned with the actual Stage 1 capability:
-
-- timing is oracle-provided
-- hitobjects are model-generated
 
 ## Training Phases
 
 ### Phase A
 
-- no timing noise augmentation
+Use clean oracle dense timing track:
+
+```text
+reference .osu red timing points
+  -> timing_track_20ms_v1
+  -> mapper
+```
+
+No timing noise augmentation.
+
+Purpose:
+
+- verify mapper upper bound under ideal dense timing
 - verify tokenizer, decoder grammar, legality masks, stitch, and export correctness
 
 ### Phase B
 
-- light timing augmentation may be introduced after Phase A passes
-- robustness-only phase, not correctness phase
+Introduce light corruption to the dense track, not to raw redlines.
+
+Allowed perturbations:
+
+- small global phase shift
+- small local phase drift
+- small BPM drift
+- temporary confidence reduction
+- beat pulse weakening
+
+Do not perturb by editing red timing points unless the edited points are immediately rendered back into the same dense timing track.
+The mapper should not care whether the dense track came from redlines, DSP, or a neural timing model.
+This is a robustness-only phase, not the correctness phase.
+
+## Roadmap Alignment
+
+### Phase 1 — Oracle Upper-Bound Mapper
+
+```text
+reference .osu red timing points
+  -> deterministic oracle dense timing renderer
+  -> mapper
+```
+
+Output:
+
+- oracle-conditioned mapper checkpoint
+
+This answers:
+
+- if timing were perfect as a dense rhythmic prior, is the mapper good enough?
+
+It does not answer:
+
+- can the mapper use osu redline metadata?
+
+### Phase 2 — Timing-Noise Robustness Fine-Tuning
+
+Corrupt the dense track directly:
+
+```text
+clean oracle dense timing
+  -> perturbed dense timing
+  -> mapper fine-tuning
+```
+
+This trains the mapper to tolerate the kind of errors a future timing model will produce.
+
+### Phase 3 — Fast and Reliable Timing Model
+
+The timing model target should be:
+
+```text
+audio -> timing_track_20ms_v1
+```
+
+or:
+
+```text
+audio -> beat/tempo primitives -> timing_track_20ms_v1 renderer
+```
+
+Both are acceptable as long as the mapper receives the same 5-channel dense track.
+Do not require the timing model to reconstruct `.osu` red timing points exactly.
+That is the wrong target.
+
+### Phase 4 — Predicted-Timing Adaptation
+
+```text
+audio
+  -> timing model
+  -> predicted timing_track_20ms_v1
+  -> mapper
+```
+
+Fine-tune mapper on a mixture:
+
+- oracle dense timing
+- predicted dense timing
+- perturbed dense timing
+
+The interface stays stable.
+
+## Design Note
+
+The corrected ownership is:
+
+- red timing points are source data
+- dense timing track is model input
+- `HitObjects` are model output
+- red timing points may be export metadata in oracle evaluation
+
+Do not include `timing_change_pulse`.
+It leaks `.osu` redline structure and encourages the mapper to depend on exact timing-change boundaries that the final timing model may not reproduce.
+The mapper needs rhythmic position and tempo, not authoring metadata.
 
 ## Pre-Training Gates
 
 Training must not start until all of the following pass:
 
 1. `.osu -> events -> tokens -> events -> .osu` round-trip
-2. timing render debug plots
+2. oracle dense timing render debug plots
 3. window stitch dry-run
 4. Event Space Audit
 5. Token Statistics Audit
 6. Quantization Audit
 7. Window Boundary Audit
+8. Dense Timing Track Audit
 
 ## Success Criteria
 
