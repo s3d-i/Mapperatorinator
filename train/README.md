@@ -34,6 +34,11 @@
 Generated files live under `train/artifacts/`:
 
 - `indexes/`: beatmap indexes, including `beatmap_index_4k.parquet`
+  and the Stage 1 training index `beatmap_index_4k_no_timing_anomalies.parquet`.
+  The training index is generated from the 4K index by excluding maps that fail
+  the same red timing parser gate used by the dense timing audit, so training
+  does not see maps with missing or anomalous red timing points. `ManiaBeatmapDataset`
+  uses this training index by default.
 - `cache/`: mel, timing-track, and token caches
 - `reports/`: audit and evaluation reports
 - `runs/`: checkpoints and experiment outputs

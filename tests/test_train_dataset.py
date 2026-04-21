@@ -9,7 +9,9 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from train.stage1_oracle.data.dataset import ManiaBeatmapDataset, build_4k_index
+from train.stage1_oracle.data.dataset import ManiaBeatmapDataset
+from train.stage1_oracle.data.dataset import build_4k_index
+from train.stage1_oracle.data.dataset import build_4k_no_timing_anomaly_index
 
 
 def _write_wav(path: Path, *, sample_rate: int = 22050, duration_seconds: float = 0.1, frequency: float = 440.0) -> None:
@@ -40,34 +42,36 @@ def _write_osu(
     circle_size: float = 4.0,
     overall_difficulty: float = 8.0,
     hp_drain_rate: float = 6.5,
+    timing_lines: list[str] | None = None,
 ) -> None:
+    lines = [
+        "osu file format v14",
+        "",
+        "[General]",
+        f"AudioFilename: {audio_filename}",
+        f"AudioLeadIn: {audio_lead_in}",
+        f"PreviewTime: {preview_time}",
+        f"Mode: {mode}",
+        "",
+        "[Metadata]",
+        f"Title:{title}",
+        f"Artist:{artist}",
+        f"Creator:{creator}",
+        f"Version:{version}",
+        f"BeatmapID:{beatmap_id}",
+        f"BeatmapSetID:{beatmap_set_id}",
+        "",
+        "[Difficulty]",
+        f"HPDrainRate:{hp_drain_rate}",
+        f"CircleSize:{circle_size}",
+        f"OverallDifficulty:{overall_difficulty}",
+        "",
+    ]
+    if timing_lines is not None:
+        lines.extend(["[TimingPoints]", *timing_lines, ""])
+    lines.append("[HitObjects]")
     path.write_text(
-        "\n".join(
-            [
-                "osu file format v14",
-                "",
-                "[General]",
-                f"AudioFilename: {audio_filename}",
-                f"AudioLeadIn: {audio_lead_in}",
-                f"PreviewTime: {preview_time}",
-                f"Mode: {mode}",
-                "",
-                "[Metadata]",
-                f"Title:{title}",
-                f"Artist:{artist}",
-                f"Creator:{creator}",
-                f"Version:{version}",
-                f"BeatmapID:{beatmap_id}",
-                f"BeatmapSetID:{beatmap_set_id}",
-                "",
-                "[Difficulty]",
-                f"HPDrainRate:{hp_drain_rate}",
-                f"CircleSize:{circle_size}",
-                f"OverallDifficulty:{overall_difficulty}",
-                "",
-                "[HitObjects]",
-            ],
-        ),
+        "\n".join(lines),
         encoding="utf-8",
     )
 
@@ -221,7 +225,7 @@ class TrainDatasetTests(unittest.TestCase):
             self.assertEqual(easy_row["difficulty"], 0.0)
             self.assertEqual(list(easy_row["sr_difficulties"]), [0.0, 0.0, 0.0, 0.0, 0.0])
 
-    def test_dataset_defaults_to_4k_index_path(self) -> None:
+    def test_dataset_uses_explicit_index_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             dataset_root = repo_root / "mania-dataset"
@@ -248,8 +252,7 @@ class TrainDatasetTests(unittest.TestCase):
             )
 
             index_path = build_4k_index(shard_path, train_path / "beatmap_index_4k.parquet")
-            with patch("train.stage1_oracle.data.dataset.get_default_4k_index_path", return_value=index_path):
-                dataset = ManiaBeatmapDataset(shard_path=shard_path, sample_rate=16000)
+            dataset = ManiaBeatmapDataset(shard_path=shard_path, sample_rate=16000, index_path=index_path)
 
             sample = dataset[0]
 
@@ -274,6 +277,103 @@ class TrainDatasetTests(unittest.TestCase):
             self.assertEqual(sample["audio_num_samples"], len(sample["audio"]))
             self.assertGreater(sample["audio_num_samples"], 0)
             self.assertLessEqual(float(np.max(np.abs(sample["audio"]))), 1.0)
+
+    def test_dataset_defaults_to_timing_clean_training_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            dataset_root = repo_root / "mania-dataset"
+            shard_path = dataset_root / "0"
+            train_path = repo_root / "train"
+            song_path = shard_path / "6789"
+            song_path.mkdir(parents=True)
+            train_path.mkdir(parents=True)
+
+            _write_wav(song_path / "song_audio.wav", sample_rate=44100, duration_seconds=0.2)
+            _write_osu(
+                song_path / "valid.osu",
+                audio_filename="song_audio.wav",
+                beatmap_set_id=6789,
+                beatmap_id=10,
+                version="Valid",
+                circle_size=4.0,
+                timing_lines=["0,500,4,2,1,60,1,0"],
+            )
+            _write_osu(
+                song_path / "invalid.osu",
+                audio_filename="song_audio.wav",
+                beatmap_set_id=6789,
+                beatmap_id=11,
+                version="Invalid",
+                circle_size=4.0,
+                timing_lines=["0,1000000,4,2,1,60,1,0"],
+            )
+            raw_index_path = train_path / "beatmap_index_4k.parquet"
+            clean_index_path = train_path / "beatmap_index_4k_no_timing_anomalies.parquet"
+
+            with patch("train.stage1_oracle.data.dataset.get_default_4k_index_path", return_value=raw_index_path):
+                with patch(
+                    "train.stage1_oracle.data.dataset.get_default_4k_no_timing_anomaly_index_path",
+                    return_value=clean_index_path,
+                ):
+                    dataset = ManiaBeatmapDataset(shard_path=shard_path, sample_rate=16000)
+
+            self.assertTrue(raw_index_path.exists())
+            self.assertTrue(clean_index_path.exists())
+            self.assertEqual(len(dataset), 1)
+            self.assertEqual(dataset[0]["beatmap_filename"], "valid.osu")
+
+    def test_build_4k_no_timing_anomaly_index_filters_unusable_red_timing_maps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            dataset_root = repo_root / "mania-dataset"
+            shard_path = dataset_root / "0"
+            train_path = repo_root / "train"
+            song_path = shard_path / "9999"
+            song_path.mkdir(parents=True)
+            train_path.mkdir(parents=True)
+
+            _write_wav(song_path / "main_audio.wav")
+            _write_osu(
+                song_path / "valid.osu",
+                audio_filename="main_audio.wav",
+                beatmap_set_id=9999,
+                beatmap_id=1,
+                version="Valid",
+                circle_size=4.0,
+                timing_lines=["0,500,4,2,1,60,1,0"],
+            )
+            _write_osu(
+                song_path / "invalid.osu",
+                audio_filename="main_audio.wav",
+                beatmap_set_id=9999,
+                beatmap_id=2,
+                version="Invalid",
+                circle_size=4.0,
+                timing_lines=["0,1000000,4,2,1,60,1,0"],
+            )
+            _write_osu(
+                song_path / "missing.osu",
+                audio_filename="main_audio.wav",
+                beatmap_set_id=9999,
+                beatmap_id=3,
+                version="Missing",
+                circle_size=4.0,
+            )
+            source_index_path = build_4k_index(shard_path, train_path / "beatmap_index_4k.parquet")
+
+            report = build_4k_no_timing_anomaly_index(
+                source_index_path=source_index_path,
+                dataset_root=dataset_root,
+                output_path=train_path / "beatmap_index_4k_no_timing_anomalies.parquet",
+            )
+
+            clean_df = pd.read_parquet(report.output_path)
+            self.assertEqual(report.source_map_count, 3)
+            self.assertEqual(report.clean_map_count, 1)
+            self.assertEqual(report.invalid_red_timing_map_count, 1)
+            self.assertEqual(report.missing_red_timing_map_count, 1)
+            self.assertEqual(set(clean_df["beatmap_filename"]), {"valid.osu"})
+            self.assertEqual(list(clean_df.columns), list(pd.read_parquet(source_index_path).columns))
 
 
 if __name__ == "__main__":

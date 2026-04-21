@@ -11,8 +11,12 @@ from torch.utils.data import Dataset
 from ..core.difficulty import calculate_mania_difficulties
 from ..features.audio import AudioWaveform, load_audio_file
 from ..osu.metadata import parse_osu_metadata
+from ..osu.timing import InvalidRedTimingError
+from ..osu.timing import MissingRedTimingError
+from ..osu.timing import require_red_timing_points
 
 INDEX_4K_FILENAME = "beatmap_index_4k.parquet"
+INDEX_4K_NO_TIMING_ANOMALIES_FILENAME = "beatmap_index_4k_no_timing_anomalies.parquet"
 SR_SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5)
 NULLABLE_INT_COLUMNS = (
     "audio_lead_in",
@@ -90,6 +94,21 @@ class BeatmapIndexRecord:
     key_count: int | None
     difficulty: float
     sr_difficulties: list[float]
+
+
+@dataclass(frozen=True)
+class TimingCleanIndexReport:
+    source_index_path: Path
+    output_path: Path
+    dataset_root: Path
+    source_map_count: int
+    clean_map_count: int
+    missing_red_timing_map_count: int
+    invalid_red_timing_map_count: int
+    invalid_red_timing_point_count: int
+    nonfinite_red_timing_point_count: int
+    nonpositive_red_timing_point_count: int
+    implausible_red_timing_point_count: int
 
 
 def _build_record(
@@ -215,12 +234,78 @@ def build_filtered_index(
     return output_path
 
 
+def build_4k_no_timing_anomaly_index(
+    *,
+    source_index_path: str | Path,
+    dataset_root: str | Path,
+    output_path: str | Path,
+) -> TimingCleanIndexReport:
+    source_index_path = Path(source_index_path)
+    dataset_root = Path(dataset_root)
+    output_path = Path(output_path)
+    source_df = load_index(source_index_path)
+
+    keep_mask: list[bool] = []
+    missing_red_timing_map_count = 0
+    invalid_red_timing_map_count = 0
+    invalid_red_timing_point_count = 0
+    nonfinite_red_timing_point_count = 0
+    nonpositive_red_timing_point_count = 0
+    implausible_red_timing_point_count = 0
+
+    for row in source_df.itertuples(index=False):
+        beatmap_path = dataset_root / str(row.shard) / str(row.beatmap_path)
+        try:
+            # The dense timing audit classifies maps with missing or impossible red timing
+            # as unusable for oracle timing. Keep the training index on that same parser
+            # gate so timing anomalies cannot enter feature generation through a stale index.
+            require_red_timing_points(beatmap_path)
+        except InvalidRedTimingError as exc:
+            keep_mask.append(False)
+            invalid_red_timing_map_count += 1
+            invalid_red_timing_point_count += exc.counts.total
+            nonfinite_red_timing_point_count += exc.counts.nonfinite
+            nonpositive_red_timing_point_count += exc.counts.nonpositive
+            implausible_red_timing_point_count += exc.counts.implausible
+        except MissingRedTimingError:
+            keep_mask.append(False)
+            missing_red_timing_map_count += 1
+        else:
+            keep_mask.append(True)
+
+    clean_df = _cast_index_dtypes(source_df.loc[keep_mask].reset_index(drop=True))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_df.to_parquet(output_path, index=False)
+
+    return TimingCleanIndexReport(
+        source_index_path=source_index_path,
+        output_path=output_path,
+        dataset_root=dataset_root,
+        source_map_count=len(source_df),
+        clean_map_count=len(clean_df),
+        missing_red_timing_map_count=missing_red_timing_map_count,
+        invalid_red_timing_map_count=invalid_red_timing_map_count,
+        invalid_red_timing_point_count=invalid_red_timing_point_count,
+        nonfinite_red_timing_point_count=nonfinite_red_timing_point_count,
+        nonpositive_red_timing_point_count=nonpositive_red_timing_point_count,
+        implausible_red_timing_point_count=implausible_red_timing_point_count,
+    )
+
+
 def load_index(index_path: str | Path) -> pd.DataFrame:
     return _cast_index_dtypes(pd.read_parquet(index_path))
 
 
 def get_default_4k_index_path() -> Path:
     return Path(__file__).resolve().parents[2] / "artifacts" / "indexes" / INDEX_4K_FILENAME
+
+
+def get_default_4k_no_timing_anomaly_index_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "artifacts" / "indexes" / INDEX_4K_NO_TIMING_ANOMALIES_FILENAME
+
+
+def get_default_4k_training_index_path() -> Path:
+    return get_default_4k_no_timing_anomaly_index_path()
 
 
 class ManiaBeatmapDataset(Dataset):
@@ -238,11 +323,15 @@ class ManiaBeatmapDataset(Dataset):
         self.sample_rate = sample_rate
         self.speed = speed
         self.normalize = normalize
-        index_path = Path(index_path) if index_path is not None else get_default_4k_index_path()
+        using_default_index = index_path is None
+        index_path = Path(index_path) if index_path is not None else get_default_4k_training_index_path()
         if not index_path.exists():
             if not build_index_if_missing:
                 raise FileNotFoundError(f"index parquet not found: {index_path}")
-            build_4k_index(self.shard_path, index_path)
+            if using_default_index:
+                _build_default_4k_training_index(self.shard_path, index_path)
+            else:
+                build_4k_index(self.shard_path, index_path)
         self.index = load_index(index_path).reset_index(drop=True)
 
     def __len__(self) -> int:
@@ -304,6 +393,17 @@ def _normalize_scalar(value: object) -> NormalizedValue:
     if isinstance(value, _SupportsItem) and not isinstance(value, (str, bytes)):
         return _normalize_scalar(value.item())
     return cast(NormalizedValue, value)
+
+
+def _build_default_4k_training_index(shard_path: Path, output_path: Path) -> TimingCleanIndexReport:
+    source_index_path = get_default_4k_index_path()
+    if not source_index_path.exists():
+        build_4k_index(shard_path, source_index_path)
+    return build_4k_no_timing_anomaly_index(
+        source_index_path=source_index_path,
+        dataset_root=shard_path.parent,
+        output_path=output_path,
+    )
 
 
 def _cast_index_dtypes(index_df: pd.DataFrame) -> pd.DataFrame:
