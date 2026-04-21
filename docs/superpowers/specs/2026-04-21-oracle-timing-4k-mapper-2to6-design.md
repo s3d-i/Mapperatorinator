@@ -462,16 +462,21 @@ The rollback must never remove previously completed events.
 
 Stage 1 uses timepoint-level event output, not note-level token output.
 
-### Default Candidate Lane Action Space
+### Frozen Lane Action Space
 
-Candidate 6-state lane actions:
+Stage 1 uses the 4-state lane-action vocabulary:
 
 - `NONE`
 - `TAP`
 - `HOLD_START`
 - `HOLD_END`
-- `END_TAP`
-- `END_START`
+
+The 6-state vocabulary is explicitly rejected for Stage 1.
+
+Reference audit:
+
+- [docs/superpowers/audits/2026-04-21-event-space-audit-4k-2to6.md](/Users/l/projects/Mapperatorinator/docs/superpowers/audits/2026-04-21-event-space-audit-4k-2to6.md)
+- audit implementation/result commit: `438565f6743d6d9eed32928f01892e1e3e455c3e`
 
 ### Event Space Audit
 
@@ -487,9 +492,7 @@ It must report:
 
 ### 6-State vs 4-State Freeze Rule
 
-Default tokenizer design assumes 6-state lane actions, but Stage 1 may freeze to 4-state if the audit shows compound same-lane events are negligible.
-
-If frozen to 4-state, allowed lane actions become:
+Stage 1 is frozen to 4-state. The allowed lane actions are:
 
 - `NONE`
 - `TAP`
@@ -498,26 +501,17 @@ If frozen to 4-state, allowed lane actions become:
 
 ### 4-State Compound Event Policy
 
-If Stage 1 freezes to 4-state, unsupported canonical compound same-lane events are **not** normalized heuristically at token time.
+Unsupported canonical compound same-lane events are **not** normalized heuristically at token time.
 
 Instead:
 
 - maps containing canonical `END_TAP` or `END_START` events are filtered out of the Stage 1 dataset
+- maps containing same-lane compounds unsupported by both 4-state and 6-state vocabularies are filtered out of the Stage 1 dataset
 - the filtered map count and filtered event count must be reported
-- 4-state freeze is only acceptable if the resulting drop rate is negligible
 
-Rationale:
+### Rejected 6-State Semantics
 
-- filtering is deterministic
-- filtering avoids hidden semantic mutation
-- filtering keeps the tokenizer language clean
-
-### 6-State Semantics
-
-If 6-state is retained:
-
-- `END_TAP`: close the current hold and place a tap on the same lane at the same timestamp; resulting lane state is closed
-- `END_START`: close the current hold and start a new hold on the same lane at the same timestamp; resulting lane state stays open
+Stage 1 does not train, tokenize, decode, or export `END_TAP` or `END_START`. Maps containing these actions after canonical quantization are filtered.
 
 ## Timing Track
 
