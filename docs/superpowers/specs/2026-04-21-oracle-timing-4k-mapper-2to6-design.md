@@ -41,7 +41,7 @@ It does **not** solve timing inference, planner/control learning, style conditio
 
 ## Core Decisions
 
-- Difficulty source is the existing mania calculator in [train/difficulty.py](/Users/l/projects/Mapperatorinator/train/difficulty.py:517).
+- Difficulty source is the existing mania calculator in [train/stage1_oracle/core/difficulty.py](/Users/l/projects/Mapperatorinator/train/stage1_oracle/core/difficulty.py:517).
 - Time is quantized on a **global deterministic 10ms grid before window assignment**.
 - Decoder language is a canonical `(TS+ EV)*` event stream with forced condition prefix.
 - Window ownership is defined on half-open absolute intervals: `[write_start, write_end)`.
@@ -52,8 +52,8 @@ It does **not** solve timing inference, planner/control learning, style conditio
 
 Stage 1 uses the repository's existing official-style mania difficulty computation:
 
-- `compute_mania_star_rating_20241007()` in [train/difficulty.py](/Users/l/projects/Mapperatorinator/train/difficulty.py:517)
-- `calculate_mania_difficulty()` in [train/difficulty.py](/Users/l/projects/Mapperatorinator/train/difficulty.py:557)
+- `compute_mania_star_rating_20241007()` in [train/stage1_oracle/core/difficulty.py](/Users/l/projects/Mapperatorinator/train/stage1_oracle/core/difficulty.py:517)
+- `calculate_mania_difficulty()` in [train/stage1_oracle/core/difficulty.py](/Users/l/projects/Mapperatorinator/train/stage1_oracle/core/difficulty.py:557)
 
 No alternate difficulty label source is allowed in Stage 1.
 

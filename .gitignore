@@ -12,3 +12,7 @@ test_inference_mai_mod.py
 .env
 .vscode
 mania-dataset/*
+train/artifacts/cache/
+train/artifacts/reports/
+train/artifacts/runs/
+train/artifacts/splits/

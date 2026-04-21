@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train.canonical_events import (
+from train.stage1_oracle.events.canonical import (
     CanonicalTimepoint,
     LaneAction,
     NegativeHitObjectTimeError,
@@ -10,9 +10,9 @@ from train.canonical_events import (
     build_canonical_quantized_events,
     quantize_10ms_half_up,
 )
-from train.event_space_audit import audit_event_space
-from train.event_space_audit import audit_osu_event_space
-from train.osu_hitobjects import ManiaHitObject, ManiaHitObjectKind, parse_mania_hit_objects
+from train.stage1_oracle.audits.event_space import audit_event_space
+from train.stage1_oracle.audits.event_space import audit_osu_event_space
+from train.stage1_oracle.osu.hitobjects import ManiaHitObject, ManiaHitObjectKind, parse_mania_hit_objects
 
 
 def _write_osu(path: Path, hitobject_lines: list[str], *, timing_lines: list[str] | None = None) -> None:

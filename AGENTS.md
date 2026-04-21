@@ -7,3 +7,8 @@
 ## Python Execution
 
 - Run Python code in this repository with `uv run` consistently instead of calling `python` or `python3` directly.
+
+## Compatibility and Placeholder Policy
+
+- Do not preserve backward compatibility unless explicitly instructed.
+- Do not leave compatibility wrappers, mock interfaces, or placeholder files unless explicitly instructed.

@@ -8,9 +8,9 @@ from typing import Protocol, TypeAlias, TypedDict, cast, runtime_checkable
 import pandas as pd
 from torch.utils.data import Dataset
 
-from .data_utils import AudioWaveform, load_audio_file
-from .difficulty import calculate_mania_difficulties
-from .osu_metadata import parse_osu_metadata
+from ..core.difficulty import calculate_mania_difficulties
+from ..features.audio import AudioWaveform, load_audio_file
+from ..osu.metadata import parse_osu_metadata
 
 INDEX_4K_FILENAME = "beatmap_index_4k.parquet"
 SR_SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5)
@@ -220,7 +220,7 @@ def load_index(index_path: str | Path) -> pd.DataFrame:
 
 
 def get_default_4k_index_path() -> Path:
-    return Path(__file__).resolve().parent / INDEX_4K_FILENAME
+    return Path(__file__).resolve().parents[2] / "artifacts" / "indexes" / INDEX_4K_FILENAME
 
 
 class ManiaBeatmapDataset(Dataset):

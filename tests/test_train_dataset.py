@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from train.dataset import ManiaBeatmapDataset, build_4k_index
+from train.stage1_oracle.data.dataset import ManiaBeatmapDataset, build_4k_index
 
 
 def _write_wav(path: Path, *, sample_rate: int = 22050, duration_seconds: float = 0.1, frequency: float = 440.0) -> None:
@@ -248,7 +248,7 @@ class TrainDatasetTests(unittest.TestCase):
             )
 
             index_path = build_4k_index(shard_path, train_path / "beatmap_index_4k.parquet")
-            with patch("train.dataset.get_default_4k_index_path", return_value=index_path):
+            with patch("train.stage1_oracle.data.dataset.get_default_4k_index_path", return_value=index_path):
                 dataset = ManiaBeatmapDataset(shard_path=shard_path, sample_rate=16000)
 
             sample = dataset[0]

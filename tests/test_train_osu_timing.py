@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train.osu_timing import (
+from train.stage1_oracle.osu.timing import (
     MissingRedTimingError,
     RedTimingPoint,
     parse_red_timing_points,

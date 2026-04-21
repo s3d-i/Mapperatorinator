@@ -19,6 +19,28 @@
 
 训练数据集位于 `mania-dataset/` 目录。
 
+## Stage 1 directory layout
+
+`train/stage1_oracle/` contains the implementation for the oracle-timing 4K mapper described in
+`docs/superpowers/specs/2026-04-21-oracle-timing-4k-mapper-2to6-design.md`.
+
+- `core/`: shared difficulty logic
+- `osu/`: `.osu` metadata, timing, and hitobject parsing
+- `events/`: canonical quantized events
+- `features/`: audio loading
+- `data/`: index building and dataset loading
+- `audits/`: implemented pre-training audits
+
+Generated files live under `train/artifacts/`:
+
+- `indexes/`: beatmap indexes, including `beatmap_index_4k.parquet`
+- `cache/`: mel, timing-track, and token caches
+- `reports/`: audit and evaluation reports
+- `runs/`: checkpoints and experiment outputs
+- `splits/`: train/validation split manifests
+
+Add new Stage 1 packages only when they contain real implementation files.
+
 ## Feature family v1
 
 - A. 强度族：描述整体压力与密度

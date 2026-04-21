@@ -5,12 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .canonical_events import CanonicalTimepoint, LaneAction
-from .canonical_events import NegativeHitObjectTimeError
-from .canonical_events import UnsupportedCompoundLaneActionError
-from .canonical_events import build_canonical_quantized_events
-from .osu_hitobjects import parse_mania_hit_objects
-from .osu_timing import MissingRedTimingError, require_red_timing_points
+from ..events.canonical import CanonicalTimepoint, LaneAction
+from ..events.canonical import NegativeHitObjectTimeError
+from ..events.canonical import UnsupportedCompoundLaneActionError
+from ..events.canonical import build_canonical_quantized_events
+from ..osu.hitobjects import parse_mania_hit_objects
+from ..osu.timing import MissingRedTimingError, require_red_timing_points
 
 
 @dataclass(frozen=True)

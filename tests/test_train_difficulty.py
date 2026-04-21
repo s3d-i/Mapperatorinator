@@ -7,7 +7,7 @@ import wave
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from train.difficulty import calculate_mania_difficulty, main
+from train.stage1_oracle.core.difficulty import calculate_mania_difficulty, main
 
 
 def _write_wav(path: Path, *, sample_rate: int = 22050, duration_seconds: float = 0.2, frequency: float = 440.0) -> None:
