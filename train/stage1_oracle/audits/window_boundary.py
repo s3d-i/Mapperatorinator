@@ -9,10 +9,10 @@ from ..events.canonical import CanonicalTimepoint, LaneAction
 from ..events.canonical import NegativeHitObjectTimeError
 from ..events.canonical import UnsupportedCompoundLaneActionError
 from ..events.canonical import build_canonical_quantized_events
+from ..events.windowing import WRITE_WINDOW_MS, compute_generation_end_ms
 from ..osu.hitobjects import parse_mania_hit_objects
 from ..osu.timing import MissingRedTimingError, require_red_timing_points
-from .token_statistics import DIFFICULTY_BIN_LABELS, WRITE_WINDOW_MS
-from .token_statistics import compute_generation_end_ms, difficulty_bin_label
+from .token_statistics import DIFFICULTY_BIN_LABELS, difficulty_bin_label
 from .token_statistics import _count_unsupported_compounds
 from .token_statistics import _four_state_unsupported_counts
 from .token_statistics import _validate_frozen_four_state_and_hold_legality

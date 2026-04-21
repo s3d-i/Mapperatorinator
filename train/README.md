@@ -30,6 +30,8 @@
 - `features/`: audio loading
 - `data/`: index building and dataset loading
 - `audits/`: implemented pre-training audits
+- `models/`: Stage 1 fused encoder / autoregressive decoder model
+- `training/`: overfit and training entrypoints
 
 Generated files live under `train/artifacts/`:
 

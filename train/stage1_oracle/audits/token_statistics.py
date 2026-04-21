@@ -6,17 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ..events.canonical import CanonicalTimepoint, LaneAction, ceil_10ms
+from ..events.canonical import CanonicalTimepoint, LaneAction
 from ..events.canonical import NegativeHitObjectTimeError
 from ..events.canonical import UnsupportedCompoundLaneActionError
 from ..events.canonical import build_canonical_quantized_events
+from ..events.tokens import decompose_ts_delta
+from ..events.windowing import WRITE_WINDOW_MS, compute_generation_end_ms
 from ..osu.hitobjects import ManiaHitObject, ManiaHitObjectKind, parse_mania_hit_objects
 from ..osu.timing import MissingRedTimingError, require_red_timing_points
 
 
 DIFFICULTY_BIN_LABELS = ("2-3", "3-4", "4-5", "5-6")
-WRITE_WINDOW_MS = 8000
-MAX_TS_TOKEN_MS = 1000
 FOUR_STATE_UNSUPPORTED_ACTIONS = frozenset({LaneAction.END_TAP, LaneAction.END_START})
 FROZEN_FOUR_STATE_ACTIONS = frozenset(
     {
@@ -338,14 +338,6 @@ def difficulty_bin_label(stars: float) -> str | None:
     return None
 
 
-def compute_generation_end_ms(
-    audio_duration_ms: float,
-    timepoints: Sequence[CanonicalTimepoint],
-) -> int:
-    max_event_time_plus_grid = max((timepoint.time_ms + 10 for timepoint in timepoints), default=0)
-    return max(ceil_10ms(audio_duration_ms), max_event_time_plus_grid)
-
-
 def build_token_statistics_gate_decision(
     report: TokenStatisticsAuditReport,
     *,
@@ -501,7 +493,7 @@ def _summarize_window_tokens(
             if delta_ms <= 0:
                 raise ValueError(f"canonical timepoints must strictly increase within a window: {timepoints}")
 
-        ts_values = _decompose_ts_delta(delta_ms)
+        ts_values = decompose_ts_delta(delta_ms)
         token_count += len(ts_values) + 1
         ts_counts.update(ts_values)
         event_timepoint_count += 1
@@ -529,21 +521,6 @@ def _summarize_window_tokens(
         max_ts_tokens_per_delta=max_ts_tokens_per_delta,
         requires_multi_ts=requires_multi_ts,
     )
-
-
-def _decompose_ts_delta(delta_ms: int) -> list[int]:
-    if delta_ms < 0:
-        raise ValueError(f"TS delta must be non-negative: {delta_ms}")
-    if delta_ms % 10 != 0:
-        raise ValueError(f"TS delta must be on the 10ms grid: {delta_ms}")
-    if delta_ms <= MAX_TS_TOKEN_MS:
-        return [delta_ms]
-
-    values = [MAX_TS_TOKEN_MS] * (delta_ms // MAX_TS_TOKEN_MS)
-    remainder = delta_ms % MAX_TS_TOKEN_MS
-    if remainder:
-        values.append(remainder)
-    return values
 
 
 def _resolve_generation_end_ms(
