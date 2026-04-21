@@ -13,6 +13,7 @@ class TrainDenseTimingArtifactTests(unittest.TestCase):
             total_map_count=1,
             audited_map_count=1,
             out_of_range_map_count=0,
+            missing_red_timing_map_count=0,
             invalid_red_timing_map_count=0,
             invalid_red_timing_point_count=0,
             nonfinite_red_timing_point_count=0,
@@ -63,10 +64,12 @@ class TrainDenseTimingArtifactTests(unittest.TestCase):
 
         payload = build_dense_timing_artifact_payload(report, provenance=provenance)
 
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["audit_name"], "dense_timing_track_4k_2to6")
         self.assertEqual(payload["provenance"]["index_sha256"], "abc123")
         self.assertEqual(payload["gate_decision"]["status"], "PASS")
+        self.assertEqual(payload["gate_decision"]["renderer_numerics_status"], "PASS")
+        self.assertEqual(payload["gate_decision"]["timing_anomaly_status"], "PASS")
         self.assertEqual(payload["gate_decision"]["timing_track_version"], "timing_track_20ms_v1")
         self.assertEqual(payload["gate_decision"]["bpm_norm_clipped_high_count"], 2)
         self.assertEqual(payload["report"]["timing_track_nan_count"], 0)

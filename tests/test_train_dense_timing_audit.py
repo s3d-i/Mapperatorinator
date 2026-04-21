@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from train.stage1_oracle.audits.dense_timing import (
+    DenseTimingAuditReport,
     DenseTimingMapInput,
     audit_dense_timing_tracks,
     build_dense_timing_gate_decision,
@@ -53,7 +54,8 @@ class TrainDenseTimingAuditTests(unittest.TestCase):
 
         self.assertEqual(report.total_map_count, 3)
         self.assertEqual(report.audited_map_count, 1)
-        self.assertEqual(report.invalid_red_timing_map_count, 1)
+        self.assertEqual(report.missing_red_timing_map_count, 1)
+        self.assertEqual(report.invalid_red_timing_map_count, 0)
         self.assertEqual(report.invalid_red_timing_point_count, 0)
         self.assertEqual(report.nonfinite_red_timing_point_count, 0)
         self.assertEqual(report.nonpositive_red_timing_point_count, 0)
@@ -86,6 +88,35 @@ class TrainDenseTimingAuditTests(unittest.TestCase):
         self.assertEqual(gate.timing_track_version, "timing_track_20ms_v1")
         self.assertEqual(gate.timing_frame_count_per_window, 600)
         self.assertEqual(gate.bpm_norm_clipped_high_count, 0)
+
+    def test_gate_passes_when_filtered_timing_anomalies_stay_under_cap(self) -> None:
+        report = _dense_timing_report(
+            total_map_count=11047,
+            audited_map_count=10977,
+            invalid_red_timing_map_count=70,
+            invalid_red_timing_point_count=60396,
+            nonpositive_red_timing_point_count=20,
+            implausible_red_timing_point_count=60376,
+            raw_bpm_min=20.0,
+            raw_bpm_p01=88.7,
+            raw_bpm_p50=179.0,
+            raw_bpm_p99=300.0,
+            raw_bpm_max=896.0,
+            raw_beat_length_min=66.9642857142857,
+            raw_beat_length_max=3000.0,
+            bpm_norm_clipped_low_count=237829,
+            bpm_norm_clipped_high_count=134948,
+            bpm_norm_clipped_ratio=0.0027750630904258885,
+        )
+
+        gate = build_dense_timing_gate_decision(report)
+
+        self.assertEqual(gate.status, "PASS")
+        self.assertEqual(gate.renderer_numerics_status, "PASS")
+        self.assertEqual(gate.timing_anomaly_status, "PASS")
+        self.assertEqual(gate.coverage_status, "PASS")
+        self.assertAlmostEqual(gate.timing_anomaly_map_ratio, 70 / 11047)
+        self.assertEqual(gate.failure_reasons, [])
 
     def test_audit_counts_bpm_norm_clipping(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -138,6 +169,49 @@ class TrainDenseTimingAuditTests(unittest.TestCase):
         self.assertEqual(report.invalid_red_timing_point_count, 2)
         self.assertEqual(report.implausible_red_timing_point_count, 2)
         self.assertEqual(build_dense_timing_gate_decision(report).status, "FAIL")
+
+
+def _dense_timing_report(**overrides: object) -> DenseTimingAuditReport:
+    defaults = dict(
+        total_map_count=1,
+        audited_map_count=1,
+        out_of_range_map_count=0,
+        missing_red_timing_map_count=0,
+        invalid_red_timing_map_count=0,
+        invalid_red_timing_point_count=0,
+        nonfinite_red_timing_point_count=0,
+        nonpositive_red_timing_point_count=0,
+        implausible_red_timing_point_count=0,
+        negative_time_hitobject_map_count=0,
+        audio_duration_failure_count=0,
+        window_count=1,
+        frame_count=600,
+        timing_track_nan_count=0,
+        timing_track_inf_count=0,
+        phase_unit_norm_error_mean=0.0,
+        phase_unit_norm_error_max=0.0,
+        beat_pulse_nonzero_ratio=0.2,
+        local_bpm_log_norm_mean=0.0,
+        local_bpm_log_norm_std=1.0,
+        local_bpm_log_norm_min=-4.0,
+        local_bpm_log_norm_max=4.0,
+        raw_bpm_min=120.0,
+        raw_bpm_p01=120.0,
+        raw_bpm_p50=180.0,
+        raw_bpm_p99=240.0,
+        raw_bpm_max=240.0,
+        raw_beat_length_min=250.0,
+        raw_beat_length_max=500.0,
+        bpm_norm_clipped_low_count=0,
+        bpm_norm_clipped_high_count=0,
+        bpm_norm_clipped_ratio=0.0,
+        bpm_log_mean=5.0,
+        bpm_log_std=0.2,
+        bins={},
+        debug_plot_paths=[],
+    )
+    defaults.update(overrides)
+    return DenseTimingAuditReport(**defaults)
 
 
 if __name__ == "__main__":

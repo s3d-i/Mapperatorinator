@@ -21,8 +21,23 @@ from ..features.timing import render_local_bpm_log_20ms_v1
 from ..features.timing import render_raw_beat_lengths_20ms_v1
 from ..features.timing import render_timing_track_20ms_v1
 from ..osu.hitobjects import ManiaHitObject, ManiaHitObjectKind, parse_mania_hit_objects
-from ..osu.timing import InvalidRedTimingError, MissingRedTimingError, RedTimingPoint, require_red_timing_points
+from ..osu.timing import InvalidRedTimingError
+from ..osu.timing import MAX_VALID_RED_BEAT_LENGTH_MS
+from ..osu.timing import MAX_VALID_RED_BPM
+from ..osu.timing import MIN_VALID_RED_BEAT_LENGTH_MS
+from ..osu.timing import MIN_VALID_RED_BPM
+from ..osu.timing import MissingRedTimingError
+from ..osu.timing import RedTimingPoint
+from ..osu.timing import require_red_timing_points
 from .token_statistics import DIFFICULTY_BIN_LABELS, WRITE_WINDOW_MS, difficulty_bin_label
+
+
+# The 2026-04-22 audit found a small SV/gimmick subset with syntactically red
+# timing points whose beat lengths are physically impossible. Those maps are
+# excluded from oracle timing statistics, but this cap keeps the exclusion an
+# explicit anomaly gate instead of letting broad timing corruption pass silently.
+MAX_TIMING_ANOMALY_MAP_RATIO = 0.01
+TIMING_ANOMALY_POLICY = "classified_invalid_red_timing_filtered_with_1pct_map_cap"
 
 
 @dataclass(frozen=True)
@@ -49,6 +64,7 @@ class DenseTimingAuditReport:
     total_map_count: int
     audited_map_count: int
     out_of_range_map_count: int
+    missing_red_timing_map_count: int
     invalid_red_timing_map_count: int
     invalid_red_timing_point_count: int
     nonfinite_red_timing_point_count: int
@@ -86,6 +102,14 @@ class DenseTimingAuditReport:
 @dataclass(frozen=True)
 class DenseTimingGateDecision:
     status: str
+    renderer_numerics_status: str
+    valid_timing_subset_status: str
+    timing_anomaly_status: str
+    coverage_status: str
+    timing_anomaly_policy: str
+    max_timing_anomaly_map_ratio: float
+    timing_anomaly_map_ratio: float
+    accounted_map_count: int
     timing_track_version: str
     timing_frame_hop_ms: int
     timing_frame_center_offset_ms: int
@@ -93,6 +117,7 @@ class DenseTimingGateDecision:
     timing_channels: tuple[str, ...]
     pulse_shape: str
     pulse_width_ms: int
+    missing_red_timing_map_count: int
     invalid_red_timing_map_count: int
     invalid_red_timing_point_count: int
     nonfinite_red_timing_point_count: int
@@ -115,6 +140,7 @@ class DenseTimingGateDecision:
     bpm_norm_clipped_ratio: float
     bpm_log_mean: float
     bpm_log_std: float
+    failure_reasons: list[str]
 
 
 @dataclass(frozen=True)
@@ -252,6 +278,7 @@ def audit_dense_timing_tracks(
     prepared_maps: list[_PreparedDenseTimingMap] = []
     total_map_count = 0
     out_of_range_map_count = 0
+    missing_red_timing_map_count = 0
     invalid_red_timing_map_count = 0
     invalid_red_timing_point_count = 0
     nonfinite_red_timing_point_count = 0
@@ -284,7 +311,7 @@ def audit_dense_timing_tracks(
             implausible_red_timing_point_count += exc.counts.implausible
             continue
         except MissingRedTimingError:
-            invalid_red_timing_map_count += 1
+            missing_red_timing_map_count += 1
             continue
 
         hitobjects = parse_mania_hit_objects(beatmap_path, expected_key_count=4)
@@ -399,6 +426,7 @@ def audit_dense_timing_tracks(
         total_map_count=total_map_count,
         audited_map_count=len(prepared_maps),
         out_of_range_map_count=out_of_range_map_count,
+        missing_red_timing_map_count=missing_red_timing_map_count,
         invalid_red_timing_map_count=invalid_red_timing_map_count,
         invalid_red_timing_point_count=invalid_red_timing_point_count,
         nonfinite_red_timing_point_count=nonfinite_red_timing_point_count,
@@ -438,13 +466,31 @@ def audit_dense_timing_tracks(
     )
 
 
-def build_dense_timing_gate_decision(report: DenseTimingAuditReport) -> DenseTimingGateDecision:
-    status = (
+def build_dense_timing_gate_decision(
+    report: DenseTimingAuditReport,
+    *,
+    max_timing_anomaly_map_ratio: float = MAX_TIMING_ANOMALY_MAP_RATIO,
+) -> DenseTimingGateDecision:
+    failure_reasons: list[str] = []
+
+    accounted_map_count = (
+        report.audited_map_count
+        + report.out_of_range_map_count
+        + report.missing_red_timing_map_count
+        + report.invalid_red_timing_map_count
+        + report.negative_time_hitobject_map_count
+        + report.audio_duration_failure_count
+    )
+    coverage_status = "PASS" if accounted_map_count == report.total_map_count else "FAIL"
+    if coverage_status == "FAIL":
+        failure_reasons.append("audited and filtered map counts do not account for total_map_count")
+
+    renderer_numerics_status = (
         "PASS"
         if (
             report.audited_map_count > 0
-            and report.invalid_red_timing_map_count == 0
-            and report.invalid_red_timing_point_count == 0
+            and report.window_count > 0
+            and report.frame_count > 0
             and report.timing_track_nan_count == 0
             and report.timing_track_inf_count == 0
             and report.phase_unit_norm_error_max <= 1e-5
@@ -454,8 +500,65 @@ def build_dense_timing_gate_decision(report: DenseTimingAuditReport) -> DenseTim
         )
         else "FAIL"
     )
+    if renderer_numerics_status == "FAIL":
+        failure_reasons.append("rendered dense timing numerics violate finite/unit/clip constraints")
+
+    valid_timing_subset_status = (
+        "PASS"
+        if (
+            report.audited_map_count > 0
+            and report.raw_bpm_min >= MIN_VALID_RED_BPM - 1e-6
+            and report.raw_bpm_max <= MAX_VALID_RED_BPM + 1e-6
+            and report.raw_beat_length_min >= MIN_VALID_RED_BEAT_LENGTH_MS - 1e-6
+            and report.raw_beat_length_max <= MAX_VALID_RED_BEAT_LENGTH_MS + 1e-6
+        )
+        else "FAIL"
+    )
+    if valid_timing_subset_status == "FAIL":
+        failure_reasons.append("filtered timing subset raw BPM/beat-length extrema violate policy")
+
+    timing_anomaly_map_ratio = _rate(report.invalid_red_timing_map_count, report.total_map_count)
+    invalid_reason_total = (
+        report.nonfinite_red_timing_point_count
+        + report.nonpositive_red_timing_point_count
+        + report.implausible_red_timing_point_count
+    )
+    timing_anomaly_status = (
+        "PASS"
+        if (
+            report.missing_red_timing_map_count == 0
+            and report.nonfinite_red_timing_point_count == 0
+            and report.invalid_red_timing_point_count == invalid_reason_total
+            and (
+                report.invalid_red_timing_map_count == 0
+                or report.invalid_red_timing_point_count > 0
+            )
+            and timing_anomaly_map_ratio <= max_timing_anomaly_map_ratio
+        )
+        else "FAIL"
+    )
+    if timing_anomaly_status == "FAIL":
+        if report.missing_red_timing_map_count:
+            failure_reasons.append("missing red timing maps are not accepted by the anomaly gate")
+        if report.nonfinite_red_timing_point_count:
+            failure_reasons.append("nonfinite red timing points are not accepted by the anomaly gate")
+        if report.invalid_red_timing_point_count != invalid_reason_total:
+            failure_reasons.append("invalid red timing point counts do not match classified reasons")
+        if report.invalid_red_timing_map_count and report.invalid_red_timing_point_count == 0:
+            failure_reasons.append("invalid red timing maps have no classified invalid timing points")
+        if timing_anomaly_map_ratio > max_timing_anomaly_map_ratio:
+            failure_reasons.append("timing anomaly map ratio exceeds configured cap")
+
     return DenseTimingGateDecision(
-        status=status,
+        status="PASS" if not failure_reasons else "FAIL",
+        renderer_numerics_status=renderer_numerics_status,
+        valid_timing_subset_status=valid_timing_subset_status,
+        timing_anomaly_status=timing_anomaly_status,
+        coverage_status=coverage_status,
+        timing_anomaly_policy=TIMING_ANOMALY_POLICY,
+        max_timing_anomaly_map_ratio=max_timing_anomaly_map_ratio,
+        timing_anomaly_map_ratio=timing_anomaly_map_ratio,
+        accounted_map_count=accounted_map_count,
         timing_track_version=TIMING_TRACK_VERSION,
         timing_frame_hop_ms=int(DEFAULT_TIMING_TRACK_CONFIG.frame_hop_ms),
         timing_frame_center_offset_ms=int(DEFAULT_TIMING_TRACK_CONFIG.frame_center_offset_ms),
@@ -463,6 +566,7 @@ def build_dense_timing_gate_decision(report: DenseTimingAuditReport) -> DenseTim
         timing_channels=TIMING_TRACK_CHANNELS,
         pulse_shape="triangular",
         pulse_width_ms=int(DEFAULT_TIMING_TRACK_CONFIG.pulse_width_ms),
+        missing_red_timing_map_count=report.missing_red_timing_map_count,
         invalid_red_timing_map_count=report.invalid_red_timing_map_count,
         invalid_red_timing_point_count=report.invalid_red_timing_point_count,
         nonfinite_red_timing_point_count=report.nonfinite_red_timing_point_count,
@@ -485,6 +589,7 @@ def build_dense_timing_gate_decision(report: DenseTimingAuditReport) -> DenseTim
         bpm_norm_clipped_ratio=report.bpm_norm_clipped_ratio,
         bpm_log_mean=report.bpm_log_mean,
         bpm_log_std=report.bpm_log_std,
+        failure_reasons=failure_reasons,
     )
 
 

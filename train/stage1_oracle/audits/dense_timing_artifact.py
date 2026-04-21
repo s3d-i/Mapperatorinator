@@ -40,7 +40,7 @@ def build_dense_timing_artifact_payload(
     provenance: DenseTimingAuditProvenance,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "audit_name": "dense_timing_track_4k_2to6",
         "report": asdict(report),
         "gate_decision": asdict(build_dense_timing_gate_decision(report)),
@@ -154,6 +154,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"total_map_count {report['total_map_count']}")
     print(f"audited_map_count {report['audited_map_count']}")
     print(f"gate_status {gate_decision['status']}")
+    print(f"renderer_numerics_status {gate_decision['renderer_numerics_status']}")
+    print(f"valid_timing_subset_status {gate_decision['valid_timing_subset_status']}")
+    print(f"timing_anomaly_status {gate_decision['timing_anomaly_status']}")
+    print(f"coverage_status {gate_decision['coverage_status']}")
+    print(f"timing_anomaly_map_ratio {gate_decision['timing_anomaly_map_ratio']}")
+    print(f"max_timing_anomaly_map_ratio {gate_decision['max_timing_anomaly_map_ratio']}")
     print(f"window_count {report['window_count']}")
     print(f"frame_count {report['frame_count']}")
     print(f"timing_track_nan_count {report['timing_track_nan_count']}")
@@ -175,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"bpm_norm_clipped_low_count {report['bpm_norm_clipped_low_count']}")
     print(f"bpm_norm_clipped_high_count {report['bpm_norm_clipped_high_count']}")
     print(f"bpm_norm_clipped_ratio {report['bpm_norm_clipped_ratio']}")
+    print(f"missing_red_timing_map_count {report['missing_red_timing_map_count']}")
     print(f"invalid_red_timing_map_count {report['invalid_red_timing_map_count']}")
     print(f"invalid_red_timing_point_count {report['invalid_red_timing_point_count']}")
     print(f"nonfinite_red_timing_point_count {report['nonfinite_red_timing_point_count']}")
@@ -182,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"implausible_red_timing_point_count {report['implausible_red_timing_point_count']}")
     print(f"bpm_log_mean {report['bpm_log_mean']}")
     print(f"bpm_log_std {report['bpm_log_std']}")
+    print(f"failure_reasons {gate_decision['failure_reasons']}")
     print(f"debug_plot_count {len(report['debug_plot_paths'])}")
     print(f"output_json {args.output_json}")
     return 0
