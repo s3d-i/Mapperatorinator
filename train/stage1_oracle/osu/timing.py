@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+
+MIN_VALID_RED_BPM = 20.0
+MAX_VALID_RED_BPM = 1000.0
+MIN_VALID_RED_BEAT_LENGTH_MS = 60000.0 / MAX_VALID_RED_BPM
+MAX_VALID_RED_BEAT_LENGTH_MS = 60000.0 / MIN_VALID_RED_BPM
 
 
 @dataclass(frozen=True)
@@ -13,14 +20,62 @@ class RedTimingPoint:
     meter: int = 4
 
 
+@dataclass(frozen=True)
+class RedTimingInvalidCounts:
+    nonfinite: int = 0
+    nonpositive: int = 0
+    implausible: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.nonfinite + self.nonpositive + self.implausible
+
+    def add_reason(self, reason: str) -> "RedTimingInvalidCounts":
+        if reason == "nonfinite":
+            return RedTimingInvalidCounts(
+                nonfinite=self.nonfinite + 1,
+                nonpositive=self.nonpositive,
+                implausible=self.implausible,
+            )
+        if reason == "nonpositive":
+            return RedTimingInvalidCounts(
+                nonfinite=self.nonfinite,
+                nonpositive=self.nonpositive + 1,
+                implausible=self.implausible,
+            )
+        if reason == "implausible":
+            return RedTimingInvalidCounts(
+                nonfinite=self.nonfinite,
+                nonpositive=self.nonpositive,
+                implausible=self.implausible + 1,
+            )
+        raise ValueError(f"unknown invalid red timing reason: {reason}")
+
+
 class MissingRedTimingError(ValueError):
     pass
+
+
+class InvalidRedTimingError(MissingRedTimingError):
+    def __init__(self, beatmap_path: str | Path, counts: RedTimingInvalidCounts) -> None:
+        self.counts = counts
+        super().__init__(
+            f"{beatmap_path} has invalid red timing point(s): "
+            f"nonfinite={counts.nonfinite}, "
+            f"nonpositive={counts.nonpositive}, "
+            f"implausible={counts.implausible}; "
+            "valid red timing requires finite offsets and "
+            f"{MIN_VALID_RED_BEAT_LENGTH_MS:g} <= beat_length_ms <= "
+            f"{MAX_VALID_RED_BEAT_LENGTH_MS:g} "
+            f"({MIN_VALID_RED_BPM:g} <= bpm <= {MAX_VALID_RED_BPM:g})",
+        )
 
 
 def parse_red_timing_points(beatmap_path: str | Path) -> list[RedTimingPoint]:
     beatmap_path = Path(beatmap_path)
     section: str | None = None
     timing_points: list[RedTimingPoint] = []
+    invalid_counts = RedTimingInvalidCounts()
 
     with beatmap_path.open("r", encoding="utf-8-sig", errors="replace") as handle:
         for raw_line in handle:
@@ -43,6 +98,11 @@ def parse_red_timing_points(beatmap_path: str | Path) -> list[RedTimingPoint]:
                 timing_points.append(_parse_timing_line(beatmap_path, line))
             except _NonRedTimingPoint:
                 continue
+            except _InvalidRedTimingPoint as exc:
+                invalid_counts = invalid_counts.add_reason(exc.reason)
+
+    if invalid_counts.total:
+        raise InvalidRedTimingError(beatmap_path, invalid_counts)
 
     return sorted(timing_points, key=lambda point: point.offset_ms)
 
@@ -59,11 +119,30 @@ def red_timing_point_at(timing_points: Sequence[RedTimingPoint], time_ms: float)
         raise MissingRedTimingError("cannot look up timing with no red timing points")
 
     sorted_points = sorted(timing_points, key=lambda point: point.offset_ms)
+    for point in sorted_points:
+        validate_red_timing_point(point)
     offsets = [point.offset_ms for point in sorted_points]
     index = bisect_right(offsets, time_ms) - 1
     if index < 0:
         return sorted_points[0]
     return sorted_points[index]
+
+
+def validate_red_timing_point(point: RedTimingPoint) -> None:
+    if not math.isfinite(point.offset_ms) or not math.isfinite(point.beat_length_ms):
+        raise ValueError(f"red timing points must be finite: {point}")
+    if point.beat_length_ms <= 0:
+        raise ValueError(f"red timing points must have positive beat lengths: {point}")
+    if not is_plausible_red_beat_length_ms(point.beat_length_ms):
+        raise ValueError(
+            f"implausible red timing beat length: {point}; "
+            f"expected {MIN_VALID_RED_BEAT_LENGTH_MS:g} <= beat_length_ms <= "
+            f"{MAX_VALID_RED_BEAT_LENGTH_MS:g}",
+        )
+
+
+def is_plausible_red_beat_length_ms(beat_length_ms: float) -> bool:
+    return MIN_VALID_RED_BEAT_LENGTH_MS <= beat_length_ms <= MAX_VALID_RED_BEAT_LENGTH_MS
 
 
 def _parse_timing_line(beatmap_path: Path, line: str) -> RedTimingPoint:
@@ -81,8 +160,12 @@ def _parse_timing_line(beatmap_path: Path, line: str) -> RedTimingPoint:
 
     if uninherited == 0:
         raise _NonRedTimingPoint
+    if not math.isfinite(offset_ms) or not math.isfinite(beat_length_ms):
+        raise _InvalidRedTimingPoint("nonfinite")
     if beat_length_ms <= 0:
-        raise _NonRedTimingPoint
+        raise _InvalidRedTimingPoint("nonpositive")
+    if not is_plausible_red_beat_length_ms(beat_length_ms):
+        raise _InvalidRedTimingPoint("implausible")
     if meter <= 0:
         raise ValueError(f"Malformed red timing point in {beatmap_path}: meter must be positive: {line}")
 
@@ -97,3 +180,9 @@ def _parse_optional_int(parts: Sequence[str], index: int, *, default: int) -> in
 
 class _NonRedTimingPoint(Exception):
     pass
+
+
+class _InvalidRedTimingPoint(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)

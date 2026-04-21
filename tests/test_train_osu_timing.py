@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from train.stage1_oracle.osu.timing import (
+    InvalidRedTimingError,
     MissingRedTimingError,
     RedTimingPoint,
     parse_red_timing_points,
@@ -94,9 +95,25 @@ class TrainOsuTimingTests(unittest.TestCase):
             osu_path = Path(tmpdir) / "chart.osu"
             _write_osu(osu_path, ["154048,-1E-40,4,2,0,25,1,0"])
 
-            self.assertEqual(parse_red_timing_points(osu_path), [])
-            with self.assertRaisesRegex(MissingRedTimingError, "no red timing point"):
+            with self.assertRaisesRegex(InvalidRedTimingError, "nonpositive"):
+                parse_red_timing_points(osu_path)
+            with self.assertRaisesRegex(InvalidRedTimingError, "nonpositive"):
                 require_red_timing_points(osu_path)
+
+    def test_implausible_positive_red_timing_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            osu_path = Path(tmpdir) / "chart.osu"
+            _write_osu(
+                osu_path,
+                [
+                    "0,500,4,2,0,80,1,0",
+                    "1000,1e-100,4,1,0,70,1,0",
+                    "2000,1E+308,4,1,0,70,1,0",
+                ],
+            )
+
+            with self.assertRaisesRegex(InvalidRedTimingError, "implausible"):
+                parse_red_timing_points(osu_path)
 
 
 if __name__ == "__main__":
