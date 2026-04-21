@@ -6,6 +6,9 @@ Spec: `docs/superpowers/specs/2026-04-21-oracle-timing-4k-mapper-2to6-design.md`
 
 Status: **FAIL**
 
+Follow-up rerun with the validity gate enabled:
+`docs/superpowers/audits/2026-04-22-dense-timing-track-audit-4k-2to6.md`.
+
 This audit run is retained as evidence of a renderer-numerics false positive. The rendered dense
 track contained no NaN/Inf values, but the source red timing set contained positive timing points
 with impossible beat lengths. Overall pre-training gate status is therefore FAIL until the audit is
