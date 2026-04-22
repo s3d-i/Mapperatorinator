@@ -8,6 +8,10 @@
 
 - Run Python code in this repository with `uv run` consistently instead of calling `python` or `python3` directly.
 
+## Testing
+
+- Run tests with `uv run python -m unittest discover`.
+
 ## Compatibility and Placeholder Policy
 
 - Do not preserve backward compatibility unless explicitly instructed.
