@@ -72,6 +72,17 @@ Ultimate run using per-bin caps for every eligible map in
 uv run python -m train.stage1_oracle.training.overfit_32 --config train/stage1_oracle/training/configs/stage1_oracle_ultimate_mps.yaml
 ```
 
+Training writes a resumable latest checkpoint to `<output_dir>/checkpoint.pt` at step 1,
+every `eval_every` steps by default, and at the final step. Archived step checkpoints are
+stored as `<output_dir>/checkpoints/checkpoint_step_*.pt`. Use `--save-every N` to change
+the checkpoint cadence, and resume a run with:
+
+```bash
+uv run python -m train.stage1_oracle.training.overfit_32 \
+  --config train/stage1_oracle/training/configs/stage1_oracle_overnight_mps.yaml \
+  --resume-from train/artifacts/runs/stage1_oracle/stage1_oracle_overnight_18m_mps/checkpoint.pt
+```
+
 ## Stage 1 oracle inference commands
 
 Stage 1 inference is still oracle-timing inference: pass an audio file and a reference `.osu`

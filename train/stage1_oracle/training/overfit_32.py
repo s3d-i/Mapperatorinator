@@ -4,10 +4,11 @@ import argparse
 import json
 import math
 import random
+import shutil
 from dataclasses import asdict, dataclass
 from itertools import cycle
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +39,7 @@ REQUIRED_PRETRAINING_GATE_NAMES = (
     "dense_timing_track",
 )
 PRETRAINING_GATE_MANIFEST_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 1
 RUN_CONFIG_KEYS = {
     "dataset_root",
     "index_path",
@@ -52,6 +54,8 @@ RUN_CONFIG_KEYS = {
     "seed",
     "device",
     "run_name",
+    "save_every",
+    "resume_from",
     "synthetic_smoke",
     "model",
 }
@@ -601,8 +605,10 @@ def run_synthetic_smoke(
     *,
     output_dir: Path,
     max_steps: int = 2,
+    save_every: int | None = None,
     seed: int = 1337,
     device_name: str = "auto",
+    resume_from: Path | None = None,
 ) -> OverfitRunResult:
     torch.manual_seed(seed)
     vocab = Stage1Vocab()
@@ -629,6 +635,7 @@ def run_synthetic_smoke(
         config=config,
         max_steps=max_steps,
         eval_every=max(1, max_steps),
+        save_every=save_every,
         learning_rate=1e-2,
         seed=seed,
         device_name=device_name,
@@ -646,6 +653,7 @@ def run_synthetic_smoke(
         },
         dataset_filter_report=None,
         training_sampling=None,
+        resume_from=resume_from,
     )
 
 
@@ -664,6 +672,8 @@ def run_overfit_32(
     seed: int = 1337,
     device_name: str = "auto",
     run_name: str = "overfit_32",
+    save_every: int | None = None,
+    resume_from: Path | None = None,
     model_config_overrides: dict[str, int] | None = None,
 ) -> OverfitRunResult:
     maps_per_bin = _validate_maps_per_bin_cap(maps_per_bin)
@@ -724,6 +734,7 @@ def run_overfit_32(
         ),
         max_steps=max_steps,
         eval_every=eval_every,
+        save_every=save_every,
         learning_rate=learning_rate,
         seed=seed,
         device_name=device_name,
@@ -738,6 +749,7 @@ def run_overfit_32(
         pretraining_gates=pretraining_gates,
         dataset_filter_report=asdict(dataset.filter_report),
         training_sampling=_sampling_plan_report(sampling_plan),
+        resume_from=resume_from,
     )
 
 
@@ -789,6 +801,264 @@ def _validate_model_config_overrides(overrides: dict[str, int] | None) -> dict[s
     return validated
 
 
+def _resolve_save_every(save_every: int | None, eval_every: int) -> int:
+    if eval_every <= 0:
+        raise ValueError(f"eval_every must be positive, got {eval_every}")
+    if save_every is None:
+        return eval_every
+    resolved = int(save_every)
+    if resolved <= 0:
+        raise ValueError(f"save_every must be positive, got {save_every}")
+    return resolved
+
+
+def _should_write_checkpoint(*, step: int, max_steps: int, save_every: int) -> bool:
+    return step == 1 or step % save_every == 0 or step == max_steps
+
+
+def _capture_rng_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python_random": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    if (
+        hasattr(torch, "mps")
+        and torch.backends.mps.is_available()
+        and hasattr(torch.mps, "get_rng_state")
+    ):
+        try:
+            state["mps"] = torch.mps.get_rng_state()
+        except RuntimeError:
+            pass
+    return state
+
+
+def _restore_rng_state(raw_state: object) -> None:
+    if not isinstance(raw_state, Mapping):
+        raise ValueError("resume checkpoint training_state.rng_state must be a mapping")
+
+    python_state = raw_state.get("python_random")
+    if python_state is not None:
+        random.setstate(python_state)
+
+    torch_state = raw_state.get("torch")
+    if torch_state is not None:
+        if not isinstance(torch_state, torch.Tensor):
+            raise ValueError("resume checkpoint torch RNG state must be a tensor")
+        torch.set_rng_state(torch_state.cpu())
+
+    cuda_state = raw_state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+    mps_state = raw_state.get("mps")
+    if (
+        mps_state is not None
+        and hasattr(torch, "mps")
+        and torch.backends.mps.is_available()
+        and hasattr(torch.mps, "set_rng_state")
+    ):
+        if not isinstance(mps_state, torch.Tensor):
+            raise ValueError("resume checkpoint mps RNG state must be a tensor")
+        torch.mps.set_rng_state(mps_state.cpu())
+
+
+def _load_resume_checkpoint(
+    resume_from: Path,
+    *,
+    expected_config: Stage1OracleMapperConfig,
+) -> dict[str, Any]:
+    checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"resume checkpoint must contain a mapping: {resume_from}")
+    raw_config = checkpoint.get("config")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError(f"resume checkpoint missing config: {resume_from}")
+    loaded_config = Stage1OracleMapperConfig(**dict(raw_config))
+    if loaded_config != expected_config:
+        raise ValueError("resume checkpoint config does not match the requested run config")
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(f"resume checkpoint missing model_state_dict: {resume_from}")
+    if "optimizer_state_dict" not in checkpoint:
+        raise ValueError("resume checkpoint missing optimizer_state_dict; old inference-only checkpoints cannot resume")
+    training_state = checkpoint.get("training_state")
+    if not isinstance(training_state, Mapping):
+        raise ValueError("resume checkpoint missing training_state")
+    step = training_state.get("step")
+    if not isinstance(step, int) or step < 0:
+        raise ValueError("resume checkpoint training_state.step must be a non-negative integer")
+    if "rng_state" not in training_state:
+        raise ValueError("resume checkpoint missing training_state.rng_state")
+    history = checkpoint.get("history")
+    if not isinstance(history, list):
+        raise ValueError("resume checkpoint history must be a list")
+    return checkpoint
+
+
+def _move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _advance_training_iterator(iterator: Any, loader: DataLoader, completed_step: int) -> Any:
+    batches_per_epoch = len(loader)
+    if batches_per_epoch <= 0:
+        return iterator
+    for _ in range(completed_step % batches_per_epoch):
+        next(iterator)
+    return iterator
+
+
+def _latest_metrics_from_checkpoint(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    training_state = checkpoint["training_state"]
+    if isinstance(training_state, Mapping):
+        final_metrics = training_state.get("final_metrics")
+        if isinstance(final_metrics, Mapping):
+            return dict(final_metrics)
+
+    history = checkpoint["history"]
+    if history:
+        last_entry = history[-1]
+        if isinstance(last_entry, Mapping):
+            return {key: value for key, value in last_entry.items() if key != "step"}
+    return {"loss": float("nan"), "token_accuracy": 0.0}
+
+
+def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(dict(payload), tmp_path)
+    tmp_path.replace(path)
+
+
+def _copy_file_atomically(source_path: Path, destination_path: Path) -> None:
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination_path.with_name(f".{destination_path.name}.tmp")
+    shutil.copy2(source_path, tmp_path)
+    tmp_path.replace(destination_path)
+
+
+def _write_report(report_path: Path, payload: Mapping[str, Any]) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = report_path.with_name(f".{report_path.name}.tmp")
+    tmp_path.write_text(
+        json.dumps(dict(payload), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    tmp_path.replace(report_path)
+
+
+def _training_report_payload(
+    *,
+    run_name: str,
+    seed: int,
+    max_steps: int,
+    completed_steps: int,
+    eval_every: int,
+    save_every: int,
+    learning_rate: float,
+    config: Stage1OracleMapperConfig,
+    device: torch.device,
+    parameter_count: int,
+    timing_track: dict[str, Any],
+    pretraining_gates: dict[str, Any],
+    dataset_filter_report: dict[str, Any] | None,
+    training_sampling: dict[str, Any] | None,
+    overfit_coverage: dict[str, Any] | None,
+    history: list[dict[str, Any]],
+    final_metrics: dict[str, Any],
+    resume_from: Path | None,
+) -> dict[str, Any]:
+    return {
+        "run_name": run_name,
+        "seed": seed,
+        "max_steps": max_steps,
+        "completed_steps": completed_steps,
+        "is_complete": completed_steps >= max_steps,
+        "eval_every": eval_every,
+        "save_every": save_every,
+        "learning_rate": learning_rate,
+        "config": asdict(config),
+        "device": str(device),
+        "parameter_count": parameter_count,
+        "timing_track": timing_track,
+        "pretraining_gates": pretraining_gates,
+        "dataset_filter_report": dataset_filter_report,
+        "training_sampling": training_sampling,
+        "overfit_coverage": overfit_coverage,
+        "history": history,
+        "final": final_metrics,
+        "resume_from": resume_from.as_posix() if resume_from is not None else None,
+    }
+
+
+def _training_checkpoint_payload(
+    *,
+    model: Stage1OracleMapper,
+    optimizer: torch.optim.Optimizer,
+    config: Stage1OracleMapperConfig,
+    seed: int,
+    run_name: str,
+    history: list[dict[str, Any]],
+    timing_track: dict[str, Any],
+    pretraining_gates: dict[str, Any],
+    dataset_filter_report: dict[str, Any] | None,
+    training_sampling: dict[str, Any] | None,
+    step: int,
+    max_steps: int,
+    eval_every: int,
+    save_every: int,
+    learning_rate: float,
+    device: torch.device,
+    final_metrics: dict[str, Any],
+    last_train_loss: float,
+    resume_from: Path | None,
+) -> dict[str, Any]:
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": asdict(config),
+        "seed": seed,
+        "run_name": run_name,
+        "history": history,
+        "timing_track": timing_track,
+        "pretraining_gates": pretraining_gates,
+        "dataset_filter_report": dataset_filter_report,
+        "training_sampling": training_sampling,
+        "training_state": {
+            "step": step,
+            "max_steps": max_steps,
+            "is_complete": step >= max_steps,
+            "eval_every": eval_every,
+            "save_every": save_every,
+            "learning_rate": learning_rate,
+            "device": str(device),
+            "last_train_loss": last_train_loss,
+            "final_metrics": final_metrics,
+            "resume_from": resume_from.as_posix() if resume_from is not None else None,
+            "rng_state": _capture_rng_state(),
+        },
+    }
+
+
+def _write_training_checkpoint(
+    *,
+    output_dir: Path,
+    latest_checkpoint_path: Path,
+    payload: Mapping[str, Any],
+    step: int,
+) -> Path:
+    archive_path = output_dir / "checkpoints" / f"checkpoint_step_{step:06d}.pt"
+    _atomic_torch_save(payload, archive_path)
+    _copy_file_atomically(archive_path, latest_checkpoint_path)
+    return archive_path
+
+
 def _run_training(
     *,
     loader: DataLoader,
@@ -796,6 +1066,7 @@ def _run_training(
     config: Stage1OracleMapperConfig,
     max_steps: int,
     eval_every: int,
+    save_every: int | None = None,
     learning_rate: float,
     seed: int,
     device_name: str,
@@ -807,16 +1078,42 @@ def _run_training(
     pretraining_gates: dict[str, Any],
     dataset_filter_report: dict[str, Any] | None,
     training_sampling: dict[str, Any] | None,
+    resume_from: Path | None = None,
 ) -> OverfitRunResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = select_torch_device(device_name)
+    save_every = _resolve_save_every(save_every, eval_every)
+    checkpoint_path = output_dir / "checkpoint.pt"
+    report_path = output_dir / "report.json"
+
     model = Stage1OracleMapper(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     history: list[dict[str, Any]] = []
     iterator = cycle(loader)
+    completed_step = 0
+    last_train_loss = float("nan")
+    final_metrics: dict[str, Any] = {"loss": float("nan"), "token_accuracy": 0.0}
 
-    final_metrics = {"loss": float("nan"), "token_accuracy": 0.0}
-    for step in range(1, max_steps + 1):
+    if resume_from is not None:
+        resume_checkpoint = _load_resume_checkpoint(resume_from, expected_config=config)
+        model.load_state_dict(resume_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        _move_optimizer_state_to_device(optimizer, device)
+
+        training_state = resume_checkpoint["training_state"]
+        completed_step = int(training_state["step"])
+        history = [dict(entry) for entry in resume_checkpoint["history"]]
+        final_metrics = _latest_metrics_from_checkpoint(resume_checkpoint)
+        last_train_loss = float(training_state.get("last_train_loss", final_metrics.get("loss", float("nan"))))
+        _restore_rng_state(training_state["rng_state"])
+        iterator = _advance_training_iterator(iterator, loader, completed_step)
+        print(
+            f"resume_progress checkpoint={resume_from} step={completed_step}/{max_steps}",
+            flush=True,
+        )
+
+    parameter_count = model.parameter_count()
+    for step in range(completed_step + 1, max_steps + 1):
         model.train()
         batch = _move_batch(next(iterator), device)
         optimizer.zero_grad(set_to_none=True)
@@ -835,12 +1132,16 @@ def _run_training(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        last_train_loss = float(loss.item())
 
-        if step == 1 or step % eval_every == 0 or step == max_steps:
+        should_eval = step == 1 or step % eval_every == 0 or step == max_steps
+        should_save = _should_write_checkpoint(step=step, max_steps=max_steps, save_every=save_every)
+        if should_eval or should_save:
             print(
                 f"train_progress step={step}/{max_steps} train_loss={loss.item():.6f}",
                 flush=True,
             )
+        if should_eval:
             final_metrics = teacher_forced_metrics_for_loader(model, eval_loader, device=device)
             if step == max_steps:
                 final_metrics.update(greedy_decode_metrics_for_loader(model, eval_loader, vocab=vocab, device=device))
@@ -852,46 +1153,120 @@ def _run_training(
             )
             history.append({"step": step, **final_metrics})
 
-    checkpoint_path = output_dir / "checkpoint.pt"
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": asdict(config),
-            "seed": seed,
-            "run_name": run_name,
-            "history": history,
-            "timing_track": timing_track,
-            "pretraining_gates": pretraining_gates,
-            "dataset_filter_report": dataset_filter_report,
-            "training_sampling": training_sampling,
-        },
-        checkpoint_path,
-    )
-    report_path = output_dir / "report.json"
-    report_path.write_text(
-        json.dumps(
-            {
-                "run_name": run_name,
-                "seed": seed,
-                "max_steps": max_steps,
-                "eval_every": eval_every,
-                "learning_rate": learning_rate,
-                "config": asdict(config),
-                "device": str(device),
-                "parameter_count": model.parameter_count(),
-                "timing_track": timing_track,
-                "pretraining_gates": pretraining_gates,
-                "dataset_filter_report": dataset_filter_report,
-                "training_sampling": training_sampling,
-                "overfit_coverage": overfit_coverage,
-                "history": history,
-                "final": final_metrics,
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+        if should_save:
+            checkpoint_payload = _training_checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                config=config,
+                seed=seed,
+                run_name=run_name,
+                history=history,
+                timing_track=timing_track,
+                pretraining_gates=pretraining_gates,
+                dataset_filter_report=dataset_filter_report,
+                training_sampling=training_sampling,
+                step=step,
+                max_steps=max_steps,
+                eval_every=eval_every,
+                save_every=save_every,
+                learning_rate=learning_rate,
+                device=device,
+                final_metrics=final_metrics,
+                last_train_loss=last_train_loss,
+                resume_from=resume_from,
+            )
+            archived_checkpoint_path = _write_training_checkpoint(
+                output_dir=output_dir,
+                latest_checkpoint_path=checkpoint_path,
+                payload=checkpoint_payload,
+                step=step,
+            )
+            _write_report(
+                report_path,
+                _training_report_payload(
+                    run_name=run_name,
+                    seed=seed,
+                    max_steps=max_steps,
+                    completed_steps=step,
+                    eval_every=eval_every,
+                    save_every=save_every,
+                    learning_rate=learning_rate,
+                    config=config,
+                    device=device,
+                    parameter_count=parameter_count,
+                    timing_track=timing_track,
+                    pretraining_gates=pretraining_gates,
+                    dataset_filter_report=dataset_filter_report,
+                    training_sampling=training_sampling,
+                    overfit_coverage=overfit_coverage,
+                    history=history,
+                    final_metrics=final_metrics,
+                    resume_from=resume_from,
+                ),
+            )
+            print(
+                f"checkpoint_progress step={step}/{max_steps} "
+                f"path={archived_checkpoint_path} latest_path={checkpoint_path}",
+                flush=True,
+            )
+
+    if not checkpoint_path.is_file():
+        checkpoint_payload = _training_checkpoint_payload(
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            seed=seed,
+            run_name=run_name,
+            history=history,
+            timing_track=timing_track,
+            pretraining_gates=pretraining_gates,
+            dataset_filter_report=dataset_filter_report,
+            training_sampling=training_sampling,
+            step=completed_step,
+            max_steps=max_steps,
+            eval_every=eval_every,
+            save_every=save_every,
+            learning_rate=learning_rate,
+            device=device,
+            final_metrics=final_metrics,
+            last_train_loss=last_train_loss,
+            resume_from=resume_from,
+        )
+        archived_checkpoint_path = _write_training_checkpoint(
+            output_dir=output_dir,
+            latest_checkpoint_path=checkpoint_path,
+            payload=checkpoint_payload,
+            step=completed_step,
+        )
+        _write_report(
+            report_path,
+            _training_report_payload(
+                run_name=run_name,
+                seed=seed,
+                max_steps=max_steps,
+                completed_steps=completed_step,
+                eval_every=eval_every,
+                save_every=save_every,
+                learning_rate=learning_rate,
+                config=config,
+                device=device,
+                parameter_count=parameter_count,
+                timing_track=timing_track,
+                pretraining_gates=pretraining_gates,
+                dataset_filter_report=dataset_filter_report,
+                training_sampling=training_sampling,
+                overfit_coverage=overfit_coverage,
+                history=history,
+                final_metrics=final_metrics,
+                resume_from=resume_from,
+            ),
+        )
+        print(
+            f"checkpoint_progress step={completed_step}/{max_steps} "
+            f"path={archived_checkpoint_path} latest_path={checkpoint_path}",
+            flush=True,
+        )
+
     return OverfitRunResult(
         report_path=report_path,
         checkpoint_path=checkpoint_path,
@@ -1310,6 +1685,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=config_defaults.get("seed", 1337))
     parser.add_argument("--device", default=config_defaults.get("device", "auto"), choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--run-name", default=config_defaults.get("run_name", "overfit_32"))
+    parser.add_argument("--save-every", type=int, default=config_defaults.get("save_every"))
+    parser.add_argument("--resume-from", default=config_defaults.get("resume_from"))
     parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
     parser.add_argument("--d-model", type=int, default=model_defaults.get("d_model"))
     parser.add_argument("--heads", type=int, default=model_defaults.get("heads"))
@@ -1327,8 +1704,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         result = run_synthetic_smoke(
             output_dir=Path(args.output_dir),
             max_steps=args.max_steps,
+            save_every=args.save_every,
             seed=args.seed,
             device_name=args.device,
+            resume_from=Path(args.resume_from) if args.resume_from is not None else None,
         )
     else:
         if args.gate_manifest is None:
@@ -1347,6 +1726,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             seed=args.seed,
             device_name=args.device,
             run_name=args.run_name,
+            save_every=args.save_every,
+            resume_from=Path(args.resume_from) if args.resume_from is not None else None,
             model_config_overrides=model_config_overrides,
         )
 

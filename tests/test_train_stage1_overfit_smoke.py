@@ -134,6 +134,74 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
             self.assertIn("decode_eos_forced_after_pending_ts_rate", report["final"])
             self.assertEqual(report["final"]["decode_evaluated_window_count"], 2)
 
+    def test_synthetic_smoke_writes_periodic_training_state_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = run_synthetic_smoke(
+                    output_dir=Path(tmpdir),
+                    max_steps=3,
+                    save_every=2,
+                    seed=1337,
+                    device_name="cpu",
+                )
+
+            self.assertEqual(result.checkpoint_path, Path(tmpdir) / "checkpoint.pt")
+            checkpoints = sorted((Path(tmpdir) / "checkpoints").glob("checkpoint_step_*.pt"))
+            self.assertEqual(
+                [path.name for path in checkpoints],
+                [
+                    "checkpoint_step_000001.pt",
+                    "checkpoint_step_000002.pt",
+                    "checkpoint_step_000003.pt",
+                ],
+            )
+            self.assertIn("checkpoint_progress step=2/3", stdout.getvalue())
+
+            checkpoint = torch.load(result.checkpoint_path, map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["checkpoint_schema_version"], 1)
+            self.assertEqual(checkpoint["training_state"]["step"], 3)
+            self.assertEqual(checkpoint["training_state"]["save_every"], 2)
+            self.assertIn("optimizer_state_dict", checkpoint)
+            self.assertIn("rng_state", checkpoint["training_state"])
+
+            report = json.loads(result.report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["completed_steps"], 3)
+            self.assertTrue(report["is_complete"])
+
+    def test_synthetic_smoke_resume_continues_from_saved_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            with redirect_stdout(io.StringIO()):
+                first = run_synthetic_smoke(
+                    output_dir=output_dir,
+                    max_steps=1,
+                    save_every=1,
+                    seed=1337,
+                    device_name="cpu",
+                )
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                resumed = run_synthetic_smoke(
+                    output_dir=output_dir,
+                    max_steps=3,
+                    save_every=1,
+                    seed=1337,
+                    device_name="cpu",
+                    resume_from=first.checkpoint_path,
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("resume_progress", output)
+            self.assertNotIn("train_progress step=1/3", output)
+            self.assertIn("train_progress step=2/3", output)
+            self.assertIn("train_progress step=3/3", output)
+
+            checkpoint = torch.load(resumed.checkpoint_path, map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["training_state"]["step"], 3)
+            self.assertEqual([entry["step"] for entry in checkpoint["history"]], [1, 3])
+
     def test_training_progress_prints_before_checkpoint_eval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()
@@ -403,6 +471,8 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
                         "seed: 2026",
                         "device: mps",
                         "run_name: configured-run",
+                        "save_every: 250",
+                        "resume_from: configured-checkpoint.pt",
                         "model:",
                         "  d_model: 320",
                         "  heads: 5",
@@ -448,6 +518,8 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
         self.assertEqual(call_kwargs["seed"], 2026)
         self.assertEqual(call_kwargs["device_name"], "mps")
         self.assertEqual(call_kwargs["run_name"], "cli-run")
+        self.assertEqual(call_kwargs["save_every"], 250)
+        self.assertEqual(call_kwargs["resume_from"], Path("configured-checkpoint.pt"))
         self.assertEqual(
             call_kwargs["model_config_overrides"],
             {
