@@ -72,6 +72,45 @@ Ultimate run using per-bin caps for every eligible map in
 uv run python -m train.stage1_oracle.training.overfit_32 --config train/stage1_oracle/training/configs/stage1_oracle_ultimate_mps.yaml
 ```
 
+## Stage 1 oracle inference commands
+
+Stage 1 inference is still oracle-timing inference: pass an audio file and a reference `.osu`
+file whose red timing points are rendered into the dense timing track. The current commands
+are for inspection and preview, not final beatmap export.
+
+Browser preview GUI:
+
+```bash
+uv run python -m train.stage1_oracle.inference.preview_server \
+  --checkpoint-path train/artifacts/runs/stage1_oracle/overfit_32/checkpoint.pt \
+  --audio-path "mania-dataset/0/1033765/audio.mp3" \
+  --beatmap-path "mania-dataset/0/1033765/onumi - REGRET PART TWO (FAMoss) [ETERNAL].osu" \
+  --difficulty 4.5 \
+  --device cpu \
+  --port 5000
+```
+
+Open `http://127.0.0.1:5000` after the server starts.
+
+Terminal JSONL stream:
+
+```bash
+uv run python -m train.stage1_oracle.inference.stream_probe \
+  --checkpoint-path train/artifacts/runs/stage1_oracle/overfit_32/checkpoint.pt \
+  --audio-path "mania-dataset/0/1033765/audio.mp3" \
+  --beatmap-path "mania-dataset/0/1033765/onumi - REGRET PART TWO (FAMoss) [ETERNAL].osu" \
+  --difficulty 4.5 \
+  --device cpu \
+  --max-windows 1
+```
+
+`stream_probe` can also auto-select the newest local Stage 1 checkpoint and a default
+eligible 4K map from `train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies.parquet`:
+
+```bash
+uv run python -m train.stage1_oracle.inference.stream_probe --device cpu --max-windows 1
+```
+
 ## Feature family v1
 
 - A. 强度族：描述整体压力与密度
