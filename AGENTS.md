@@ -12,6 +12,10 @@
 
 - Run tests with `uv run python -m unittest discover`.
 
+## Documentation
+
+- When writing documentation content, pin the repository commit used for the analysis in document frontmatter, for example `pinned_commit: <git rev-parse HEAD>`.
+
 ## Compatibility and Placeholder Policy
 
 - Do not preserve backward compatibility unless explicitly instructed.
