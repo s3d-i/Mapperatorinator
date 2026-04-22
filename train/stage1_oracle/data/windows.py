@@ -25,6 +25,9 @@ from ..osu.timing import InvalidRedTimingError, MissingRedTimingError
 from ..osu.timing import RedTimingPoint, require_red_timing_points
 from .dataset import get_default_4k_training_index_path, load_index
 
+COARSE_BIN_LABELS = ("2-3", "3-4", "4-5", "5-6")
+MapsPerBinCap = int | dict[str, int]
+
 
 @dataclass(frozen=True)
 class OracleWindowRecord:
@@ -68,15 +71,14 @@ class OracleWindowDataset(Dataset):
         mel_config: MelCacheConfig = DEFAULT_MEL_CACHE_CONFIG,
         bpm_log_mean: float,
         bpm_log_std: float,
-        max_maps_per_bin: int | None = None,
+        max_maps_per_bin: MapsPerBinCap | None = None,
         progress: bool = False,
     ) -> None:
         if not math.isfinite(bpm_log_mean):
             raise ValueError(f"bpm_log_mean must be finite: {bpm_log_mean}")
         if not math.isfinite(bpm_log_std) or bpm_log_std <= 0:
             raise ValueError(f"bpm_log_std must be positive: {bpm_log_std}")
-        if max_maps_per_bin is not None and max_maps_per_bin <= 0:
-            raise ValueError(f"max_maps_per_bin must be positive when set: {max_maps_per_bin}")
+        max_maps_per_bin_by_label = _normalize_max_maps_per_bin(max_maps_per_bin)
 
         self.dataset_root = Path(dataset_root)
         self.index_path = Path(index_path) if index_path is not None else get_default_4k_training_index_path()
@@ -97,7 +99,7 @@ class OracleWindowDataset(Dataset):
             index_df,
             source_map_count=source_map_count,
             difficulty_filtered_map_count=difficulty_filtered_map_count,
-            max_maps_per_bin=max_maps_per_bin,
+            max_maps_per_bin_by_label=max_maps_per_bin_by_label,
             progress=progress,
         )
 
@@ -154,11 +156,11 @@ class OracleWindowDataset(Dataset):
         *,
         source_map_count: int,
         difficulty_filtered_map_count: int,
-        max_maps_per_bin: int | None,
+        max_maps_per_bin_by_label: dict[str, int] | None,
         progress: bool,
     ) -> tuple[list[OracleWindowRecord], OracleWindowFilterReport]:
         records: list[OracleWindowRecord] = []
-        retained_map_count_by_bin = {label: 0 for label in ("2-3", "3-4", "4-5", "5-6")}
+        retained_map_count_by_bin = {label: 0 for label in COARSE_BIN_LABELS}
         missing_red_timing_map_count = 0
         invalid_red_timing_map_count = 0
         negative_time_hitobject_map_count = 0
@@ -220,11 +222,11 @@ class OracleWindowDataset(Dataset):
                 invalid_hold_transition_count += invalid_hold_transition_action_count
                 continue
 
-            if max_maps_per_bin is not None:
+            if max_maps_per_bin_by_label is not None:
                 label = _difficulty_bin_label(difficulty)
                 if label is None:
                     continue
-                if retained_map_count_by_bin[label] >= max_maps_per_bin:
+                if retained_map_count_by_bin[label] >= max_maps_per_bin_by_label[label]:
                     continue
                 retained_map_count_by_bin[label] += 1
 
@@ -313,6 +315,32 @@ def collate_oracle_windows(samples: Sequence[dict[str, Any]], *, pad_id: int = 0
 def filter_supported_difficulty_range(index_df: pd.DataFrame) -> pd.DataFrame:
     difficulty = pd.to_numeric(index_df["difficulty"], errors="coerce")
     return index_df[(difficulty >= 2.0) & (difficulty <= 6.0)].reset_index(drop=True)
+
+
+def _normalize_max_maps_per_bin(max_maps_per_bin: MapsPerBinCap | None) -> dict[str, int] | None:
+    if max_maps_per_bin is None:
+        return None
+    if isinstance(max_maps_per_bin, int):
+        if max_maps_per_bin <= 0:
+            raise ValueError(f"max_maps_per_bin must be positive when set: {max_maps_per_bin}")
+        return {label: max_maps_per_bin for label in COARSE_BIN_LABELS}
+    if not isinstance(max_maps_per_bin, dict):
+        raise ValueError(f"max_maps_per_bin must be an integer or per-bin mapping: {max_maps_per_bin}")
+
+    missing = [label for label in COARSE_BIN_LABELS if label not in max_maps_per_bin]
+    unknown = sorted(set(max_maps_per_bin) - set(COARSE_BIN_LABELS))
+    if missing:
+        raise ValueError(f"max_maps_per_bin missing bins: {missing}")
+    if unknown:
+        raise ValueError(f"max_maps_per_bin unknown bins: {unknown}")
+
+    normalized: dict[str, int] = {}
+    for label in COARSE_BIN_LABELS:
+        value = int(max_maps_per_bin[label])
+        if value <= 0:
+            raise ValueError(f"max_maps_per_bin[{label}] must be positive, got {max_maps_per_bin[label]}")
+        normalized[label] = value
+    return normalized
 
 
 def _filter_index_by_manifest(index_df: pd.DataFrame, manifest_path: Path) -> pd.DataFrame:

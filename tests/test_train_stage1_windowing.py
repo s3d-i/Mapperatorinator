@@ -321,6 +321,65 @@ class Stage1WindowingTests(unittest.TestCase):
             ["valid_1.osu", "valid_2.osu"],
         )
 
+    def test_oracle_window_dataset_accepts_per_bin_map_caps(self) -> None:
+        index_df = pd.DataFrame(
+            {
+                "difficulty": [2.5, 2.6, 3.5, 3.6, 4.5, 5.5],
+                "shard": ["s"] * 6,
+                "beatmap_path": [
+                    "low_1.osu",
+                    "low_2.osu",
+                    "mid_1.osu",
+                    "mid_2.osu",
+                    "high_1.osu",
+                    "expert_1.osu",
+                ],
+                "audio_path": [f"audio_{index}.mp3" for index in range(6)],
+            },
+        )
+
+        with patch("train.stage1_oracle.data.windows.load_index", return_value=index_df):
+            with patch(
+                "train.stage1_oracle.data.windows.require_red_timing_points",
+                return_value=[RedTimingPoint(offset_ms=0.0, beat_length_ms=500.0)],
+            ):
+                with patch(
+                    "train.stage1_oracle.data.windows.parse_mania_hit_objects",
+                    side_effect=lambda beatmap_path, expected_key_count: [
+                        SimpleNamespace(
+                            source=Path(beatmap_path).name,
+                            start_time_ms=0.0,
+                            end_time_ms=0.0,
+                            lane=0,
+                            kind=ManiaHitObjectKind.TAP,
+                        ),
+                    ],
+                ):
+                    with patch(
+                        "train.stage1_oracle.data.windows.build_canonical_quantized_events",
+                        return_value=CanonicalEventBuildResult(
+                            timepoints=[CanonicalTimepoint(0, _lane_actions(LaneAction.TAP))],
+                            zero_length_hold_normalized_count=0,
+                        ),
+                    ):
+                        with patch("train.stage1_oracle.data.windows.load_audio_file", return_value=[0.0] * 16000):
+                            dataset = OracleWindowDataset(
+                                index_path="index.parquet",
+                                bpm_log_mean=5.0,
+                                bpm_log_std=0.25,
+                                max_maps_per_bin={
+                                    "2-3": 1,
+                                    "3-4": 2,
+                                    "4-5": 1,
+                                    "5-6": 1,
+                                },
+                            )
+
+        self.assertEqual(
+            [record.beatmap_path.name for record in dataset.records],
+            ["low_1.osu", "mid_1.osu", "mid_2.osu", "high_1.osu", "expert_1.osu"],
+        )
+
     def test_oracle_window_dataset_filters_invalid_hold_transition_maps(self) -> None:
         index_df = pd.DataFrame(
             {

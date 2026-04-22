@@ -1,0 +1,27 @@
+# Largest Stage 1 oracle MPS run: per-bin caps match every eligible map in the
+# no-timing-anomalies training index before downstream legality filters.
+dataset_root: mania-dataset
+index_path: train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies.parquet
+gate_manifest: train/artifacts/reports/audits/pretraining_gates_stage1_4k_2to6_2026-04-22.json
+output_dir: train/artifacts/runs/stage1_oracle/stage1_oracle_ultimate_18m_mps
+run_name: stage1_oracle_ultimate_18m_mps
+
+maps_per_bin:
+  2-3: 3638
+  3-4: 3376
+  4-5: 2705
+  5-6: 1258
+max_steps: 150000
+eval_every: 10000
+batch_size: 4
+learning_rate: 0.0002
+dropout: 0.1
+seed: 1337
+device: mps
+
+model:
+  d_model: 320
+  heads: 5
+  encoder_layers: 5
+  decoder_layers: 7
+  ffn_dim: 1280

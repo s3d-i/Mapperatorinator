@@ -48,6 +48,30 @@ Generated files live under `train/artifacts/`:
 
 Add new Stage 1 packages only when they contain real implementation files.
 
+## Stage 1 oracle training commands
+
+These run configs train with `device: mps` and use the pre-training gate manifest at
+`train/artifacts/reports/audits/pretraining_gates_stage1_4k_2to6_2026-04-22.json`.
+
+Balanced 1k-map run:
+
+```bash
+uv run python -m train.stage1_oracle.training.overfit_32 --config train/stage1_oracle/training/configs/stage1_oracle_1k_mps.yaml
+```
+
+Longer overnight run:
+
+```bash
+uv run python -m train.stage1_oracle.training.overfit_32 --config train/stage1_oracle/training/configs/stage1_oracle_overnight_mps.yaml
+```
+
+Ultimate run using per-bin caps for every eligible map in
+`train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies.parquet`:
+
+```bash
+uv run python -m train.stage1_oracle.training.overfit_32 --config train/stage1_oracle/training/configs/stage1_oracle_ultimate_mps.yaml
+```
+
 ## Feature family v1
 
 - A. 强度族：描述整体压力与密度

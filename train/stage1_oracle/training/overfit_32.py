@@ -11,9 +11,10 @@ from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
+import yaml
 from torch.utils.data import DataLoader
 
-from ..data.windows import OracleWindowDataset, collate_oracle_windows
+from ..data.windows import MapsPerBinCap, OracleWindowDataset, collate_oracle_windows
 from ..events.canonical import LaneAction
 from ..events.grammar import constrained_greedy_decode
 from ..events.stitch import DecodedWindowEvents, stitch_decoded_windows
@@ -37,6 +38,24 @@ REQUIRED_PRETRAINING_GATE_NAMES = (
     "dense_timing_track",
 )
 PRETRAINING_GATE_MANIFEST_SCHEMA_VERSION = 2
+RUN_CONFIG_KEYS = {
+    "dataset_root",
+    "index_path",
+    "gate_manifest",
+    "output_dir",
+    "maps_per_bin",
+    "max_steps",
+    "eval_every",
+    "batch_size",
+    "learning_rate",
+    "dropout",
+    "seed",
+    "device",
+    "run_name",
+    "synthetic_smoke",
+    "model",
+}
+MODEL_CONFIG_OVERRIDE_KEYS = ("d_model", "heads", "encoder_layers", "decoder_layers", "ffn_dim")
 
 
 def select_torch_device(device_name: str = "auto") -> torch.device:
@@ -57,6 +76,49 @@ def select_torch_device(device_name: str = "auto") -> torch.device:
             raise ValueError("requested mps device is not available")
         return torch.device("mps")
     raise ValueError(f"unknown device: {device_name}")
+
+
+def load_run_config(config_path: str | Path) -> dict[str, Any]:
+    path = Path(config_path)
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML run config: {path}") from exc
+
+    if loaded is None:
+        return {"model": {}}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"run config must be a mapping: {path}")
+
+    config = _normalize_config_mapping(loaded, source_name="run config")
+    unknown_keys = sorted(set(config) - RUN_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"unknown run config keys: {unknown_keys}")
+
+    model_config = config.get("model", {})
+    if model_config is None:
+        model_config = {}
+    if not isinstance(model_config, dict):
+        raise ValueError("run config model section must be a mapping")
+    normalized_model_config = _normalize_config_mapping(model_config, source_name="model config")
+    unknown_model_keys = sorted(set(normalized_model_config) - set(MODEL_CONFIG_OVERRIDE_KEYS))
+    if unknown_model_keys:
+        raise ValueError(f"unknown model config keys: {unknown_model_keys}")
+
+    config["model"] = normalized_model_config
+    return config
+
+
+def _normalize_config_mapping(source: dict[Any, Any], *, source_name: str) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for raw_key, value in source.items():
+        if not isinstance(raw_key, str):
+            raise ValueError(f"{source_name} keys must be strings")
+        key = raw_key.replace("-", "_")
+        if key in normalized:
+            raise ValueError(f"{source_name} contains duplicate key after normalization: {key}")
+        normalized[key] = value
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -593,7 +655,7 @@ def run_overfit_32(
     index_path: Path | None,
     gate_manifest_path: Path,
     output_dir: Path,
-    maps_per_bin: int = 8,
+    maps_per_bin: MapsPerBinCap = 8,
     max_steps: int = 5000,
     eval_every: int = 100,
     batch_size: int = 8,
@@ -602,9 +664,9 @@ def run_overfit_32(
     seed: int = 1337,
     device_name: str = "auto",
     run_name: str = "overfit_32",
+    model_config_overrides: dict[str, int] | None = None,
 ) -> OverfitRunResult:
-    if maps_per_bin <= 0:
-        raise ValueError(f"maps_per_bin must be positive, got {maps_per_bin}")
+    maps_per_bin = _validate_maps_per_bin_cap(maps_per_bin)
     if dropout < 0.0:
         raise ValueError(f"dropout must be non-negative, got {dropout}")
     torch.manual_seed(seed)
@@ -632,13 +694,6 @@ def run_overfit_32(
     if len(dataset) == 0:
         raise ValueError("OracleWindowDataset produced no windows for overfit_32")
     overfit_coverage = summarize_overfit_coverage(dataset.records)
-    underfilled_bins = {
-        label: count
-        for label, count in overfit_coverage["map_count_by_bin"].items()
-        if count != maps_per_bin
-    }
-    if underfilled_bins:
-        raise ValueError(f"overfit_32 requires {maps_per_bin} retained maps per bin, got {underfilled_bins}")
     sampling_plan = build_balanced_epoch_sampling_plan(
         dataset.records,
         empty_window_cap_ratio=training_config["empty_window_cap_ratio"],
@@ -657,6 +712,7 @@ def run_overfit_32(
         shuffle=False,
         collate_fn=lambda batch: collate_oracle_windows(batch, pad_id=vocab.pad_id),
     )
+    model_config_overrides = _validate_model_config_overrides(model_config_overrides)
     return _run_training(
         loader=loader,
         output_dir=output_dir,
@@ -664,6 +720,7 @@ def run_overfit_32(
             vocab_size=vocab.size,
             max_decode_len=training_config["max_decode_len"],
             dropout=dropout,
+            **model_config_overrides,
         ),
         max_steps=max_steps,
         eval_every=eval_every,
@@ -682,6 +739,54 @@ def run_overfit_32(
         dataset_filter_report=asdict(dataset.filter_report),
         training_sampling=_sampling_plan_report(sampling_plan),
     )
+
+
+def _validate_maps_per_bin_cap(maps_per_bin: MapsPerBinCap) -> MapsPerBinCap:
+    if isinstance(maps_per_bin, int):
+        if maps_per_bin <= 0:
+            raise ValueError(f"maps_per_bin must be positive, got {maps_per_bin}")
+        return maps_per_bin
+    if not isinstance(maps_per_bin, dict):
+        raise ValueError(f"maps_per_bin must be an integer or per-bin mapping, got {maps_per_bin}")
+
+    missing = [label for label in COARSE_BIN_LABELS if label not in maps_per_bin]
+    unknown = sorted(set(maps_per_bin) - set(COARSE_BIN_LABELS))
+    if missing:
+        raise ValueError(f"maps_per_bin missing bins: {missing}")
+    if unknown:
+        raise ValueError(f"maps_per_bin unknown bins: {unknown}")
+
+    normalized: dict[str, int] = {}
+    for label in COARSE_BIN_LABELS:
+        value = int(maps_per_bin[label])
+        if value <= 0:
+            raise ValueError(f"maps_per_bin[{label}] must be positive, got {maps_per_bin[label]}")
+        normalized[label] = value
+    return normalized
+
+
+def _validate_model_config_overrides(overrides: dict[str, int] | None) -> dict[str, int]:
+    if overrides is None:
+        return {}
+    unknown_keys = sorted(set(overrides) - set(MODEL_CONFIG_OVERRIDE_KEYS))
+    if unknown_keys:
+        raise ValueError(f"unknown model config override keys: {unknown_keys}")
+
+    validated: dict[str, int] = {}
+    for key in MODEL_CONFIG_OVERRIDE_KEYS:
+        if key not in overrides or overrides[key] is None:
+            continue
+        value = int(overrides[key])
+        if value <= 0:
+            raise ValueError(f"model config override {key} must be positive, got {overrides[key]}")
+        validated[key] = value
+
+    default_config = Stage1OracleMapperConfig()
+    d_model = validated.get("d_model", default_config.d_model)
+    heads = validated.get("heads", default_config.heads)
+    if d_model % heads != 0:
+        raise ValueError(f"d_model must be divisible by heads, got d_model={d_model} heads={heads}")
+    return validated
 
 
 def _run_training(
@@ -1179,22 +1284,44 @@ def _synthetic_samples(vocab: Stage1Vocab) -> list[dict[str, Any]]:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run Stage 1 oracle mapper map-subset overfit.")
-    parser.add_argument("--dataset-root", default="mania-dataset")
-    parser.add_argument("--index-path", default=None)
-    parser.add_argument("--gate-manifest", default=None)
-    parser.add_argument("--output-dir", default="train/artifacts/runs/stage1_oracle/overfit_32")
-    parser.add_argument("--maps-per-bin", type=int, default=8)
-    parser.add_argument("--max-steps", type=int, default=5000)
-    parser.add_argument("--eval-every", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
-    parser.add_argument("--run-name", default="overfit_32")
-    parser.add_argument("--synthetic-smoke", action="store_true")
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default=None, help="YAML run config; CLI flags override config values")
+    config_args, _ = config_parser.parse_known_args(argv)
+    config_defaults = load_run_config(config_args.config) if config_args.config is not None else {"model": {}}
+    model_defaults = config_defaults["model"]
+
+    parser = argparse.ArgumentParser(
+        description="Run Stage 1 oracle mapper map-subset overfit.",
+        parents=[config_parser],
+    )
+    parser.add_argument("--dataset-root", default=config_defaults.get("dataset_root", "mania-dataset"))
+    parser.add_argument("--index-path", default=config_defaults.get("index_path"))
+    parser.add_argument("--gate-manifest", default=config_defaults.get("gate_manifest"))
+    parser.add_argument(
+        "--output-dir",
+        default=config_defaults.get("output_dir", "train/artifacts/runs/stage1_oracle/overfit_32"),
+    )
+    parser.add_argument("--maps-per-bin", type=int, default=config_defaults.get("maps_per_bin", 8))
+    parser.add_argument("--max-steps", type=int, default=config_defaults.get("max_steps", 5000))
+    parser.add_argument("--eval-every", type=int, default=config_defaults.get("eval_every", 100))
+    parser.add_argument("--batch-size", type=int, default=config_defaults.get("batch_size", 8))
+    parser.add_argument("--learning-rate", type=float, default=config_defaults.get("learning_rate", 3e-4))
+    parser.add_argument("--dropout", type=float, default=config_defaults.get("dropout", 0.1))
+    parser.add_argument("--seed", type=int, default=config_defaults.get("seed", 1337))
+    parser.add_argument("--device", default=config_defaults.get("device", "auto"), choices=("auto", "cpu", "cuda", "mps"))
+    parser.add_argument("--run-name", default=config_defaults.get("run_name", "overfit_32"))
+    parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
+    parser.add_argument("--d-model", type=int, default=model_defaults.get("d_model"))
+    parser.add_argument("--heads", type=int, default=model_defaults.get("heads"))
+    parser.add_argument("--encoder-layers", type=int, default=model_defaults.get("encoder_layers"))
+    parser.add_argument("--decoder-layers", type=int, default=model_defaults.get("decoder_layers"))
+    parser.add_argument("--ffn-dim", type=int, default=model_defaults.get("ffn_dim"))
     args = parser.parse_args(argv)
+    model_config_overrides = {
+        key: getattr(args, key)
+        for key in MODEL_CONFIG_OVERRIDE_KEYS
+        if getattr(args, key) is not None
+    }
 
     if args.synthetic_smoke:
         result = run_synthetic_smoke(
@@ -1220,6 +1347,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             seed=args.seed,
             device_name=args.device,
             run_name=args.run_name,
+            model_config_overrides=model_config_overrides,
         )
 
     print(f"report_path {result.report_path}")

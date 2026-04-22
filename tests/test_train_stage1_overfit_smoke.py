@@ -19,6 +19,7 @@ from train.stage1_oracle.training.overfit_32 import (
     OverfitRunResult,
     build_balanced_epoch_sampling_plan,
     greedy_decode_metrics_for_loader,
+    main,
     run_overfit_32,
     run_synthetic_smoke,
     summarize_overfit_coverage,
@@ -167,7 +168,7 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
         self.assertEqual(coverage["window_count_by_bin"], {"2-3": 2, "3-4": 0, "4-5": 1, "5-6": 0})
         self.assertEqual(coverage["missing_bins"], ["3-4", "5-6"])
 
-    def test_overfit_32_requires_eight_retained_maps_per_bin(self) -> None:
+    def test_overfit_treats_maps_per_bin_as_cap_not_exact_quota(self) -> None:
         records = []
         for difficulty, count in ((2.5, 8), (3.5, 7), (4.5, 8), (5.5, 8)):
             for index in range(count):
@@ -204,15 +205,17 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
                         final_loss=0.0,
                         final_token_accuracy=1.0,
                     ),
-                ):
-                    with self.assertRaisesRegex(ValueError, "requires 8 retained maps per bin"):
-                        with redirect_stdout(io.StringIO()):
-                            run_overfit_32(
-                                dataset_root=Path("mania-dataset"),
-                                index_path=None,
-                                gate_manifest_path=Path("gates.json"),
-                                output_dir=Path("out"),
-                            )
+                ) as run_training:
+                    with redirect_stdout(io.StringIO()):
+                        run_overfit_32(
+                            dataset_root=Path("mania-dataset"),
+                            index_path=None,
+                            gate_manifest_path=Path("gates.json"),
+                            output_dir=Path("out"),
+                        )
+
+        call_kwargs = run_training.call_args.kwargs
+        self.assertEqual(call_kwargs["overfit_coverage"]["map_count_by_bin"]["3-4"], 7)
 
     def test_overfit_allows_custom_maps_per_bin_dropout_and_run_name(self) -> None:
         records = []
@@ -267,6 +270,194 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
         self.assertEqual(call_kwargs["device_name"], "mps")
         self.assertEqual(call_kwargs["config"].dropout, 0.0)
         self.assertEqual(call_kwargs["overfit_coverage"]["unique_map_count"], 4)
+
+    def test_overfit_allows_per_bin_map_caps(self) -> None:
+        records = []
+        for difficulty, count in ((2.5, 3), (3.5, 2), (4.5, 1), (5.5, 1)):
+            for index in range(count):
+                records.append(_window_record(difficulty=difficulty, has_event=True, name=f"{difficulty}-{index}"))
+
+        pretraining_gates = {
+            "training": {
+                "max_decode_len": 16,
+                "empty_window_cap_ratio": 0.05,
+            },
+            "gates": {
+                "dense_timing_track": {
+                    "bpm_log_mean": 5.0,
+                    "bpm_log_std": 0.25,
+                },
+            },
+        }
+        caps = {
+            "2-3": 3,
+            "3-4": 2,
+            "4-5": 1,
+            "5-6": 1,
+        }
+
+        def dataset_probe(*args: object, **kwargs: object) -> _DatasetStub:
+            self.assertEqual(kwargs["max_maps_per_bin"], caps)
+            return _DatasetStub(records)
+
+        with patch(
+            "train.stage1_oracle.training.overfit_32.validate_pretraining_gate_manifest",
+            return_value=pretraining_gates,
+        ):
+            with patch("train.stage1_oracle.training.overfit_32.OracleWindowDataset", side_effect=dataset_probe):
+                with patch(
+                    "train.stage1_oracle.training.overfit_32._run_training",
+                    return_value=OverfitRunResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_token_accuracy=1.0,
+                    ),
+                ) as run_training:
+                    with redirect_stdout(io.StringIO()):
+                        run_overfit_32(
+                            dataset_root=Path("mania-dataset"),
+                            index_path=None,
+                            gate_manifest_path=Path("gates.json"),
+                            output_dir=Path("out"),
+                            maps_per_bin=caps,
+                        )
+
+        self.assertEqual(run_training.call_args.kwargs["overfit_coverage"]["map_count_by_bin"], caps)
+
+    def test_overfit_allows_model_size_overrides(self) -> None:
+        records = []
+        for difficulty in (2.5, 3.5, 4.5, 5.5):
+            records.append(_window_record(difficulty=difficulty, has_event=True, name=f"{difficulty}"))
+
+        pretraining_gates = {
+            "training": {
+                "max_decode_len": 16,
+                "empty_window_cap_ratio": 0.05,
+            },
+            "gates": {
+                "dense_timing_track": {
+                    "bpm_log_mean": 5.0,
+                    "bpm_log_std": 0.25,
+                },
+            },
+        }
+
+        with patch(
+            "train.stage1_oracle.training.overfit_32.validate_pretraining_gate_manifest",
+            return_value=pretraining_gates,
+        ):
+            with patch("train.stage1_oracle.training.overfit_32.OracleWindowDataset", return_value=_DatasetStub(records)):
+                with patch(
+                    "train.stage1_oracle.training.overfit_32._run_training",
+                    return_value=OverfitRunResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_token_accuracy=1.0,
+                    ),
+                ) as run_training:
+                    with redirect_stdout(io.StringIO()):
+                        run_overfit_32(
+                            dataset_root=Path("mania-dataset"),
+                            index_path=None,
+                            gate_manifest_path=Path("gates.json"),
+                            output_dir=Path("out"),
+                            maps_per_bin=1,
+                            model_config_overrides={
+                                "d_model": 320,
+                                "heads": 5,
+                                "encoder_layers": 5,
+                                "decoder_layers": 7,
+                                "ffn_dim": 1280,
+                            },
+                        )
+
+        config = run_training.call_args.kwargs["config"]
+        self.assertEqual(config.d_model, 320)
+        self.assertEqual(config.heads, 5)
+        self.assertEqual(config.encoder_layers, 5)
+        self.assertEqual(config.decoder_layers, 7)
+        self.assertEqual(config.ffn_dim, 1280)
+
+    def test_main_loads_yaml_config_and_cli_overrides_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "run.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "dataset_root: custom-dataset",
+                        "index_path: custom-index.parquet",
+                        "gate_manifest: gates.json",
+                        "output_dir: configured-out",
+                        "maps_per_bin:",
+                        "  2-3: 3638",
+                        "  3-4: 3376",
+                        "  4-5: 2705",
+                        "  5-6: 1258",
+                        "max_steps: 10000",
+                        "eval_every: 500",
+                        "batch_size: 4",
+                        "learning_rate: 0.0002",
+                        "dropout: 0.1",
+                        "seed: 2026",
+                        "device: mps",
+                        "run_name: configured-run",
+                        "model:",
+                        "  d_model: 320",
+                        "  heads: 5",
+                        "  encoder_layers: 5",
+                        "  decoder_layers: 7",
+                        "  ffn_dim: 1280",
+                    ],
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "train.stage1_oracle.training.overfit_32.run_overfit_32",
+                return_value=OverfitRunResult(
+                    report_path=Path("report.json"),
+                    checkpoint_path=Path("checkpoint.pt"),
+                    final_loss=0.0,
+                    final_token_accuracy=1.0,
+                ),
+            ) as run_overfit:
+                with redirect_stdout(io.StringIO()):
+                    main(["--config", str(config_path), "--max-steps", "12000", "--run-name", "cli-run"])
+
+        call_kwargs = run_overfit.call_args.kwargs
+        self.assertEqual(call_kwargs["dataset_root"], Path("custom-dataset"))
+        self.assertEqual(call_kwargs["index_path"], Path("custom-index.parquet"))
+        self.assertEqual(call_kwargs["gate_manifest_path"], Path("gates.json"))
+        self.assertEqual(call_kwargs["output_dir"], Path("configured-out"))
+        self.assertEqual(
+            call_kwargs["maps_per_bin"],
+            {
+                "2-3": 3638,
+                "3-4": 3376,
+                "4-5": 2705,
+                "5-6": 1258,
+            },
+        )
+        self.assertEqual(call_kwargs["max_steps"], 12000)
+        self.assertEqual(call_kwargs["eval_every"], 500)
+        self.assertEqual(call_kwargs["batch_size"], 4)
+        self.assertEqual(call_kwargs["learning_rate"], 0.0002)
+        self.assertEqual(call_kwargs["dropout"], 0.1)
+        self.assertEqual(call_kwargs["seed"], 2026)
+        self.assertEqual(call_kwargs["device_name"], "mps")
+        self.assertEqual(call_kwargs["run_name"], "cli-run")
+        self.assertEqual(
+            call_kwargs["model_config_overrides"],
+            {
+                "d_model": 320,
+                "heads": 5,
+                "encoder_layers": 5,
+                "decoder_layers": 7,
+                "ffn_dim": 1280,
+            },
+        )
 
     def test_overfit_prints_dataset_progress_before_dataset_build(self) -> None:
         records = []
