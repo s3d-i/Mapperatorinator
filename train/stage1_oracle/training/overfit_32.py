@@ -39,6 +39,26 @@ REQUIRED_PRETRAINING_GATE_NAMES = (
 PRETRAINING_GATE_MANIFEST_SCHEMA_VERSION = 2
 
 
+def select_torch_device(device_name: str = "auto") -> torch.device:
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if device_name == "cpu":
+        return torch.device("cpu")
+    if device_name == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("requested cuda device is not available")
+        return torch.device("cuda")
+    if device_name == "mps":
+        if not torch.backends.mps.is_available():
+            raise ValueError("requested mps device is not available")
+        return torch.device("mps")
+    raise ValueError(f"unknown device: {device_name}")
+
+
 @dataclass(frozen=True)
 class OverfitRunResult:
     report_path: Path
@@ -520,6 +540,7 @@ def run_synthetic_smoke(
     output_dir: Path,
     max_steps: int = 2,
     seed: int = 1337,
+    device_name: str = "auto",
 ) -> OverfitRunResult:
     torch.manual_seed(seed)
     vocab = Stage1Vocab()
@@ -548,6 +569,7 @@ def run_synthetic_smoke(
         eval_every=max(1, max_steps),
         learning_rate=1e-2,
         seed=seed,
+        device_name=device_name,
         run_name="synthetic_smoke",
         vocab=vocab,
         eval_loader=loader,
@@ -571,12 +593,20 @@ def run_overfit_32(
     index_path: Path | None,
     gate_manifest_path: Path,
     output_dir: Path,
+    maps_per_bin: int = 8,
     max_steps: int = 5000,
     eval_every: int = 100,
     batch_size: int = 8,
     learning_rate: float = 3e-4,
+    dropout: float = 0.1,
     seed: int = 1337,
+    device_name: str = "auto",
+    run_name: str = "overfit_32",
 ) -> OverfitRunResult:
+    if maps_per_bin <= 0:
+        raise ValueError(f"maps_per_bin must be positive, got {maps_per_bin}")
+    if dropout < 0.0:
+        raise ValueError(f"dropout must be non-negative, got {dropout}")
     torch.manual_seed(seed)
     vocab = Stage1Vocab()
     print("gate_progress status=validating", flush=True)
@@ -591,7 +621,7 @@ def run_overfit_32(
         vocab=vocab,
         bpm_log_mean=timing_stats["bpm_log_mean"],
         bpm_log_std=timing_stats["bpm_log_std"],
-        max_maps_per_bin=8,
+        max_maps_per_bin=maps_per_bin,
         progress=True,
     )
     print(
@@ -605,10 +635,10 @@ def run_overfit_32(
     underfilled_bins = {
         label: count
         for label, count in overfit_coverage["map_count_by_bin"].items()
-        if count != 8
+        if count != maps_per_bin
     }
     if underfilled_bins:
-        raise ValueError(f"overfit_32 requires 8 retained maps per bin, got {underfilled_bins}")
+        raise ValueError(f"overfit_32 requires {maps_per_bin} retained maps per bin, got {underfilled_bins}")
     sampling_plan = build_balanced_epoch_sampling_plan(
         dataset.records,
         empty_window_cap_ratio=training_config["empty_window_cap_ratio"],
@@ -633,12 +663,14 @@ def run_overfit_32(
         config=Stage1OracleMapperConfig(
             vocab_size=vocab.size,
             max_decode_len=training_config["max_decode_len"],
+            dropout=dropout,
         ),
         max_steps=max_steps,
         eval_every=eval_every,
         learning_rate=learning_rate,
         seed=seed,
-        run_name="overfit_32",
+        device_name=device_name,
+        run_name=run_name,
         vocab=vocab,
         eval_loader=eval_loader,
         timing_track=build_timing_track_metadata(
@@ -661,6 +693,7 @@ def _run_training(
     eval_every: int,
     learning_rate: float,
     seed: int,
+    device_name: str,
     run_name: str,
     vocab: Stage1Vocab,
     eval_loader: DataLoader,
@@ -671,7 +704,7 @@ def _run_training(
     training_sampling: dict[str, Any] | None,
 ) -> OverfitRunResult:
     output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_torch_device(device_name)
     model = Stage1OracleMapper(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     history: list[dict[str, Any]] = []
@@ -738,6 +771,7 @@ def _run_training(
                 "max_steps": max_steps,
                 "eval_every": eval_every,
                 "learning_rate": learning_rate,
+                "config": asdict(config),
                 "device": str(device),
                 "parameter_count": model.parameter_count(),
                 "timing_track": timing_track,
@@ -1145,16 +1179,20 @@ def _synthetic_samples(vocab: Stage1Vocab) -> list[dict[str, Any]]:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Run Stage 1 oracle mapper 32-map overfit.")
+    parser = argparse.ArgumentParser(description="Run Stage 1 oracle mapper map-subset overfit.")
     parser.add_argument("--dataset-root", default="mania-dataset")
     parser.add_argument("--index-path", default=None)
     parser.add_argument("--gate-manifest", default=None)
     parser.add_argument("--output-dir", default="train/artifacts/runs/stage1_oracle/overfit_32")
+    parser.add_argument("--maps-per-bin", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda", "mps"))
+    parser.add_argument("--run-name", default="overfit_32")
     parser.add_argument("--synthetic-smoke", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1163,6 +1201,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             output_dir=Path(args.output_dir),
             max_steps=args.max_steps,
             seed=args.seed,
+            device_name=args.device,
         )
     else:
         if args.gate_manifest is None:
@@ -1172,11 +1211,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             index_path=Path(args.index_path) if args.index_path is not None else None,
             gate_manifest_path=Path(args.gate_manifest),
             output_dir=Path(args.output_dir),
+            maps_per_bin=args.maps_per_bin,
             max_steps=args.max_steps,
             eval_every=args.eval_every,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
+            dropout=args.dropout,
             seed=args.seed,
+            device_name=args.device,
+            run_name=args.run_name,
         )
 
     print(f"report_path {result.report_path}")

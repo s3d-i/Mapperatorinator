@@ -214,6 +214,60 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
                                 output_dir=Path("out"),
                             )
 
+    def test_overfit_allows_custom_maps_per_bin_dropout_and_run_name(self) -> None:
+        records = []
+        for difficulty in (2.5, 3.5, 4.5, 5.5):
+            records.append(_window_record(difficulty=difficulty, has_event=True, name=f"{difficulty}"))
+
+        pretraining_gates = {
+            "training": {
+                "max_decode_len": 16,
+                "empty_window_cap_ratio": 0.05,
+            },
+            "gates": {
+                "dense_timing_track": {
+                    "bpm_log_mean": 5.0,
+                    "bpm_log_std": 0.25,
+                },
+            },
+        }
+
+        def dataset_probe(*args: object, **kwargs: object) -> _DatasetStub:
+            self.assertEqual(kwargs["max_maps_per_bin"], 1)
+            return _DatasetStub(records)
+
+        with patch(
+            "train.stage1_oracle.training.overfit_32.validate_pretraining_gate_manifest",
+            return_value=pretraining_gates,
+        ):
+            with patch("train.stage1_oracle.training.overfit_32.OracleWindowDataset", side_effect=dataset_probe):
+                with patch(
+                    "train.stage1_oracle.training.overfit_32._run_training",
+                    return_value=OverfitRunResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_token_accuracy=1.0,
+                    ),
+                ) as run_training:
+                    with redirect_stdout(io.StringIO()):
+                        run_overfit_32(
+                            dataset_root=Path("mania-dataset"),
+                            index_path=None,
+                            gate_manifest_path=Path("gates.json"),
+                            output_dir=Path("out"),
+                            maps_per_bin=1,
+                            dropout=0.0,
+                            device_name="mps",
+                            run_name="overfit_4_dropout0",
+                        )
+
+        call_kwargs = run_training.call_args.kwargs
+        self.assertEqual(call_kwargs["run_name"], "overfit_4_dropout0")
+        self.assertEqual(call_kwargs["device_name"], "mps")
+        self.assertEqual(call_kwargs["config"].dropout, 0.0)
+        self.assertEqual(call_kwargs["overfit_coverage"]["unique_map_count"], 4)
+
     def test_overfit_prints_dataset_progress_before_dataset_build(self) -> None:
         records = []
         for difficulty in (2.5, 3.5, 4.5, 5.5):
