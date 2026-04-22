@@ -1,27 +1,21 @@
 ---
 date: 2026-04-23
-pinned_commit: 8b4b448f1929fbc19a4c8adece383d4611e47bc0
+drafted_on: 2026-04-23
+effective_on: 2026-04-23
+pinned_commit: 63e885f13d82e18814707bb74def2b34bdb4357a
 ---
 
 # Stage 1 Oracle Training Diagnostics
 
 Date: 2026-04-23
 
-This document summarizes the current Stage 1 oracle mapper training evidence,
-the problems visible in saved artifacts, and the experiment/code changes needed
-before treating the larger training configs as reliable.
+Current Stage 1 evidence is not yet model-selection evidence. It only proves
+limited overfit behavior, not held-out generalization or full-song rollout
+reliability.
 
-## Scope
-
-This is a diagnostics note, not a passing training gate. It covers:
-
-- current Stage 1 training configs under `train/stage1_oracle/training/configs/`
-- saved run reports under `train/artifacts/runs/stage1_oracle/`
-- audit artifacts under `train/artifacts/reports/audits/`
-- training/evaluation behavior in `train/stage1_oracle/training/overfit_32.py`
-
-The goal is to decide what must change before running and trusting the 1k,
-overnight, or ultimate Stage 1 oracle mapper runs.
+This is a diagnostics note, not a passing training gate. The goal is to prevent
+the next expensive run from answering the wrong question before trusting the 1k,
+overnight, or ultimate Stage 1 oracle mapper configs.
 
 ## Current Evidence
 
@@ -43,9 +37,9 @@ Interpretation:
 - The model can memorize a tiny 4-map subset when dropout is disabled.
 - The 32-map run is not a clean overfit result. Loss and token accuracy were
   still improving at the final step.
-- Stitched boundary open-mask errors are high even when teacher-forced token
-  accuracy is strong. This is the clearest signal that full-song rollout needs
-  separate attention from token-level teacher forcing.
+- Stitched boundary open-mask errors remain high even when teacher-forced token
+  accuracy is strong. Full-song rollout needs separate attention from
+  token-level teacher forcing.
 
 ## Dataset And Audit Facts
 
@@ -59,25 +53,6 @@ difficulty range:
 | 4-5 | 2705 |
 | 5-6 | 1258 |
 
-The token statistics audit supports the current sequence budget:
-
-- observed max target tokens: 455
-- configured max decode length: 512
-- max decode length headroom: 57 tokens
-- empty-window ratio by bin is roughly 4.16% to 4.79%
-- configured empty-window cap is 5% per difficulty bin per epoch
-
-The window boundary audit shows that boundary handling is common enough to be a
-core training/evaluation concern:
-
-- global hold-crossing boundary rate: 29.53%
-- by bin: 30.65%, 32.58%, 28.44%, 23.80%
-
-This means boundary state is not a rare edge case. Roughly one quarter to one
-third of window boundaries cross an active hold, depending on difficulty bin.
-
-## Current Training Configs
-
 The larger configs use the same training recipe shape:
 
 | Config | Maps per bin | Steps | Eval every | Batch size | LR | Dropout | Approx params |
@@ -86,29 +61,37 @@ The larger configs use the same training recipe shape:
 | `stage1_oracle_overnight_mps.yaml` | 1000 | 50000 | 5000 | 4 | 0.0002 | 0.1 | 18.65M |
 | `stage1_oracle_ultimate_mps.yaml` | all eligible per bin | 150000 | 10000 | 4 | 0.0002 | 0.1 | 18.65M |
 
-These are plausible as first large-run configs, but the saved evidence does not
-prove they are good enough. The larger model has not been shown to overfit a
-small subset, and there is no held-out validation report.
+The token statistics audit supports the current sequence budget:
+
+- observed max target tokens: 455
+- configured max decode length: 512
+- max decode length headroom: 57 tokens
+- empty-window ratio by bin is roughly 4.16% to 4.79%
+- configured empty-window cap is 5% per difficulty bin per epoch
+
+The window boundary audit shows that boundary state is not a rare edge case:
+
+- global hold-crossing boundary rate: 29.53%
+- by bin: 30.65%, 32.58%, 28.44%, 23.80%
 
 ## Confirmed Problems
 
 ### 1. Evaluation Uses The Training Dataset
 
 `run_overfit_32()` builds one `OracleWindowDataset`, then creates both the
-training loader and evaluation loader from that same dataset. This measures
-training-set fit, not generalization.
-
-This is acceptable for explicit overfit probes, but not for judging the 1k,
-overnight, or ultimate configs.
+training loader and evaluation loader from that same dataset. This is acceptable
+for explicit overfit probes, but not for judging 1k, overnight, or ultimate
+configs.
 
 ### 2. No Beatmap/Audio-Level Split Exists
 
-The README mentions `train/artifacts/splits/`, but no split artifacts are present.
-Any split must happen by map/audio group before window expansion. A window-level
-split would leak neighboring windows from the same song into both train and eval.
+The README mentions `train/artifacts/splits/`, but no split artifacts are
+present. Any split must happen by map/audio group before window expansion. A
+window-level split would leak neighboring windows from the same song into both
+train and eval.
 
-The correct split unit should be at least beatmap-level, and preferably audio
-group-level when multiple difficulties share the same audio.
+Default policy: split by audio group for model-selection evidence. Beatmap-level
+splits may be used only for explicitly labeled diagnostics.
 
 ### 3. Teacher-Forced Accuracy Hides Rollout Problems
 
@@ -119,340 +102,166 @@ Full-song inference asks: "Can the model keep its own generated state coherent
 across windows?"
 
 The high stitched open-mask error rates show that these are not equivalent.
-Boundary behavior needs dedicated metrics and, likely, dedicated training
-pressure.
 
-### 4. Greedy/Stitched Decode Runs Only At Final Step
-
-The current training loop updates greedy decode metrics only at the final step.
-That makes it hard to see when rollout quality begins improving, regressing, or
-diverging from teacher-forced validation.
-
-Teacher-forced validation can remain frequent and cheap, but rollout diagnostics
-need their own cadence on a smaller fixed probe set.
-
-### 5. Dropout Is Not Yet Calibrated
+### 4. Dropout Is Not Yet Calibrated
 
 The tiny no-dropout run memorized. The 32-map dropout-0.1 run did not. This does
 not prove dropout 0.1 is wrong, because device, subset size, steps, and model
 size also differed. It does mean dropout should not be accepted blindly for the
 larger configs.
 
-### 6. Step Counts Are Not Tied To Epochs Or Tokens
+### 5. Step Counts Are Not Tied To Epochs Or Tokens
 
 The configs use raw step counts, but the effective amount of training depends on
 sampled epoch size, batch size, average sequence length, and train/eval split.
+Reports should at least state sampled windows per epoch, batches per epoch, and
+approximate epochs completed.
 
-The reports should state:
+## Next Valid Sequence
 
-- sampled windows per epoch
-- batches per epoch
-- approximate epochs completed
-- approximate non-pad target tokens processed
+Do not run overnight or ultimate as model-selection evidence until these gates
+are satisfied in order.
 
-Without this, comparing 12k, 50k, and 150k steps is too coarse.
+### Gate 1: Target-Architecture Overfit
 
-## Recommended Design Direction
+Purpose: prove optimization before larger runs.
 
-Separate the training system into four evaluation modes:
+Use:
 
-1. **Overfit mode**
-   - Train and eval on the same small fixed subset.
-   - Purpose: prove optimization, model capacity, LR, and dropout.
-   - Success criterion: near-perfect teacher-forced token accuracy and low
-     greedy/stitch errors on 32 or 64 maps.
+- 32 or 64 maps
+- the same 18.65M-ish config as the 1k run
+- fixed subset, LR, batch size, seed, and max decode length
+- dropout sweep: `0.0`, `0.05`, `0.1`
 
-2. **Validation mode**
-   - Train on train split, evaluate teacher-forced metrics on held-out split.
-   - Purpose: track generalization cheaply during training.
-   - Success criterion: validation loss and token accuracy improve without
-     obvious overfit divergence.
+Pass condition:
 
-3. **Rollout probe mode**
-   - Greedy/stitch decode a small fixed held-out probe set every N steps.
-   - Purpose: track generation stability and boundary state.
-   - Success criterion: open-mask error, invalid transitions, empty outputs,
-     EOS failures, and density error improve together.
+- teacher-forced token accuracy reaches a clear overfit level
+- decode health does not fail trivially
+- boundary open-mask error is materially better than the current 32-map run
 
-4. **Candidate test mode**
-   - Run only for selected checkpoints on an untouched test split.
-   - Purpose: compare candidate configs without tuning on the test set.
+If dropout `0.1` cannot overfit but `0.0` or `0.05` can, use the lower dropout
+for the first split-aware 1k run.
 
-## Required Code Changes
+### Gate 2: 1k Held-Out Validation
 
-### A. Split Manifest Generation
+Purpose: prove a real generalization trend.
 
-Add a split builder that reads the clean 4K index and writes a deterministic
-manifest under `train/artifacts/splits/`.
+Use:
 
-Requirements:
+- train/eval split before window expansion
+- train loader from `train_manifest`
+- eval loader from `eval_manifest`
+- teacher-forced validation only at the normal `eval_every` cadence
 
-- stratify by difficulty bin
-- split by audio group or beatmap group before window expansion
-- record seed, source index path, counts by bin, map counts, and audio counts
-- produce at least `train`, `val`, and optionally `test` partitions
-- ensure no audio path appears in more than one partition when audio grouping is
-  enabled
+Pass condition:
 
-Suggested initial split:
+- train metrics improve
+- held-out validation metrics improve
+- validation is clearly labeled as held-out and not mixed with train metrics
 
-- train: 90%
-- val: 5%
-- test: 5%
+### Gate 3: Small Rollout Probe
 
-For early iteration, a smaller fixed validation/probe subset can be derived from
-the validation partition to keep greedy decode cost bounded.
+Purpose: catch state and boundary failure before overnight.
 
-### B. Dataset Split Filtering
+Use:
 
-Extend the training entrypoint so configs can specify split manifests:
+- fixed held-out probe subset from the validation side
+- greedy/stitch decode every few thousand steps
+- small enough probe size that it does not dominate wall time
+
+Pass condition:
+
+- rollout probe does not diverge while validation improves
+- EOS failures, empty outputs, density drift, and stitched boundary errors are
+  visible in the report
+- boundary metrics are grouped enough to tell whether failures are concentrated
+  on active hold boundaries
+
+## Minimal Required Code Changes
+
+### 1. Add Config Keys
+
+Current `RUN_CONFIG_KEYS` rejects unknown YAML fields, so split/probe fields must
+be added before split-aware configs can run.
+
+Add:
 
 - `train_manifest`
 - `eval_manifest`
 - `rollout_probe_manifest`
+- `rollout_eval_every`
 
-The existing `OracleWindowDataset(manifest_path=...)` hook can be reused, but
-the current training path does not expose it.
+Keep unknown-key rejection. The point is to support the next required fields, not
+to make config parsing permissive.
 
-### C. Separate Train, Eval, And Probe Loaders
+### 2. Build Separate Datasets And Loaders
 
-The training entrypoint should build:
+The training path should stop using one `OracleWindowDataset` for both training
+and evaluation except in explicit overfit mode.
 
-- a sampled/balanced train loader
-- an unsampled validation loader
-- an optional small rollout probe loader
+Target shape:
 
-The report should identify which split each metric came from. Avoid using a
-single field called `final` for mixed train, validation, and rollout metrics
-without labels.
+```python
+train_dataset = OracleWindowDataset(..., manifest_path=train_manifest)
+eval_dataset = OracleWindowDataset(..., manifest_path=eval_manifest)
+rollout_probe_dataset = OracleWindowDataset(..., manifest_path=rollout_probe_manifest)
 
-### D. Boundary Diagnostics
+train_loader = sampled_balanced_loader(train_dataset)
+eval_loader = unsampled_ordered_loader(eval_dataset)
+rollout_probe_loader = unsampled_ordered_loader(rollout_probe_dataset)
+```
 
-Add explicit boundary metrics:
+Training can remain sampled and balanced. Held-out validation and rollout probes
+should not be sampled from the train distribution.
 
-- generated final open-hold mask accuracy per window
-- exact open-mask match rate at each stitched boundary
-- per-lane hold-open precision/recall at boundary
-- boundary metrics only on windows where oracle open mask is non-zero
-- metrics by difficulty bin
-- metrics by whether the previous oracle window had a crossing hold
+### 3. Label Report Metrics By Source
 
-The current `stitched_boundary_open_mask_error_rate` is useful, but too blunt.
-It says the carried model mask differs from oracle, not which lane/action caused
-the divergence.
+The current report has `history` and `final`. That is tolerable for a pure
+overfit run, but ambiguous once train, validation, and rollout probe metrics
+exist.
 
-### E. Rollout Evaluation Cadence
+Do not introduce a large report framework yet. First split the final fields:
 
-Add separate cadences:
+```json
+{
+  "history": [],
+  "final_train_teacher_forced": {},
+  "final_val_teacher_forced": {},
+  "final_rollout_probe": {}
+}
+```
 
-- `eval_every`: teacher-forced validation cadence
-- `rollout_eval_every`: greedy/stitch probe cadence
-- `save_every`: checkpoint cadence
+The immediate goal is semantic clarity: a reader should know whether a metric
+came from train teacher forcing, held-out teacher forcing, or greedy/stitch
+rollout.
 
-Recommended default for 1k experiments:
+## Boundary Diagnostics To Add Now
 
-- teacher-forced eval every 500 to 1000 steps
-- rollout probe every 2000 to 5000 steps
-- save every 1000 to 5000 steps, depending on disk budget
+Add only the two boundary metrics needed for the next decision:
 
-For ultimate training, keep teacher-forced eval moderate and rollout probe small.
-Full greedy validation over all held-out windows will be too expensive to run
-frequently.
+- `active_boundary_exact_match`
+  - Count only stitched boundaries where the oracle open-hold mask is non-zero.
+  - This answers whether boundary failures are concentrated on active hold
+    carryover rather than all boundaries.
+- `boundary_error_by_bin`
+  - Report the same boundary error metric grouped by difficulty bin.
+  - This answers whether the failure is global or concentrated in specific
+    difficulty ranges.
 
-### F. Training Progress Accounting
+Per-lane precision/recall, auxiliary heads, loss weighting, and scheduled
+stitched-prefix training may be useful later. They are not required before the
+next split-aware 1k run.
 
-Add report fields:
+## Next Engineering Slice
 
-- train sampled epoch window count
-- train batches per epoch
-- completed sampled epochs
-- estimated target tokens per batch
-- estimated target tokens processed
-- validation window count
-- rollout probe window count
+The next implementation slice should be:
 
-This makes step counts interpretable.
+1. accept split/probe config keys;
+2. build separate train/eval/rollout probe datasets and loaders;
+3. label final report metrics by source;
+4. add `active_boundary_exact_match` and `boundary_error_by_bin`;
+5. run Gate 1, then Gate 2, then Gate 3.
 
-### G. Dropout Sweep Support
-
-Keep dropout configurable, but treat it as an experimental variable:
-
-- `0.0`: optimization control
-- `0.05`: conservative regularization candidate
-- `0.1`: current large-run default
-
-Do not run expensive full training until the target architecture can overfit a
-32/64-map subset at the chosen dropout and LR.
-
-## Experiment Plan
-
-### Experiment 1: Target-Architecture Overfit Probe
-
-Purpose: prove the 18.65M config can optimize the representation.
-
-Run the 32-map or 64-map subset using the same model shape as the 1k config:
-
-- `d_model: 320`
-- `heads: 5`
-- `encoder_layers: 5`
-- `decoder_layers: 7`
-- `ffn_dim: 1280`
-
-Sweep:
-
-- dropout: 0.0, 0.05, 0.1
-- keep LR fixed initially at 0.0002
-
-Expected pass:
-
-- teacher-forced token accuracy above 98%
-- no EOS failures
-- low density error
-- materially lower boundary open-mask error than current 32-map run
-
-If dropout 0.1 cannot overfit but 0.0 or 0.05 can, use the lower dropout for
-the first 1k run.
-
-### Experiment 2: 1k Split Validation Run
-
-Purpose: establish real generalization behavior before overnight training.
-
-Use the 1k config shape, but train on a real train split and evaluate on a
-held-out validation split.
-
-Track:
-
-- train teacher-forced loss/accuracy
-- validation teacher-forced loss/accuracy
-- rollout probe metrics
-- boundary diagnostics
-- metrics by difficulty bin
-
-Expected pass:
-
-- validation improves steadily
-- rollout probe does not regress while teacher-forced validation improves
-- boundary metrics improve across checkpoints
-
-### Experiment 3: Boundary-Focused Ablations
-
-Purpose: determine whether open-mask errors are model, loss, data, or decode
-issues.
-
-Run ablations after Experiment 2 if boundary metrics remain poor:
-
-- increase sampling weight for windows with non-zero open masks
-- add auxiliary final-open-mask prediction head
-- add loss weighting for `HOLD_START` and `HOLD_END` event tokens
-- add scheduled stitched-prefix training on short two-window sequences
-- compare constrained greedy with stricter boundary-aware decoding rules
-
-Prefer training-signal fixes before decode-only fixes unless diagnostics show
-the model is already mostly correct and only needs legality cleanup.
-
-### Experiment 4: Overnight Candidate Run
-
-Purpose: scale only after split validation and boundary diagnostics are stable.
-
-Use `stage1_oracle_overnight_mps.yaml` as the base, adjusted for the chosen
-dropout and new split/probe fields.
-
-Run only if:
-
-- target-architecture overfit passes
-- 1k validation run has useful held-out metrics
-- boundary metrics are tracked and improving
-
-### Experiment 5: Ultimate Run
-
-Purpose: train the strongest oracle-conditioned baseline.
-
-This should be the last step, not the next proof step. The ultimate run is too
-expensive to use as the first debugging surface.
-
-## Initial Config Guidance
-
-For the next serious run, prefer:
-
-- keep `max_decode_len: 512`
-- keep empty-window cap at `0.05`
-- start with dropout `0.05` unless the target-architecture overfit sweep says
-  `0.1` is safe
-- keep LR `0.0002` for the first controlled comparison
-- add split manifests before judging validation quality
-- add rollout probe metrics before judging full-song quality
-
-Do not change too many variables at once. First isolate optimization, then
-generalization, then rollout stability.
-
-## Success Criteria Before Large Training
-
-Before treating the larger configs as good enough:
-
-- target architecture overfits 32/64 maps cleanly
-- train/eval split has no audio leakage
-- validation metrics are reported separately from train metrics
-- rollout probe metrics run during training, not only at the final step
-- boundary open-mask diagnostics identify which lane/action failures dominate
-- the selected dropout is justified by a small sweep
-- step counts are reported with epoch/token context
-
-## Resolved Open Questions
-
-### Primary Split Unit
-
-Use audio-group splits as the default for validation and test manifests. The
-split key should be the dataset-relative audio path, including shard, so every
-beatmap that uses the same audio lands in the same partition.
-
-This is stricter than beatmap-level splitting and is the right default because
-Stage 1 validation should measure generalization to unseen audio/timing context,
-not only unseen difficulty files for familiar songs. Beatmap-level splits can be
-kept for explicit diagnostics if needed, but they should not be used for the
-main train/val/test gate.
-
-### Boundary Error Threshold
-
-Use provisional boundary gates by evaluation mode until the expanded diagnostics
-show which lane/action failures dominate:
-
-- overfit gate: `stitched_boundary_open_mask_error_rate <= 0.05` on the fixed
-  32/64-map training subset, with zero EOS failures and no max-decode-length
-  failures
-- 1k validation candidate gate: `stitched_boundary_open_mask_error_rate <= 0.15`
-  globally on the fixed held-out rollout probe and `<= 0.25` in every difficulty
-  bin
-- overnight/ultimate candidate gate: target `<= 0.10` globally and `<= 0.20` in
-  every difficulty bin, plus improving per-lane boundary precision/recall once
-  those metrics exist
-
-These thresholds are intentionally stricter for overfit mode. If the model
-cannot carry open-hold state correctly on a memorized subset, larger held-out
-training runs are not yet meaningful.
-
-### Rollout Probe Size On MPS
-
-Use a fixed ordered rollout probe of whole audio groups, not random windows.
-Start with the smallest deterministic validation-derived audio-group subset that
-produces roughly 150 to 250 windows, then run it every 2,000 to 5,000 training
-steps for 1k experiments.
-
-Also keep a larger checkpoint probe of roughly 500 to 1,000 ordered windows for
-less frequent checkpoint comparisons. After the first measured MPS run, adjust
-probe size or cadence so greedy/stitch rollout stays under roughly 10% to 15%
-of total wall time. If rollout exceeds that budget, reduce probe size before
-relaxing the cadence enough to lose trend visibility.
-
-## Recommended Next Change Set
-
-Implement one focused change set before further hyperparameter tuning:
-
-1. split manifest builder
-2. config fields for train/eval/probe manifests
-3. separate train validation metrics in reports
-4. rollout probe cadence
-5. expanded boundary diagnostics
-6. report epoch/token accounting
-
-After that, run the target-architecture overfit sweep and use the result to
-choose dropout for the 1k validation run.
+Before running overnight or ultimate, make the next run split-aware,
+source-labeled, and rollout-probed. Do not expand training scale until the target
+architecture passes small overfit and 1k held-out validation.
