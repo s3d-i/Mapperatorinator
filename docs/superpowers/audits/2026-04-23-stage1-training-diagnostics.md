@@ -1,6 +1,6 @@
 ---
 date: 2026-04-23
-pinned_commit: e84f4d7f7c96935cd5049b628b73965bd5cc6dbd
+pinned_commit: 8b4b448f1929fbc19a4c8adece383d4611e47bc0
 ---
 
 # Stage 1 Oracle Training Diagnostics
@@ -397,16 +397,51 @@ Before treating the larger configs as good enough:
 - the selected dropout is justified by a small sweep
 - step counts are reported with epoch/token context
 
-## Open Questions
+## Resolved Open Questions
 
-- Should the primary split unit be audio path or beatmap set? Audio path is safer
-  for leakage prevention, but beatmap-level split may preserve more same-song
-  difficulty diversity in training.
-- What boundary error threshold is acceptable for a Stage 1 oracle checkpoint?
-  The current reports show the metric is important, but no pass/fail threshold
-  has been defined.
-- How large should the rollout probe be on MPS so it is frequent enough to be
-  useful without dominating training time?
+### Primary Split Unit
+
+Use audio-group splits as the default for validation and test manifests. The
+split key should be the dataset-relative audio path, including shard, so every
+beatmap that uses the same audio lands in the same partition.
+
+This is stricter than beatmap-level splitting and is the right default because
+Stage 1 validation should measure generalization to unseen audio/timing context,
+not only unseen difficulty files for familiar songs. Beatmap-level splits can be
+kept for explicit diagnostics if needed, but they should not be used for the
+main train/val/test gate.
+
+### Boundary Error Threshold
+
+Use provisional boundary gates by evaluation mode until the expanded diagnostics
+show which lane/action failures dominate:
+
+- overfit gate: `stitched_boundary_open_mask_error_rate <= 0.05` on the fixed
+  32/64-map training subset, with zero EOS failures and no max-decode-length
+  failures
+- 1k validation candidate gate: `stitched_boundary_open_mask_error_rate <= 0.15`
+  globally on the fixed held-out rollout probe and `<= 0.25` in every difficulty
+  bin
+- overnight/ultimate candidate gate: target `<= 0.10` globally and `<= 0.20` in
+  every difficulty bin, plus improving per-lane boundary precision/recall once
+  those metrics exist
+
+These thresholds are intentionally stricter for overfit mode. If the model
+cannot carry open-hold state correctly on a memorized subset, larger held-out
+training runs are not yet meaningful.
+
+### Rollout Probe Size On MPS
+
+Use a fixed ordered rollout probe of whole audio groups, not random windows.
+Start with the smallest deterministic validation-derived audio-group subset that
+produces roughly 150 to 250 windows, then run it every 2,000 to 5,000 training
+steps for 1k experiments.
+
+Also keep a larger checkpoint probe of roughly 500 to 1,000 ordered windows for
+less frequent checkpoint comparisons. After the first measured MPS run, adjust
+probe size or cadence so greedy/stitch rollout stays under roughly 10% to 15%
+of total wall time. If rollout exceeds that budget, reduce probe size before
+relaxing the cadence enough to lose trend visibility.
 
 ## Recommended Next Change Set
 
