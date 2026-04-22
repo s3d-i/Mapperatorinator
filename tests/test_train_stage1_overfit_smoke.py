@@ -1,6 +1,8 @@
+import io
 import tempfile
 import unittest
 import json
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -100,14 +102,18 @@ class _DatasetStub:
 class Stage1OverfitSmokeTests(unittest.TestCase):
     def test_synthetic_smoke_writes_report_and_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = run_synthetic_smoke(
-                output_dir=Path(tmpdir),
-                max_steps=2,
-                seed=1337,
-            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                result = run_synthetic_smoke(
+                    output_dir=Path(tmpdir),
+                    max_steps=2,
+                    seed=1337,
+                )
 
             self.assertTrue(result.report_path.is_file())
             self.assertTrue(result.checkpoint_path.is_file())
+            self.assertIn("train_progress step=1/2", stdout.getvalue())
+            self.assertIn("train_progress step=2/2", stdout.getvalue())
             self.assertGreaterEqual(result.final_token_accuracy, 0.0)
             self.assertLessEqual(result.final_token_accuracy, 1.0)
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
@@ -126,6 +132,26 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
             self.assertIn("decode_empty_output_rate", report["final"])
             self.assertIn("decode_eos_forced_after_pending_ts_rate", report["final"])
             self.assertEqual(report["final"]["decode_evaluated_window_count"], 2)
+
+    def test_training_progress_prints_before_checkpoint_eval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+
+            def metrics_probe(*args: object, **kwargs: object) -> dict[str, float]:
+                self.assertIn("train_progress step=1/1", stdout.getvalue())
+                self.assertNotIn("eval_progress step=1/1", stdout.getvalue())
+                return {"loss": 0.0, "token_accuracy": 1.0}
+
+            with patch(
+                "train.stage1_oracle.training.overfit_32.teacher_forced_metrics_for_loader",
+                side_effect=metrics_probe,
+            ):
+                with redirect_stdout(stdout):
+                    run_synthetic_smoke(
+                        output_dir=Path(tmpdir),
+                        max_steps=1,
+                        seed=1337,
+                    )
 
     def test_overfit_coverage_reports_unique_maps_and_missing_bins(self) -> None:
         coverage = summarize_overfit_coverage(
@@ -180,12 +206,62 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
                     ),
                 ):
                     with self.assertRaisesRegex(ValueError, "requires 8 retained maps per bin"):
+                        with redirect_stdout(io.StringIO()):
+                            run_overfit_32(
+                                dataset_root=Path("mania-dataset"),
+                                index_path=None,
+                                gate_manifest_path=Path("gates.json"),
+                                output_dir=Path("out"),
+                            )
+
+    def test_overfit_prints_dataset_progress_before_dataset_build(self) -> None:
+        records = []
+        for difficulty in (2.5, 3.5, 4.5, 5.5):
+            for index in range(8):
+                records.append(_window_record(difficulty=difficulty, has_event=True, name=f"{difficulty}-{index}"))
+
+        pretraining_gates = {
+            "training": {
+                "max_decode_len": 16,
+                "empty_window_cap_ratio": 0.05,
+            },
+            "gates": {
+                "dense_timing_track": {
+                    "bpm_log_mean": 5.0,
+                    "bpm_log_std": 0.25,
+                },
+            },
+        }
+        stdout = io.StringIO()
+
+        def dataset_probe(*args: object, **kwargs: object) -> _DatasetStub:
+            self.assertIn("dataset_progress phase=build_windows status=start", stdout.getvalue())
+            self.assertTrue(kwargs["progress"])
+            return _DatasetStub(records)
+
+        with patch(
+            "train.stage1_oracle.training.overfit_32.validate_pretraining_gate_manifest",
+            return_value=pretraining_gates,
+        ):
+            with patch("train.stage1_oracle.training.overfit_32.OracleWindowDataset", side_effect=dataset_probe):
+                with patch(
+                    "train.stage1_oracle.training.overfit_32._run_training",
+                    return_value=OverfitRunResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_token_accuracy=1.0,
+                    ),
+                ):
+                    with redirect_stdout(stdout):
                         run_overfit_32(
                             dataset_root=Path("mania-dataset"),
                             index_path=None,
                             gate_manifest_path=Path("gates.json"),
                             output_dir=Path("out"),
                         )
+
+        self.assertIn("dataset_progress phase=build_windows status=done", stdout.getvalue())
 
     def test_decode_metrics_allow_holds_that_close_in_a_later_window(self) -> None:
         vocab = Stage1Vocab()

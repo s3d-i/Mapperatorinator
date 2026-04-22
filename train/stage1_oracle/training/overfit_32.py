@@ -579,9 +579,12 @@ def run_overfit_32(
 ) -> OverfitRunResult:
     torch.manual_seed(seed)
     vocab = Stage1Vocab()
+    print("gate_progress status=validating", flush=True)
     pretraining_gates = validate_pretraining_gate_manifest(gate_manifest_path)
+    print("gate_progress status=pass", flush=True)
     timing_stats = timing_training_stats_from_pretraining_gates(pretraining_gates)
     training_config = training_config_from_pretraining_gates(pretraining_gates)
+    print("dataset_progress phase=build_windows status=start", flush=True)
     dataset = OracleWindowDataset(
         dataset_root=dataset_root,
         index_path=index_path,
@@ -589,6 +592,12 @@ def run_overfit_32(
         bpm_log_mean=timing_stats["bpm_log_mean"],
         bpm_log_std=timing_stats["bpm_log_std"],
         max_maps_per_bin=8,
+        progress=True,
+    )
+    print(
+        f"dataset_progress phase=build_windows status=done "
+        f"retained_maps={dataset.filter_report.retained_map_count} windows={len(dataset)}",
+        flush=True,
     )
     if len(dataset) == 0:
         raise ValueError("OracleWindowDataset produced no windows for overfit_32")
@@ -690,9 +699,19 @@ def _run_training(
         optimizer.step()
 
         if step == 1 or step % eval_every == 0 or step == max_steps:
+            print(
+                f"train_progress step={step}/{max_steps} train_loss={loss.item():.6f}",
+                flush=True,
+            )
             final_metrics = teacher_forced_metrics_for_loader(model, eval_loader, device=device)
             if step == max_steps:
                 final_metrics.update(greedy_decode_metrics_for_loader(model, eval_loader, vocab=vocab, device=device))
+            print(
+                f"eval_progress step={step}/{max_steps} "
+                f"loss={final_metrics['loss']:.6f} "
+                f"token_accuracy={final_metrics['token_accuracy']:.6f}",
+                flush=True,
+            )
             history.append({"step": step, **final_metrics})
 
     checkpoint_path = output_dir / "checkpoint.pt"

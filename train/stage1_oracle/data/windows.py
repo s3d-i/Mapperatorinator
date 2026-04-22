@@ -69,6 +69,7 @@ class OracleWindowDataset(Dataset):
         bpm_log_mean: float,
         bpm_log_std: float,
         max_maps_per_bin: int | None = None,
+        progress: bool = False,
     ) -> None:
         if not math.isfinite(bpm_log_mean):
             raise ValueError(f"bpm_log_mean must be finite: {bpm_log_mean}")
@@ -97,6 +98,7 @@ class OracleWindowDataset(Dataset):
             source_map_count=source_map_count,
             difficulty_filtered_map_count=difficulty_filtered_map_count,
             max_maps_per_bin=max_maps_per_bin,
+            progress=progress,
         )
 
     def __len__(self) -> int:
@@ -153,6 +155,7 @@ class OracleWindowDataset(Dataset):
         source_map_count: int,
         difficulty_filtered_map_count: int,
         max_maps_per_bin: int | None,
+        progress: bool,
     ) -> tuple[list[OracleWindowRecord], OracleWindowFilterReport]:
         records: list[OracleWindowRecord] = []
         retained_map_count_by_bin = {label: 0 for label in ("2-3", "3-4", "4-5", "5-6")}
@@ -167,7 +170,13 @@ class OracleWindowDataset(Dataset):
         invalid_hold_transition_count = 0
         zero_length_hold_normalized_count = 0
         retained_map_count = 0
-        for row in index_df.itertuples(index=False):
+        for scanned_map_count, row in enumerate(index_df.itertuples(index=False), start=1):
+            if progress and (scanned_map_count == 1 or scanned_map_count % 100 == 0):
+                print(
+                    f"dataset_progress scanned_maps={scanned_map_count} "
+                    f"retained_maps={retained_map_count} windows={len(records)}",
+                    flush=True,
+                )
             difficulty = float(row.difficulty)
             beatmap_path = self.dataset_root / str(row.shard) / str(row.beatmap_path)
             audio_path = self.dataset_root / str(row.shard) / str(row.audio_path)
@@ -234,6 +243,12 @@ class OracleWindowDataset(Dataset):
                         window=window,
                         open_hold_mask=open_hold_mask_at_write_start(build_result.timepoints, window.write_start_ms),
                     ),
+                )
+            if progress:
+                print(
+                    f"dataset_progress retained_maps={retained_map_count} "
+                    f"windows={len(records)} difficulty={difficulty:.2f}",
+                    flush=True,
                 )
         return records, OracleWindowFilterReport(
             source_map_count=source_map_count,

@@ -1,4 +1,6 @@
+import io
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -117,6 +119,52 @@ class Stage1WindowingTests(unittest.TestCase):
 
         filtered_df = build_records.call_args.args[0]
         self.assertEqual(filtered_df["difficulty"].tolist(), [2.0, 3.5, 6.0])
+
+    def test_oracle_window_dataset_prints_first_scan_when_progress_enabled(self) -> None:
+        index_df = pd.DataFrame(
+            {
+                "difficulty": [2.5],
+                "shard": ["s"],
+                "beatmap_path": ["valid.osu"],
+                "audio_path": ["valid.mp3"],
+            },
+        )
+        stdout = io.StringIO()
+
+        with patch("train.stage1_oracle.data.windows.load_index", return_value=index_df):
+            with patch(
+                "train.stage1_oracle.data.windows.require_red_timing_points",
+                return_value=[RedTimingPoint(offset_ms=0.0, beat_length_ms=500.0)],
+            ):
+                with patch(
+                    "train.stage1_oracle.data.windows.parse_mania_hit_objects",
+                    return_value=[
+                        SimpleNamespace(
+                            source="valid.osu",
+                            start_time_ms=0.0,
+                            end_time_ms=0.0,
+                            lane=0,
+                            kind=ManiaHitObjectKind.TAP,
+                        ),
+                    ],
+                ):
+                    with patch(
+                        "train.stage1_oracle.data.windows.build_canonical_quantized_events",
+                        return_value=CanonicalEventBuildResult(
+                            timepoints=[CanonicalTimepoint(0, _lane_actions(LaneAction.TAP))],
+                            zero_length_hold_normalized_count=0,
+                        ),
+                    ):
+                        with patch("train.stage1_oracle.data.windows.load_audio_file", return_value=[0.0] * 16000):
+                            with redirect_stdout(stdout):
+                                OracleWindowDataset(
+                                    index_path="index.parquet",
+                                    bpm_log_mean=5.0,
+                                    bpm_log_std=0.25,
+                                    progress=True,
+                                )
+
+        self.assertIn("dataset_progress scanned_maps=1 retained_maps=0 windows=0", stdout.getvalue())
 
     def test_oracle_window_dataset_exposes_filter_report_counts(self) -> None:
         index_df = pd.DataFrame(
