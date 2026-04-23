@@ -196,6 +196,119 @@ class _DecodeMetricCounts:
         return self.stitched_invalid_hold_end_count + self.stitched_same_lane_collision_count
 
 
+def _rollout_progress_totals(loader: Any) -> tuple[int | None, int | None]:
+    dataset = getattr(loader, "dataset", None)
+    if dataset is not None:
+        return len(dataset), _rollout_total_map_count_from_dataset(dataset)
+    if isinstance(loader, Sequence):
+        return _rollout_progress_totals_from_batches(loader)
+    return None, None
+
+
+def _rollout_total_map_count_from_dataset(dataset: Any) -> int | None:
+    filter_report = getattr(dataset, "filter_report", None)
+    retained_map_count = getattr(filter_report, "retained_map_count", None)
+    if isinstance(retained_map_count, int):
+        return retained_map_count
+
+    records = getattr(dataset, "records", None)
+    if isinstance(records, Sequence):
+        return _count_rollout_map_keys(records)
+    if isinstance(dataset, (list, tuple)):
+        return _count_rollout_map_keys(dataset)
+    return None
+
+
+def _rollout_progress_totals_from_batches(batches: Sequence[Any]) -> tuple[int | None, int | None]:
+    total_window_count = 0
+    saw_window_count = False
+    map_keys: set[tuple[str, str]] = set()
+    for batch in batches:
+        batch_window_count = _rollout_batch_window_count(batch)
+        if batch_window_count is not None:
+            total_window_count += batch_window_count
+            saw_window_count = True
+        map_keys.update(_rollout_batch_map_keys(batch))
+    return (
+        total_window_count if saw_window_count else None,
+        len(map_keys) if map_keys else None,
+    )
+
+
+def _rollout_batch_window_count(batch: Any) -> int | None:
+    if not isinstance(batch, Mapping):
+        return None
+    decoder_input_ids = batch.get("decoder_input_ids")
+    if isinstance(decoder_input_ids, torch.Tensor):
+        return int(decoder_input_ids.shape[0])
+    metadata = batch.get("metadata")
+    if isinstance(metadata, Sequence):
+        return len(metadata)
+    return None
+
+
+def _rollout_batch_map_keys(batch: Any) -> set[tuple[str, str]]:
+    if not isinstance(batch, Mapping):
+        return set()
+    metadata = batch.get("metadata")
+    if not isinstance(metadata, Sequence):
+        return set()
+    return {
+        map_key
+        for item in metadata
+        if (map_key := _rollout_map_key(item)) is not None
+    }
+
+
+def _count_rollout_map_keys(entries: Sequence[Any]) -> int | None:
+    map_keys = {
+        map_key
+        for entry in entries
+        if (map_key := _rollout_map_key(entry)) is not None
+    }
+    if not map_keys:
+        return None
+    return len(map_keys)
+
+
+def _rollout_map_key(entry: Any) -> tuple[str, str] | None:
+    try:
+        beatmap_path = _record_value(entry, "beatmap_path")
+    except (AttributeError, KeyError, TypeError):
+        return None
+    try:
+        audio_path = _record_value(entry, "audio_path")
+    except (AttributeError, KeyError, TypeError):
+        audio_path = ""
+    return str(beatmap_path), str(audio_path)
+
+
+def _format_rollout_progress_count(index: int, total: int | None) -> str:
+    if total is None:
+        return f"{index}/?"
+    return f"{index}/{total}"
+
+
+def _print_rollout_progress(
+    *,
+    pass_name: str,
+    window_index: int,
+    total_window_count: int | None,
+    map_index: int,
+    total_map_count: int | None,
+    avg_generated_len: float,
+    status: str | None = None,
+) -> None:
+    status_fragment = f" status={status}" if status is not None else ""
+    print(
+        f"rollout_progress pass={pass_name}{status_fragment} "
+        f"window={_format_rollout_progress_count(window_index, total_window_count)} "
+        f"map={_format_rollout_progress_count(map_index, total_map_count)} "
+        f"avg_generated_len={avg_generated_len:.2f}",
+        flush=True,
+    )
+
+
 class PretrainingGateValidationError(ValueError):
     pass
 
@@ -1477,6 +1590,18 @@ def greedy_decode_metrics_for_loader(
     counts = _DecodeMetricCounts()
     counts_by_bin = {label: _DecodeMetricCounts() for label in COARSE_BIN_LABELS}
     decode_inputs_by_map: dict[tuple[str, str], list[_DecodeWindowInput]] = {}
+    total_window_count, total_map_count = _rollout_progress_totals(loader)
+    oracle_window_index = 0
+    oracle_generated_length_sum = 0
+    _print_rollout_progress(
+        pass_name="oracle",
+        status="start",
+        window_index=0,
+        total_window_count=total_window_count,
+        map_index=0,
+        total_map_count=total_map_count,
+        avg_generated_len=0.0,
+    )
 
     for raw_batch in loader:
         batch_inputs = _move_rollout_batch_inputs(raw_batch, device)
@@ -1507,6 +1632,8 @@ def greedy_decode_metrics_for_loader(
             target_tokens = decode_result.token_ids[3:]
             counts.generated_lengths.append(len(target_tokens))
             bin_counts.generated_lengths.append(len(target_tokens))
+            oracle_window_index += 1
+            oracle_generated_length_sum += len(target_tokens)
             if decode_result.max_decode_len_reached:
                 counts.max_decode_len_reached += 1
                 bin_counts.max_decode_len_reached += 1
@@ -1570,8 +1697,29 @@ def greedy_decode_metrics_for_loader(
                     difficulty_bin_label=difficulty_bin_label,
                 ),
             )
+            _print_rollout_progress(
+                pass_name="oracle",
+                window_index=oracle_window_index,
+                total_window_count=total_window_count,
+                map_index=len(decode_inputs_by_map),
+                total_map_count=total_map_count,
+                avg_generated_len=oracle_generated_length_sum / max(oracle_window_index, 1),
+            )
 
-    for decode_inputs in decode_inputs_by_map.values():
+    total_window_count = counts.evaluated_window_count if total_window_count is None else total_window_count
+    total_map_count = len(decode_inputs_by_map) if total_map_count is None else total_map_count
+    stitched_window_index = 0
+    stitched_generated_length_sum = 0
+    _print_rollout_progress(
+        pass_name="stitched",
+        status="start",
+        window_index=0,
+        total_window_count=total_window_count,
+        map_index=0,
+        total_map_count=total_map_count,
+        avg_generated_len=0.0,
+    )
+    for map_index, decode_inputs in enumerate(decode_inputs_by_map.values(), start=1):
         carried_open_hold_mask = 0
         sorted_decode_inputs = sorted(decode_inputs, key=lambda item: item.write_start_ms)
         last_bin_counts: _DecodeMetricCounts | None = None
@@ -1611,9 +1759,12 @@ def greedy_decode_metrics_for_loader(
                 vocab=vocab,
                 max_decode_len=model.config.max_decode_len,
             )
+            stitched_target_tokens = decode_result.token_ids[3:]
+            stitched_window_index += 1
+            stitched_generated_length_sum += len(stitched_target_tokens)
             try:
                 stitched_timepoints = decode_target_tokens(
-                    decode_result.token_ids[3:],
+                    stitched_target_tokens,
                     vocab=vocab,
                     write_duration_ms=decode_input.write_duration_ms,
                 )
@@ -1635,6 +1786,14 @@ def greedy_decode_metrics_for_loader(
             bin_counts.stitched_same_lane_collision_count += stitched_window.same_lane_collision_count
             bin_counts.stitched_generated_event_count += len(stitched_timepoints)
             carried_open_hold_mask = stitched_window.final_open_hold_mask
+            _print_rollout_progress(
+                pass_name="stitched",
+                window_index=stitched_window_index,
+                total_window_count=total_window_count,
+                map_index=map_index,
+                total_map_count=total_map_count,
+                avg_generated_len=stitched_generated_length_sum / max(stitched_window_index, 1),
+            )
         if last_bin_counts is not None:
             unclosed_hold_count = carried_open_hold_mask.bit_count()
             counts.stitched_unclosed_hold_count += unclosed_hold_count

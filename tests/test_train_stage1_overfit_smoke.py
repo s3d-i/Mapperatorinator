@@ -120,6 +120,8 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
             self.assertTrue(result.checkpoint_path.is_file())
             self.assertIn("train_progress step=1/2", stdout.getvalue())
             self.assertIn("train_progress step=2/2", stdout.getvalue())
+            self.assertIn("rollout_progress pass=oracle", stdout.getvalue())
+            self.assertIn("rollout_progress pass=stitched", stdout.getvalue())
             self.assertGreaterEqual(result.final_token_accuracy, 0.0)
             self.assertLessEqual(result.final_token_accuracy, 1.0)
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
@@ -819,6 +821,63 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
         self.assertEqual(metrics["active_boundary_evaluated_boundary_count"], 1)
         self.assertEqual(metrics["boundary_error_by_bin"]["2-3"], 1.0)
         self.assertEqual(metrics["boundary_error_by_bin"]["3-4"], 0.0)
+
+    def test_decode_metrics_print_rollout_progress_for_both_passes(self) -> None:
+        vocab = Stage1Vocab()
+        tap = vocab.encode_timepoint_event(
+            (LaneAction.TAP, LaneAction.NONE, LaneAction.NONE, LaneAction.NONE),
+        )
+        low_condition = [vocab.bos_id, vocab.diff_token_id(0), vocab.open_token_id(0)]
+        high_condition = [vocab.bos_id, vocab.diff_token_id(4), vocab.open_token_id(0)]
+        samples = [
+            _sample_for_decode_metrics(
+                vocab,
+                condition=low_condition,
+                target=[vocab.eos_id],
+                difficulty_bucket=0,
+                open_hold_mask=0,
+                write_start_ms=0,
+            ),
+            _sample_for_decode_metrics(
+                vocab,
+                condition=high_condition,
+                target=[vocab.ts_token_id(100), tap, vocab.eos_id],
+                difficulty_bucket=4,
+                open_hold_mask=0,
+                write_start_ms=0,
+            ),
+        ]
+        samples[0]["beatmap_path"] = "map_a.osu"
+        samples[0]["audio_path"] = "map_a.mp3"
+        samples[1]["beatmap_path"] = "map_b.osu"
+        samples[1]["audio_path"] = "map_b.mp3"
+        batch = collate_oracle_windows(samples, pad_id=vocab.pad_id)
+        model = _SequenceModel(
+            {
+                0: [vocab.eos_id],
+                4: [vocab.ts_token_id(100), tap, vocab.eos_id],
+            },
+            key_source="difficulty_bucket",
+            vocab_size=vocab.size,
+        )
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            greedy_decode_metrics_for_loader(model, [batch], vocab=vocab, device=torch.device("cpu"))
+
+        output = stdout.getvalue()
+        self.assertIn(
+            "rollout_progress pass=oracle status=start window=0/2 map=0/2 avg_generated_len=0.00",
+            output,
+        )
+        self.assertIn("rollout_progress pass=oracle window=1/2 map=1/2 avg_generated_len=1.00", output)
+        self.assertIn("rollout_progress pass=oracle window=2/2 map=2/2 avg_generated_len=2.00", output)
+        self.assertIn(
+            "rollout_progress pass=stitched status=start window=0/2 map=0/2 avg_generated_len=0.00",
+            output,
+        )
+        self.assertIn("rollout_progress pass=stitched window=1/2 map=1/2 avg_generated_len=1.00", output)
+        self.assertIn("rollout_progress pass=stitched window=2/2 map=2/2 avg_generated_len=2.00", output)
 
     def test_decode_density_error_counts_lane_note_events_not_timepoints(self) -> None:
         vocab = Stage1Vocab()
