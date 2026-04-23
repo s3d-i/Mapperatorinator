@@ -14,11 +14,16 @@ from train.stage1_oracle.data.windows import OracleWindowFilterReport, collate_o
 from train.stage1_oracle.events.canonical import CanonicalTimepoint, LaneAction
 from train.stage1_oracle.events.tokens import Stage1Vocab, decompose_ts_delta
 from train.stage1_oracle.training.overfit_32 import (
+    _DecodeWindowInput,
+    _clone_tensor_to_cpu,
+    _decode_window_input_to_device,
+    _move_rollout_batch_inputs,
     REQUIRED_PRETRAINING_GATE_NAMES,
     PretrainingGateValidationError,
     OverfitRunResult,
     build_balanced_epoch_sampling_plan,
     greedy_decode_metrics_for_loader,
+    load_run_config,
     main,
     run_overfit_32,
     run_synthetic_smoke,
@@ -129,10 +134,15 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
             self.assertEqual(report["timing_track"]["red_timing_source"], "reference_osu_red_points_for_oracle_phase")
             self.assertEqual(report["pretraining_gates"]["status"], "SKIPPED_SYNTHETIC_SMOKE")
             self.assertIsNone(report["dataset_filter_report"])
-            self.assertIn("decode_eos_failure_rate", report["final"])
-            self.assertIn("decode_empty_output_rate", report["final"])
-            self.assertIn("decode_eos_forced_after_pending_ts_rate", report["final"])
-            self.assertEqual(report["final"]["decode_evaluated_window_count"], 2)
+            self.assertIn("loss", report["final_train_teacher_forced"])
+            self.assertIn("token_accuracy", report["final_train_teacher_forced"])
+            self.assertIn("loss", report["final_val_teacher_forced"])
+            self.assertIn("token_accuracy", report["final_val_teacher_forced"])
+            self.assertIn("decode_eos_failure_rate", report["final_rollout_probe"])
+            self.assertIn("decode_empty_output_rate", report["final_rollout_probe"])
+            self.assertIn("decode_eos_forced_after_pending_ts_rate", report["final_rollout_probe"])
+            self.assertEqual(report["final_rollout_probe"]["decode_evaluated_window_count"], 2)
+            self.assertNotIn("final", report)
 
     def test_synthetic_smoke_writes_periodic_training_state_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,6 +211,9 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
             checkpoint = torch.load(resumed.checkpoint_path, map_location="cpu", weights_only=False)
             self.assertEqual(checkpoint["training_state"]["step"], 3)
             self.assertEqual([entry["step"] for entry in checkpoint["history"]], [1, 3])
+            self.assertIn("final_train_teacher_forced", checkpoint["training_state"])
+            self.assertIn("final_val_teacher_forced", checkpoint["training_state"])
+            self.assertIn("final_rollout_probe", checkpoint["training_state"])
 
     def test_training_progress_prints_before_checkpoint_eval(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -531,6 +544,132 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
             },
         )
 
+    def test_run_config_accepts_split_and_probe_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "run.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "train_manifest: splits/train.json",
+                        "eval_manifest: splits/eval.json",
+                        "rollout_probe_manifest: splits/probe.json",
+                        "rollout_eval_every: 2500",
+                    ],
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_run_config(config_path)
+
+        self.assertEqual(config["train_manifest"], "splits/train.json")
+        self.assertEqual(config["eval_manifest"], "splits/eval.json")
+        self.assertEqual(config["rollout_probe_manifest"], "splits/probe.json")
+        self.assertEqual(config["rollout_eval_every"], 2500)
+
+    def test_main_forwards_split_and_probe_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "run.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "dataset_root: custom-dataset",
+                        "gate_manifest: gates.json",
+                        "output_dir: out",
+                        "train_manifest: splits/train.json",
+                        "eval_manifest: splits/eval.json",
+                        "rollout_probe_manifest: splits/probe.json",
+                        "rollout_eval_every: 2500",
+                    ],
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "train.stage1_oracle.training.overfit_32.run_overfit_32",
+                return_value=OverfitRunResult(
+                    report_path=Path("report.json"),
+                    checkpoint_path=Path("checkpoint.pt"),
+                    final_loss=0.0,
+                    final_token_accuracy=1.0,
+                ),
+            ) as run_overfit:
+                with redirect_stdout(io.StringIO()):
+                    main(["--config", str(config_path)])
+
+        call_kwargs = run_overfit.call_args.kwargs
+        self.assertEqual(call_kwargs["train_manifest_path"], Path("splits/train.json"))
+        self.assertEqual(call_kwargs["eval_manifest_path"], Path("splits/eval.json"))
+        self.assertEqual(call_kwargs["rollout_probe_manifest_path"], Path("splits/probe.json"))
+        self.assertEqual(call_kwargs["rollout_eval_every"], 2500)
+
+    def test_split_manifests_build_separate_datasets_and_loaders(self) -> None:
+        train_records = [_window_record(difficulty=2.5, has_event=True, name="train")]
+        eval_records = [_window_record(difficulty=3.5, has_event=True, name="eval")]
+        probe_records = [_window_record(difficulty=4.5, has_event=True, name="probe")]
+        datasets = {
+            Path("splits/train.json"): _DatasetStub(train_records),
+            Path("splits/eval.json"): _DatasetStub(eval_records),
+            Path("splits/probe.json"): _DatasetStub(probe_records),
+        }
+        seen_manifest_paths: list[Path | None] = []
+        pretraining_gates = {
+            "training": {
+                "max_decode_len": 16,
+                "empty_window_cap_ratio": 0.05,
+            },
+            "gates": {
+                "dense_timing_track": {
+                    "bpm_log_mean": 5.0,
+                    "bpm_log_std": 0.25,
+                },
+            },
+        }
+
+        def dataset_probe(*args: object, **kwargs: object) -> _DatasetStub:
+            manifest_path = kwargs.get("manifest_path")
+            seen_manifest_paths.append(manifest_path)
+            self.assertIn(manifest_path, datasets)
+            if manifest_path == Path("splits/train.json"):
+                self.assertEqual(kwargs["max_maps_per_bin"], 1)
+            else:
+                self.assertIsNone(kwargs["max_maps_per_bin"])
+            return datasets[manifest_path]
+
+        with patch(
+            "train.stage1_oracle.training.overfit_32.validate_pretraining_gate_manifest",
+            return_value=pretraining_gates,
+        ):
+            with patch("train.stage1_oracle.training.overfit_32.OracleWindowDataset", side_effect=dataset_probe):
+                with patch(
+                    "train.stage1_oracle.training.overfit_32._run_training",
+                    return_value=OverfitRunResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_token_accuracy=1.0,
+                    ),
+                ) as run_training:
+                    with redirect_stdout(io.StringIO()):
+                        run_overfit_32(
+                            dataset_root=Path("mania-dataset"),
+                            index_path=None,
+                            gate_manifest_path=Path("gates.json"),
+                            output_dir=Path("out"),
+                            maps_per_bin=1,
+                            train_manifest_path=Path("splits/train.json"),
+                            eval_manifest_path=Path("splits/eval.json"),
+                            rollout_probe_manifest_path=Path("splits/probe.json"),
+                            rollout_eval_every=2500,
+                        )
+
+        call_kwargs = run_training.call_args.kwargs
+        self.assertEqual(seen_manifest_paths, [Path("splits/train.json"), Path("splits/eval.json"), Path("splits/probe.json")])
+        self.assertIs(call_kwargs["loader"].dataset, datasets[Path("splits/train.json")])
+        self.assertIs(call_kwargs["train_eval_loader"].dataset, datasets[Path("splits/train.json")])
+        self.assertIs(call_kwargs["eval_loader"].dataset, datasets[Path("splits/eval.json")])
+        self.assertIs(call_kwargs["rollout_probe_loader"].dataset, datasets[Path("splits/probe.json")])
+        self.assertEqual(call_kwargs["rollout_eval_every"], 2500)
+
     def test_overfit_prints_dataset_progress_before_dataset_build(self) -> None:
         records = []
         for difficulty in (2.5, 3.5, 4.5, 5.5):
@@ -629,6 +768,8 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
         self.assertEqual(metrics["oracle_boundary_invalid_hold_end_rate"], 0.0)
         self.assertEqual(metrics["stitched_boundary_invalid_hold_end_rate"], 0.0)
         self.assertEqual(metrics["stitched_boundary_unclosed_hold_rate"], 0.0)
+        self.assertEqual(metrics["active_boundary_exact_match"], 1.0)
+        self.assertEqual(metrics["active_boundary_evaluated_boundary_count"], 1)
 
     def test_decode_metrics_report_stitched_boundary_open_mask_error(self) -> None:
         vocab = Stage1Vocab()
@@ -674,6 +815,10 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
         self.assertEqual(metrics["oracle_boundary_invalid_hold_end_rate"], 0.0)
         self.assertEqual(metrics["stitched_boundary_invalid_hold_end_rate"], 0.0)
         self.assertNotIn("decode_invalid_hold_end_rate", metrics)
+        self.assertEqual(metrics["active_boundary_exact_match"], 0.0)
+        self.assertEqual(metrics["active_boundary_evaluated_boundary_count"], 1)
+        self.assertEqual(metrics["boundary_error_by_bin"]["2-3"], 1.0)
+        self.assertEqual(metrics["boundary_error_by_bin"]["3-4"], 0.0)
 
     def test_decode_density_error_counts_lane_note_events_not_timepoints(self) -> None:
         vocab = Stage1Vocab()
@@ -807,6 +952,57 @@ class Stage1OverfitSmokeTests(unittest.TestCase):
 
         self.assertEqual(per_bin["3-4"]["decode_evaluated_window_count"], 1)
         self.assertEqual(per_bin["4-5"]["decode_evaluated_window_count"], 0)
+
+    def test_clone_tensor_to_cpu_detaches_and_copies_slice_storage(self) -> None:
+        source = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        slice_view = source[:, 1:2, :]
+
+        cloned = _clone_tensor_to_cpu(slice_view)
+        source[:, 1:2, :].fill_(-1)
+
+        self.assertEqual(cloned.device.type, "cpu")
+        self.assertEqual(cloned.tolist(), [[[4.0, 5.0, 6.0, 7.0]], [[16.0, 17.0, 18.0, 19.0]]])
+        self.assertNotEqual(cloned.untyped_storage().data_ptr(), slice_view.untyped_storage().data_ptr())
+
+    def test_move_rollout_batch_inputs_moves_only_model_inputs(self) -> None:
+        batch = {
+            "packed_audio": torch.arange(12, dtype=torch.float32).reshape(1, 3, 4),
+            "timing_track": torch.arange(15, dtype=torch.float32).reshape(1, 3, 5),
+            "difficulty_bucket": torch.tensor([2], dtype=torch.long),
+            "decoder_input_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "labels": torch.tensor([[4, 5, 6]], dtype=torch.long),
+        }
+
+        moved = _move_rollout_batch_inputs(batch, torch.device("cpu"))
+
+        self.assertEqual(set(moved), {"packed_audio", "timing_track", "difficulty_bucket"})
+        self.assertTrue(torch.equal(moved["packed_audio"], batch["packed_audio"]))
+        self.assertTrue(torch.equal(moved["timing_track"], batch["timing_track"]))
+        self.assertTrue(torch.equal(moved["difficulty_bucket"], batch["difficulty_bucket"]))
+
+    def test_decode_window_input_to_device_restores_cpu_cached_tensors(self) -> None:
+        decode_input = _DecodeWindowInput(
+            write_start_ms=120,
+            packed_audio=torch.arange(12, dtype=torch.float32).reshape(1, 3, 4),
+            timing_track=torch.arange(15, dtype=torch.float32).reshape(1, 3, 5),
+            difficulty_bucket=torch.tensor([2], dtype=torch.long),
+            condition_ids=[1, 2, 3],
+            oracle_open_hold_mask=1,
+            write_duration_ms=8000,
+            difficulty_bin_label="2-3",
+        )
+
+        packed_audio, timing_track, difficulty_bucket = _decode_window_input_to_device(
+            decode_input,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(packed_audio.device.type, "cpu")
+        self.assertEqual(timing_track.device.type, "cpu")
+        self.assertEqual(difficulty_bucket.device.type, "cpu")
+        self.assertTrue(torch.equal(packed_audio, decode_input.packed_audio))
+        self.assertTrue(torch.equal(timing_track, decode_input.timing_track))
+        self.assertTrue(torch.equal(difficulty_bucket, decode_input.difficulty_bucket))
 
     def test_balanced_sampling_caps_empty_windows_per_bin(self) -> None:
         records = []

@@ -57,6 +57,10 @@ RUN_CONFIG_KEYS = {
     "save_every",
     "resume_from",
     "synthetic_smoke",
+    "train_manifest",
+    "eval_manifest",
+    "rollout_probe_manifest",
+    "rollout_eval_every",
     "model",
 }
 MODEL_CONFIG_OVERRIDE_KEYS = ("d_model", "heads", "encoder_layers", "decoder_layers", "ffn_dim")
@@ -175,6 +179,8 @@ class _DecodeMetricCounts:
     evaluated_window_count: int = 0
     stitched_boundary_errors: int = 0
     stitched_boundary_count: int = 0
+    active_stitched_boundary_matches: int = 0
+    active_stitched_boundary_count: int = 0
     generated_lengths: list[int] | None = None
 
     def __post_init__(self) -> None:
@@ -641,7 +647,10 @@ def run_synthetic_smoke(
         device_name=device_name,
         run_name="synthetic_smoke",
         vocab=vocab,
+        train_eval_loader=loader,
         eval_loader=loader,
+        rollout_probe_loader=loader,
+        rollout_eval_every=max(1, max_steps),
         timing_track=build_timing_track_metadata(
             bpm_log_mean=SYNTHETIC_SMOKE_BPM_LOG_MEAN,
             bpm_log_std=SYNTHETIC_SMOKE_BPM_LOG_STD,
@@ -675,10 +684,16 @@ def run_overfit_32(
     save_every: int | None = None,
     resume_from: Path | None = None,
     model_config_overrides: dict[str, int] | None = None,
+    train_manifest_path: Path | None = None,
+    eval_manifest_path: Path | None = None,
+    rollout_probe_manifest_path: Path | None = None,
+    rollout_eval_every: int | None = None,
 ) -> OverfitRunResult:
     maps_per_bin = _validate_maps_per_bin_cap(maps_per_bin)
     if dropout < 0.0:
         raise ValueError(f"dropout must be non-negative, got {dropout}")
+    if rollout_eval_every is not None and rollout_eval_every <= 0:
+        raise ValueError(f"rollout_eval_every must be positive when set, got {rollout_eval_every}")
     torch.manual_seed(seed)
     vocab = Stage1Vocab()
     print("gate_progress status=validating", flush=True)
@@ -686,41 +701,81 @@ def run_overfit_32(
     print("gate_progress status=pass", flush=True)
     timing_stats = timing_training_stats_from_pretraining_gates(pretraining_gates)
     training_config = training_config_from_pretraining_gates(pretraining_gates)
-    print("dataset_progress phase=build_windows status=start", flush=True)
-    dataset = OracleWindowDataset(
+    train_dataset = _build_oracle_window_dataset(
+        source_name="train",
         dataset_root=dataset_root,
         index_path=index_path,
+        manifest_path=train_manifest_path,
         vocab=vocab,
-        bpm_log_mean=timing_stats["bpm_log_mean"],
-        bpm_log_std=timing_stats["bpm_log_std"],
+        timing_stats=timing_stats,
         max_maps_per_bin=maps_per_bin,
-        progress=True,
     )
-    print(
-        f"dataset_progress phase=build_windows status=done "
-        f"retained_maps={dataset.filter_report.retained_map_count} windows={len(dataset)}",
-        flush=True,
-    )
-    if len(dataset) == 0:
-        raise ValueError("OracleWindowDataset produced no windows for overfit_32")
-    overfit_coverage = summarize_overfit_coverage(dataset.records)
+    if len(train_dataset) == 0:
+        raise ValueError("train OracleWindowDataset produced no windows")
+
+    if eval_manifest_path is None:
+        eval_dataset = train_dataset
+    else:
+        eval_dataset = _build_oracle_window_dataset(
+            source_name="eval",
+            dataset_root=dataset_root,
+            index_path=index_path,
+            manifest_path=eval_manifest_path,
+            vocab=vocab,
+            timing_stats=timing_stats,
+            max_maps_per_bin=None,
+        )
+        if len(eval_dataset) == 0:
+            raise ValueError("eval OracleWindowDataset produced no windows")
+
+    rollout_probe_dataset = None
+    if rollout_probe_manifest_path is not None:
+        rollout_probe_dataset = _build_oracle_window_dataset(
+            source_name="rollout_probe",
+            dataset_root=dataset_root,
+            index_path=index_path,
+            manifest_path=rollout_probe_manifest_path,
+            vocab=vocab,
+            timing_stats=timing_stats,
+            max_maps_per_bin=None,
+        )
+        if len(rollout_probe_dataset) == 0:
+            raise ValueError("rollout probe OracleWindowDataset produced no windows")
+
+    overfit_coverage = summarize_overfit_coverage(train_dataset.records)
     sampling_plan = build_balanced_epoch_sampling_plan(
-        dataset.records,
+        train_dataset.records,
         empty_window_cap_ratio=training_config["empty_window_cap_ratio"],
         empty_window_cap_by_bin=training_config["empty_window_cap_by_bin"],
         seed=seed,
     )
     loader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=batch_size,
         sampler=sampling_plan.indices,
         collate_fn=lambda batch: collate_oracle_windows(batch, pad_id=vocab.pad_id),
     )
-    eval_loader = DataLoader(
-        dataset,
+    train_eval_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=lambda batch: collate_oracle_windows(batch, pad_id=vocab.pad_id),
+    )
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate_oracle_windows(batch, pad_id=vocab.pad_id),
+    )
+    rollout_probe_loader = (
+        DataLoader(
+            rollout_probe_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=lambda batch: collate_oracle_windows(batch, pad_id=vocab.pad_id),
+        )
+        if rollout_probe_dataset is not None
+        else None
     )
     model_config_overrides = _validate_model_config_overrides(model_config_overrides)
     return _run_training(
@@ -740,17 +795,49 @@ def run_overfit_32(
         device_name=device_name,
         run_name=run_name,
         vocab=vocab,
+        train_eval_loader=train_eval_loader,
         eval_loader=eval_loader,
+        rollout_probe_loader=rollout_probe_loader,
+        rollout_eval_every=rollout_eval_every,
         timing_track=build_timing_track_metadata(
-            bpm_log_mean=dataset.bpm_log_mean,
-            bpm_log_std=dataset.bpm_log_std,
+            bpm_log_mean=train_dataset.bpm_log_mean,
+            bpm_log_std=train_dataset.bpm_log_std,
         ),
         overfit_coverage=overfit_coverage,
         pretraining_gates=pretraining_gates,
-        dataset_filter_report=asdict(dataset.filter_report),
+        dataset_filter_report=asdict(train_dataset.filter_report),
         training_sampling=_sampling_plan_report(sampling_plan),
         resume_from=resume_from,
     )
+
+
+def _build_oracle_window_dataset(
+    *,
+    source_name: str,
+    dataset_root: Path,
+    index_path: Path | None,
+    manifest_path: Path | None,
+    vocab: Stage1Vocab,
+    timing_stats: dict[str, float],
+    max_maps_per_bin: MapsPerBinCap | None,
+) -> OracleWindowDataset:
+    print(f"dataset_progress phase=build_windows status=start source={source_name}", flush=True)
+    dataset = OracleWindowDataset(
+        dataset_root=dataset_root,
+        index_path=index_path,
+        manifest_path=manifest_path,
+        vocab=vocab,
+        bpm_log_mean=timing_stats["bpm_log_mean"],
+        bpm_log_std=timing_stats["bpm_log_std"],
+        max_maps_per_bin=max_maps_per_bin,
+        progress=True,
+    )
+    print(
+        f"dataset_progress phase=build_windows status=done source={source_name} "
+        f"retained_maps={dataset.filter_report.retained_map_count} windows={len(dataset)}",
+        flush=True,
+    )
+    return dataset
 
 
 def _validate_maps_per_bin_cap(maps_per_bin: MapsPerBinCap) -> MapsPerBinCap:
@@ -913,19 +1000,11 @@ def _advance_training_iterator(iterator: Any, loader: DataLoader, completed_step
     return iterator
 
 
-def _latest_metrics_from_checkpoint(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
-    training_state = checkpoint["training_state"]
-    if isinstance(training_state, Mapping):
-        final_metrics = training_state.get("final_metrics")
-        if isinstance(final_metrics, Mapping):
-            return dict(final_metrics)
-
-    history = checkpoint["history"]
-    if history:
-        last_entry = history[-1]
-        if isinstance(last_entry, Mapping):
-            return {key: value for key, value in last_entry.items() if key != "step"}
-    return {"loss": float("nan"), "token_accuracy": 0.0}
+def _checkpoint_metric_group(training_state: Mapping[str, Any], key: str) -> dict[str, Any]:
+    raw_metrics = training_state.get(key)
+    if isinstance(raw_metrics, Mapping):
+        return dict(raw_metrics)
+    return {}
 
 
 def _atomic_torch_save(payload: Mapping[str, Any], path: Path) -> None:
@@ -970,7 +1049,9 @@ def _training_report_payload(
     training_sampling: dict[str, Any] | None,
     overfit_coverage: dict[str, Any] | None,
     history: list[dict[str, Any]],
-    final_metrics: dict[str, Any],
+    final_train_teacher_forced: dict[str, Any],
+    final_val_teacher_forced: dict[str, Any],
+    final_rollout_probe: dict[str, Any],
     resume_from: Path | None,
 ) -> dict[str, Any]:
     return {
@@ -991,7 +1072,9 @@ def _training_report_payload(
         "training_sampling": training_sampling,
         "overfit_coverage": overfit_coverage,
         "history": history,
-        "final": final_metrics,
+        "final_train_teacher_forced": final_train_teacher_forced,
+        "final_val_teacher_forced": final_val_teacher_forced,
+        "final_rollout_probe": final_rollout_probe,
         "resume_from": resume_from.as_posix() if resume_from is not None else None,
     }
 
@@ -1014,7 +1097,9 @@ def _training_checkpoint_payload(
     save_every: int,
     learning_rate: float,
     device: torch.device,
-    final_metrics: dict[str, Any],
+    final_train_teacher_forced: dict[str, Any],
+    final_val_teacher_forced: dict[str, Any],
+    final_rollout_probe: dict[str, Any],
     last_train_loss: float,
     resume_from: Path | None,
 ) -> dict[str, Any]:
@@ -1039,7 +1124,9 @@ def _training_checkpoint_payload(
             "learning_rate": learning_rate,
             "device": str(device),
             "last_train_loss": last_train_loss,
-            "final_metrics": final_metrics,
+            "final_train_teacher_forced": final_train_teacher_forced,
+            "final_val_teacher_forced": final_val_teacher_forced,
+            "final_rollout_probe": final_rollout_probe,
             "resume_from": resume_from.as_posix() if resume_from is not None else None,
             "rng_state": _capture_rng_state(),
         },
@@ -1072,7 +1159,10 @@ def _run_training(
     device_name: str,
     run_name: str,
     vocab: Stage1Vocab,
+    train_eval_loader: DataLoader,
     eval_loader: DataLoader,
+    rollout_probe_loader: DataLoader | None,
+    rollout_eval_every: int | None,
     timing_track: dict[str, Any],
     overfit_coverage: dict[str, Any] | None,
     pretraining_gates: dict[str, Any],
@@ -1092,7 +1182,9 @@ def _run_training(
     iterator = cycle(loader)
     completed_step = 0
     last_train_loss = float("nan")
-    final_metrics: dict[str, Any] = {"loss": float("nan"), "token_accuracy": 0.0}
+    final_train_teacher_forced: dict[str, Any] = {}
+    final_val_teacher_forced: dict[str, Any] = {"loss": float("nan"), "token_accuracy": 0.0}
+    final_rollout_probe: dict[str, Any] = {}
 
     if resume_from is not None:
         resume_checkpoint = _load_resume_checkpoint(resume_from, expected_config=config)
@@ -1103,8 +1195,15 @@ def _run_training(
         training_state = resume_checkpoint["training_state"]
         completed_step = int(training_state["step"])
         history = [dict(entry) for entry in resume_checkpoint["history"]]
-        final_metrics = _latest_metrics_from_checkpoint(resume_checkpoint)
-        last_train_loss = float(training_state.get("last_train_loss", final_metrics.get("loss", float("nan"))))
+        final_train_teacher_forced = _checkpoint_metric_group(training_state, "final_train_teacher_forced")
+        final_val_teacher_forced = _checkpoint_metric_group(training_state, "final_val_teacher_forced")
+        final_rollout_probe = _checkpoint_metric_group(training_state, "final_rollout_probe")
+        last_train_loss = float(
+            training_state.get(
+                "last_train_loss",
+                final_val_teacher_forced.get("loss", final_train_teacher_forced.get("loss", float("nan"))),
+            ),
+        )
         _restore_rng_state(training_state["rng_state"])
         iterator = _advance_training_iterator(iterator, loader, completed_step)
         print(
@@ -1142,16 +1241,56 @@ def _run_training(
                 flush=True,
             )
         if should_eval:
-            final_metrics = teacher_forced_metrics_for_loader(model, eval_loader, device=device)
+            final_val_teacher_forced = teacher_forced_metrics_for_loader(model, eval_loader, device=device)
+            history_entry: dict[str, Any] = {
+                "step": step,
+                "train_loss": last_train_loss,
+                "val_teacher_forced": final_val_teacher_forced,
+            }
             if step == max_steps:
-                final_metrics.update(greedy_decode_metrics_for_loader(model, eval_loader, vocab=vocab, device=device))
+                final_train_teacher_forced = teacher_forced_metrics_for_loader(model, train_eval_loader, device=device)
+                history_entry["train_teacher_forced"] = final_train_teacher_forced
+
+            should_rollout_probe = (
+                rollout_probe_loader is not None
+                and (
+                    step == max_steps
+                    or (
+                        rollout_eval_every is not None
+                        and step % rollout_eval_every == 0
+                    )
+                )
+            )
+            if should_rollout_probe and rollout_probe_loader is not None:
+                final_rollout_probe = greedy_decode_metrics_for_loader(
+                    model,
+                    rollout_probe_loader,
+                    vocab=vocab,
+                    device=device,
+                )
+                history_entry["rollout_probe"] = final_rollout_probe
+            if step == max_steps:
+                if not final_train_teacher_forced:
+                    final_train_teacher_forced = teacher_forced_metrics_for_loader(
+                        model,
+                        train_eval_loader,
+                        device=device,
+                    )
+                if rollout_probe_loader is None:
+                    final_rollout_probe = greedy_decode_metrics_for_loader(
+                        model,
+                        eval_loader,
+                        vocab=vocab,
+                        device=device,
+                    )
+                    history_entry["rollout_probe"] = final_rollout_probe
             print(
                 f"eval_progress step={step}/{max_steps} "
-                f"loss={final_metrics['loss']:.6f} "
-                f"token_accuracy={final_metrics['token_accuracy']:.6f}",
+                f"val_loss={final_val_teacher_forced['loss']:.6f} "
+                f"val_token_accuracy={final_val_teacher_forced['token_accuracy']:.6f}",
                 flush=True,
             )
-            history.append({"step": step, **final_metrics})
+            history.append(history_entry)
 
         if should_save:
             checkpoint_payload = _training_checkpoint_payload(
@@ -1171,7 +1310,9 @@ def _run_training(
                 save_every=save_every,
                 learning_rate=learning_rate,
                 device=device,
-                final_metrics=final_metrics,
+                final_train_teacher_forced=final_train_teacher_forced,
+                final_val_teacher_forced=final_val_teacher_forced,
+                final_rollout_probe=final_rollout_probe,
                 last_train_loss=last_train_loss,
                 resume_from=resume_from,
             )
@@ -1200,7 +1341,9 @@ def _run_training(
                     training_sampling=training_sampling,
                     overfit_coverage=overfit_coverage,
                     history=history,
-                    final_metrics=final_metrics,
+                    final_train_teacher_forced=final_train_teacher_forced,
+                    final_val_teacher_forced=final_val_teacher_forced,
+                    final_rollout_probe=final_rollout_probe,
                     resume_from=resume_from,
                 ),
             )
@@ -1228,7 +1371,9 @@ def _run_training(
             save_every=save_every,
             learning_rate=learning_rate,
             device=device,
-            final_metrics=final_metrics,
+            final_train_teacher_forced=final_train_teacher_forced,
+            final_val_teacher_forced=final_val_teacher_forced,
+            final_rollout_probe=final_rollout_probe,
             last_train_loss=last_train_loss,
             resume_from=resume_from,
         )
@@ -1257,7 +1402,9 @@ def _run_training(
                 training_sampling=training_sampling,
                 overfit_coverage=overfit_coverage,
                 history=history,
-                final_metrics=final_metrics,
+                final_train_teacher_forced=final_train_teacher_forced,
+                final_val_teacher_forced=final_val_teacher_forced,
+                final_rollout_probe=final_rollout_probe,
                 resume_from=resume_from,
             ),
         )
@@ -1267,11 +1414,12 @@ def _run_training(
             flush=True,
         )
 
+    result_metrics = final_val_teacher_forced or final_train_teacher_forced
     return OverfitRunResult(
         report_path=report_path,
         checkpoint_path=checkpoint_path,
-        final_loss=float(final_metrics["loss"]),
-        final_token_accuracy=float(final_metrics["token_accuracy"]),
+        final_loss=float(result_metrics.get("loss", float("nan"))),
+        final_token_accuracy=float(result_metrics.get("token_accuracy", 0.0)),
     )
 
 
@@ -1331,25 +1479,25 @@ def greedy_decode_metrics_for_loader(
     decode_inputs_by_map: dict[tuple[str, str], list[_DecodeWindowInput]] = {}
 
     for raw_batch in loader:
-        batch = _move_batch(raw_batch, device)
-        for index in range(int(batch["decoder_input_ids"].shape[0])):
-            metadata = batch["metadata"][index]
+        batch_inputs = _move_rollout_batch_inputs(raw_batch, device)
+        for index in range(int(raw_batch["decoder_input_ids"].shape[0])):
+            metadata = raw_batch["metadata"][index]
             difficulty_bin_label = _difficulty_bin_label(float(metadata["difficulty"]))
             if difficulty_bin_label is None:
                 raise ValueError(f"difficulty outside supported coarse bins: {metadata['difficulty']}")
             bin_counts = counts_by_bin[difficulty_bin_label]
             counts.evaluated_window_count += 1
             bin_counts.evaluated_window_count += 1
-            condition_ids = [int(token_id) for token_id in batch["decoder_input_ids"][index, :3].tolist()]
-            write_duration_ms = int(batch["write_duration_ms"][index].item())
+            condition_ids = [int(token_id) for token_id in raw_batch["decoder_input_ids"][index, :3].tolist()]
+            write_duration_ms = int(raw_batch["write_duration_ms"][index].item())
             map_key = (str(metadata["beatmap_path"]), str(metadata["audio_path"]))
             write_start_ms = int(metadata["write_start_ms"])
-            oracle_open_hold_mask = int(batch["open_hold_mask"][index].item())
+            oracle_open_hold_mask = int(raw_batch["open_hold_mask"][index].item())
             decode_result = constrained_greedy_decode(
                 model,
-                packed_audio=batch["packed_audio"][index : index + 1],
-                timing_track=batch["timing_track"][index : index + 1],
-                difficulty_bucket=batch["difficulty_bucket"][index : index + 1],
+                packed_audio=batch_inputs["packed_audio"][index : index + 1],
+                timing_track=batch_inputs["timing_track"][index : index + 1],
+                difficulty_bucket=batch_inputs["difficulty_bucket"][index : index + 1],
                 condition_ids=condition_ids,
                 open_hold_mask=oracle_open_hold_mask,
                 write_duration_ms=write_duration_ms,
@@ -1372,7 +1520,7 @@ def greedy_decode_metrics_for_loader(
                 counts.empty_outputs += 1
                 bin_counts.empty_outputs += 1
 
-            label_tokens = [int(token_id) for token_id in batch["labels"][index].tolist() if int(token_id) != -100]
+            label_tokens = [int(token_id) for token_id in raw_batch["labels"][index].tolist() if int(token_id) != -100]
             reference_timepoints = decode_target_tokens(
                 label_tokens,
                 vocab=vocab,
@@ -1413,9 +1561,9 @@ def greedy_decode_metrics_for_loader(
             decode_inputs_by_map.setdefault(map_key, []).append(
                 _DecodeWindowInput(
                     write_start_ms=write_start_ms,
-                    packed_audio=batch["packed_audio"][index : index + 1],
-                    timing_track=batch["timing_track"][index : index + 1],
-                    difficulty_bucket=batch["difficulty_bucket"][index : index + 1],
+                    packed_audio=_clone_tensor_to_cpu(raw_batch["packed_audio"][index : index + 1]),
+                    timing_track=_clone_tensor_to_cpu(raw_batch["timing_track"][index : index + 1]),
+                    difficulty_bucket=_clone_tensor_to_cpu(raw_batch["difficulty_bucket"][index : index + 1]),
                     condition_ids=condition_ids,
                     oracle_open_hold_mask=oracle_open_hold_mask,
                     write_duration_ms=write_duration_ms,
@@ -1433,20 +1581,30 @@ def greedy_decode_metrics_for_loader(
             if decode_input.write_start_ms != 0:
                 counts.stitched_boundary_count += 1
                 bin_counts.stitched_boundary_count += 1
+                if decode_input.oracle_open_hold_mask != 0:
+                    counts.active_stitched_boundary_count += 1
+                    bin_counts.active_stitched_boundary_count += 1
                 if carried_open_hold_mask != decode_input.oracle_open_hold_mask:
                     counts.stitched_boundary_errors += 1
                     bin_counts.stitched_boundary_errors += 1
+                elif decode_input.oracle_open_hold_mask != 0:
+                    counts.active_stitched_boundary_matches += 1
+                    bin_counts.active_stitched_boundary_matches += 1
 
             stitched_condition_ids = [
                 decode_input.condition_ids[0],
                 decode_input.condition_ids[1],
                 vocab.open_token_id(carried_open_hold_mask),
             ]
+            packed_audio, timing_track, difficulty_bucket = _decode_window_input_to_device(
+                decode_input,
+                device=device,
+            )
             decode_result = constrained_greedy_decode(
                 model,
-                packed_audio=decode_input.packed_audio,
-                timing_track=decode_input.timing_track,
-                difficulty_bucket=decode_input.difficulty_bucket,
+                packed_audio=packed_audio,
+                timing_track=timing_track,
+                difficulty_bucket=difficulty_bucket,
                 condition_ids=stitched_condition_ids,
                 open_hold_mask=carried_open_hold_mask,
                 write_duration_ms=decode_input.write_duration_ms,
@@ -1487,6 +1645,10 @@ def greedy_decode_metrics_for_loader(
         label: _decode_metric_report(bin_counts)
         for label, bin_counts in counts_by_bin.items()
     }
+    metrics["boundary_error_by_bin"] = {
+        label: metrics["decode_per_difficulty_bin"][label]["stitched_boundary_open_mask_error_rate"]
+        for label in COARSE_BIN_LABELS
+    }
     return metrics
 
 
@@ -1500,6 +1662,7 @@ def _decode_metric_report(counts: _DecodeMetricCounts) -> dict[str, float | int]
     oracle_event_denominator = max(counts.generated_event_count, 1)
     stitched_event_denominator = max(counts.stitched_generated_event_count, 1)
     boundary_denominator = max(counts.stitched_boundary_count, 1)
+    active_boundary_denominator = max(counts.active_stitched_boundary_count, 1)
     return {
         "decode_density_error": float(density_error),
         "decode_time_monotonicity_error": float(counts.time_monotonicity_errors),
@@ -1524,6 +1687,8 @@ def _decode_metric_report(counts: _DecodeMetricCounts) -> dict[str, float | int]
         "decode_evaluated_window_count": counts.evaluated_window_count,
         "stitched_boundary_open_mask_error_rate": counts.stitched_boundary_errors / boundary_denominator,
         "stitched_boundary_evaluated_boundary_count": counts.stitched_boundary_count,
+        "active_boundary_exact_match": counts.active_stitched_boundary_matches / active_boundary_denominator,
+        "active_boundary_evaluated_boundary_count": counts.active_stitched_boundary_count,
     }
 
 
@@ -1550,6 +1715,30 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     ):
         moved[key] = batch[key].to(device)
     return moved
+
+
+def _move_rollout_batch_inputs(batch: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
+    return {
+        "packed_audio": batch["packed_audio"].to(device),
+        "timing_track": batch["timing_track"].to(device),
+        "difficulty_bucket": batch["difficulty_bucket"].to(device),
+    }
+
+
+def _clone_tensor_to_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().cpu().clone()
+
+
+def _decode_window_input_to_device(
+    decode_input: _DecodeWindowInput,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        decode_input.packed_audio.to(device),
+        decode_input.timing_track.to(device),
+        decode_input.difficulty_bucket.to(device),
+    )
 
 
 def _record_value(record: Any, key: str) -> Any:
@@ -1687,6 +1876,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--run-name", default=config_defaults.get("run_name", "overfit_32"))
     parser.add_argument("--save-every", type=int, default=config_defaults.get("save_every"))
     parser.add_argument("--resume-from", default=config_defaults.get("resume_from"))
+    parser.add_argument("--train-manifest", default=config_defaults.get("train_manifest"))
+    parser.add_argument("--eval-manifest", default=config_defaults.get("eval_manifest"))
+    parser.add_argument("--rollout-probe-manifest", default=config_defaults.get("rollout_probe_manifest"))
+    parser.add_argument("--rollout-eval-every", type=int, default=config_defaults.get("rollout_eval_every"))
     parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
     parser.add_argument("--d-model", type=int, default=model_defaults.get("d_model"))
     parser.add_argument("--heads", type=int, default=model_defaults.get("heads"))
@@ -1729,6 +1922,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             save_every=args.save_every,
             resume_from=Path(args.resume_from) if args.resume_from is not None else None,
             model_config_overrides=model_config_overrides,
+            train_manifest_path=Path(args.train_manifest) if args.train_manifest is not None else None,
+            eval_manifest_path=Path(args.eval_manifest) if args.eval_manifest is not None else None,
+            rollout_probe_manifest_path=(
+                Path(args.rollout_probe_manifest)
+                if args.rollout_probe_manifest is not None
+                else None
+            ),
+            rollout_eval_every=args.rollout_eval_every,
         )
 
     print(f"report_path {result.report_path}")

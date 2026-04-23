@@ -17,6 +17,19 @@ class DecodePhase(str, Enum):
     FINISHED = "FINISHED"
 
 
+def _event_actions_compatible_with_open_hold_mask(
+    open_hold_mask: int,
+    lane_actions: Sequence[LaneAction],
+) -> bool:
+    for lane, action in enumerate(lane_actions):
+        is_open = (open_hold_mask & (1 << lane)) != 0
+        if is_open and action not in {LaneAction.NONE, LaneAction.HOLD_END}:
+            return False
+        if not is_open and action == LaneAction.HOLD_END:
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class ConstrainedDecodeState:
     current_time_rel: int
@@ -51,12 +64,17 @@ class ConstrainedDecodeState:
             } and self._event_time_in_bounds() and self._is_legal_event(vocab.decode_event_token(token_id))
         return False
 
-    def legal_token_mask(self, vocab: Stage1Vocab, *, device: torch.device | None = None) -> torch.Tensor:
-        mask = torch.zeros(vocab.size, dtype=torch.bool, device=device)
-        for token_id in range(vocab.size):
-            if self.is_legal(token_id, vocab):
-                mask[token_id] = True
-        return mask
+    def legal_token_mask(
+        self,
+        vocab: Stage1Vocab,
+        *,
+        device: torch.device | None = None,
+        mask_cache: "_LegalityMaskCache | None" = None,
+    ) -> torch.Tensor:
+        if mask_cache is None:
+            resolved_device = torch.device("cpu") if device is None else device
+            mask_cache = _LegalityMaskCache(vocab=vocab, device=resolved_device)
+        return mask_cache.mask_for_state(self)
 
     def transition(self, token_id: int, vocab: Stage1Vocab) -> "ConstrainedDecodeState":
         if not self.is_legal(token_id, vocab):
@@ -110,13 +128,71 @@ class ConstrainedDecodeState:
         return base + self.pending_delta + extra_delta
 
     def _is_legal_event(self, lane_actions: Sequence[LaneAction]) -> bool:
-        for lane, action in enumerate(lane_actions):
-            is_open = (self.open_hold_mask & (1 << lane)) != 0
-            if is_open and action not in {LaneAction.NONE, LaneAction.HOLD_END}:
-                return False
-            if not is_open and action == LaneAction.HOLD_END:
-                return False
-        return True
+        return _event_actions_compatible_with_open_hold_mask(self.open_hold_mask, lane_actions)
+
+
+@dataclass
+class _LegalityMaskCache:
+    vocab: Stage1Vocab
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        self._empty_mask = torch.zeros(self.vocab.size, dtype=torch.bool, device=self.device)
+        self._max_ts_index = len(self.vocab.ts_token_ids) - 1
+        self._event_masks_by_open_hold = {
+            open_hold_mask: self._build_event_mask(open_hold_mask)
+            for open_hold_mask in range(len(self.vocab.open_token_ids))
+        }
+        self._ts_masks_by_key: dict[tuple[DecodePhase, bool, int], torch.Tensor] = {}
+
+    def mask_for_state(self, state: ConstrainedDecodeState) -> torch.Tensor:
+        mask = self._ts_mask_for_state(state).clone()
+        if state.phase == DecodePhase.EXPECT_TS_OR_EOS:
+            mask[self.vocab.eos_id] = True
+        if state.phase in {
+            DecodePhase.EXPECT_EVENT_ONLY,
+            DecodePhase.EXPECT_EVENT_OR_TS_REMAINDER,
+        } and state._event_time_in_bounds():
+            mask |= self._event_masks_by_open_hold[state.open_hold_mask]
+        return mask
+
+    def _build_event_mask(self, open_hold_mask: int) -> torch.Tensor:
+        mask = self._empty_mask.clone()
+        for token_id in self.vocab.event_token_ids:
+            if _event_actions_compatible_with_open_hold_mask(
+                open_hold_mask,
+                self.vocab.decode_event_token(token_id),
+            ):
+                mask[token_id] = True
+        return mask
+
+    def _ts_mask_for_state(self, state: ConstrainedDecodeState) -> torch.Tensor:
+        if state.phase not in {
+            DecodePhase.EXPECT_TS_OR_EOS,
+            DecodePhase.EXPECT_EVENT_OR_TS_REMAINDER,
+        }:
+            return self._empty_mask
+
+        min_ts_index = 1 if state.phase == DecodePhase.EXPECT_EVENT_OR_TS_REMAINDER or state.has_emitted_event else 0
+        remaining_time_ms = state.write_duration_ms - state._next_event_time_rel()
+        if remaining_time_ms <= 0:
+            return self._empty_mask
+
+        max_ts_index = min(self._max_ts_index, (remaining_time_ms - 1) // 10)
+        if max_ts_index < min_ts_index:
+            return self._empty_mask
+
+        key = (state.phase, state.has_emitted_event, max_ts_index)
+        cached_mask = self._ts_masks_by_key.get(key)
+        if cached_mask is not None:
+            return cached_mask
+
+        mask = self._empty_mask.clone()
+        start_token_id = self.vocab.ts_token_ids[min_ts_index]
+        stop_token_id = self.vocab.ts_token_ids[max_ts_index]
+        mask[start_token_id : stop_token_id + 1] = True
+        self._ts_masks_by_key[key] = mask
+        return mask
 
 
 @dataclass(frozen=True)
@@ -164,10 +240,19 @@ def constrained_greedy_decode(
             difficulty_bucket=difficulty_bucket,
         )
     generated = list(condition_ids)
+    decoder_input_ids = torch.empty(
+        (1, len(condition_ids) + max_decode_len),
+        dtype=torch.long,
+        device=device,
+    )
+    if condition_ids:
+        decoder_input_ids[0, : len(condition_ids)] = torch.tensor(condition_ids, dtype=torch.long, device=device)
+    generated_length = len(condition_ids)
     state = ConstrainedDecodeState.after_prefix(
         open_hold_mask=open_hold_mask,
         write_duration_ms=write_duration_ms,
     )
+    legality_mask_cache = _LegalityMaskCache(vocab=vocab, device=device)
     target_count = 0
 
     while target_count < max_decode_len:
@@ -188,23 +273,25 @@ def constrained_greedy_decode(
                 eos_forced_after_pending_ts=True,
             )
 
-        decoder_input_ids = torch.tensor([generated], dtype=torch.long, device=device)
+        active_decoder_input_ids = decoder_input_ids[:, :generated_length]
         if memory is None:
             logits = model(
                 packed_audio=packed_audio,
                 timing_track=timing_track,
                 difficulty_bucket=difficulty_bucket,
-                decoder_input_ids=decoder_input_ids,
+                decoder_input_ids=active_decoder_input_ids,
             )[0, -1]
         else:
             logits = model.decode_from_memory(
                 memory=memory,
-                decoder_input_ids=decoder_input_ids,
+                decoder_input_ids=active_decoder_input_ids,
             )[0, -1]
-        legal_mask = state.legal_token_mask(vocab, device=device)
+        legal_mask = state.legal_token_mask(vocab, device=device, mask_cache=legality_mask_cache)
         masked_logits = logits.masked_fill(~legal_mask, -torch.inf)
         next_token_id = int(torch.argmax(masked_logits).item())
         generated.append(next_token_id)
+        decoder_input_ids[0, generated_length] = next_token_id
+        generated_length += 1
         target_count += 1
         state = state.transition(next_token_id, vocab)
         if next_token_id == vocab.eos_id:

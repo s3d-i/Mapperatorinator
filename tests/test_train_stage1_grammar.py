@@ -5,6 +5,7 @@ import torch
 from train.stage1_oracle.events.canonical import LaneAction
 from train.stage1_oracle.events.grammar import (
     ConstrainedDecodeState,
+    DecodePhase,
     constrained_greedy_decode,
     force_eos_after_pending_ts,
 )
@@ -41,6 +42,8 @@ class _SplitTokenSequenceModel:
         self.vocab_size = vocab_size
         self.encode_calls = 0
         self.decode_calls = 0
+        self.decoder_input_ptrs: list[int] = []
+        self.decoder_input_history: list[list[int]] = []
 
     def __call__(self, **_: torch.Tensor) -> torch.Tensor:
         raise AssertionError("split decode path should not call model.forward()")
@@ -64,6 +67,8 @@ class _SplitTokenSequenceModel:
     ) -> torch.Tensor:
         del memory, decoder_padding_mask
         self.decode_calls += 1
+        self.decoder_input_ptrs.append(decoder_input_ids.data_ptr())
+        self.decoder_input_history.append(decoder_input_ids[0].tolist())
         step = decoder_input_ids.shape[1] - 3
         next_token_id = self.token_ids[min(step, len(self.token_ids) - 1)]
         logits = torch.full(
@@ -125,6 +130,43 @@ class Stage1GrammarTests(unittest.TestCase):
         self.assertFalse(state.is_legal(tap_on_open_lane, vocab))
         self.assertTrue(state.is_legal(end_open_lane, vocab))
         self.assertEqual(state.transition(end_open_lane, vocab).open_hold_mask, 0)
+
+    def test_legal_token_mask_matches_reference_legality_scan(self) -> None:
+        vocab = Stage1Vocab()
+        hold_start = vocab.encode_timepoint_event(
+            (LaneAction.HOLD_START, LaneAction.NONE, LaneAction.NONE, LaneAction.NONE),
+        )
+        states = [
+            ConstrainedDecodeState.after_prefix(open_hold_mask=0, write_duration_ms=8000),
+            ConstrainedDecodeState.after_prefix(open_hold_mask=0b0001, write_duration_ms=8000),
+            ConstrainedDecodeState.after_prefix(open_hold_mask=0, write_duration_ms=8000).transition(
+                vocab.ts_token_id(0),
+                vocab,
+            ),
+            ConstrainedDecodeState.after_prefix(open_hold_mask=0, write_duration_ms=1500).transition(
+                vocab.ts_token_id(1000),
+                vocab,
+            ),
+            ConstrainedDecodeState.after_prefix(open_hold_mask=0, write_duration_ms=8000)
+            .transition(vocab.ts_token_id(0), vocab)
+            .transition(hold_start, vocab),
+            ConstrainedDecodeState(
+                current_time_rel=90,
+                pending_delta=10,
+                has_emitted_event=True,
+                open_hold_mask=0b0001,
+                write_duration_ms=100,
+                phase=DecodePhase.EXPECT_EVENT_OR_TS_REMAINDER,
+            ),
+        ]
+
+        for state in states:
+            expected = torch.tensor(
+                [state.is_legal(token_id, vocab) for token_id in range(vocab.size)],
+                dtype=torch.bool,
+            )
+            actual = state.legal_token_mask(vocab, device=torch.device("cpu"))
+            self.assertTrue(torch.equal(actual.cpu(), expected), msg=f"mask mismatch for state {state}")
 
     def test_force_eos_rolls_back_only_pending_ts_suffix(self) -> None:
         vocab = Stage1Vocab()
@@ -297,6 +339,15 @@ class Stage1GrammarTests(unittest.TestCase):
         )
         self.assertEqual(model.encode_calls, 1)
         self.assertEqual(model.decode_calls, 3)
+        self.assertEqual(len(set(model.decoder_input_ptrs)), 1)
+        self.assertEqual(
+            model.decoder_input_history,
+            [
+                condition_ids,
+                condition_ids + [vocab.ts_token_id(0)],
+                condition_ids + [vocab.ts_token_id(0), event_id],
+            ],
+        )
 
 
 if __name__ == "__main__":
