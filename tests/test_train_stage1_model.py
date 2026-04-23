@@ -82,6 +82,45 @@ class Stage1MapperModelTests(unittest.TestCase):
 
         self.assertLess(after, before)
 
+    def test_split_encode_decode_matches_forward(self) -> None:
+        torch.manual_seed(7)
+        config = Stage1OracleMapperConfig(
+            vocab_size=48,
+            d_model=32,
+            heads=4,
+            encoder_layers=1,
+            decoder_layers=1,
+            ffn_dim=64,
+            max_decode_len=8,
+            dropout=0.0,
+        )
+        model = Stage1OracleMapper(config)
+        packed_audio = torch.randn(2, 600, 160)
+        timing_track = torch.randn(2, 600, 5)
+        difficulty_bucket = torch.tensor([2, 5])
+        decoder_input_ids = torch.tensor([[1, 3, 20, 5], [1, 4, 21, 6]])
+        decoder_padding_mask = torch.tensor([[False, False, False, False], [False, False, False, True]])
+
+        logits = model(
+            packed_audio=packed_audio,
+            timing_track=timing_track,
+            difficulty_bucket=difficulty_bucket,
+            decoder_input_ids=decoder_input_ids,
+            decoder_padding_mask=decoder_padding_mask,
+        )
+        memory = model.encode_context(
+            packed_audio=packed_audio,
+            timing_track=timing_track,
+            difficulty_bucket=difficulty_bucket,
+        )
+        split_logits = model.decode_from_memory(
+            memory=memory,
+            decoder_input_ids=decoder_input_ids,
+            decoder_padding_mask=decoder_padding_mask,
+        )
+
+        self.assertTrue(torch.allclose(logits, split_logits))
+
 
 if __name__ == "__main__":
     unittest.main()

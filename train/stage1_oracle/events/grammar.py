@@ -153,6 +153,16 @@ def constrained_greedy_decode(
         raise ValueError(f"max_decode_len must be positive: {max_decode_len}")
 
     device = packed_audio.device
+    split_decode = callable(getattr(model, "encode_context", None)) and callable(
+        getattr(model, "decode_from_memory", None),
+    )
+    memory = None
+    if split_decode:
+        memory = model.encode_context(
+            packed_audio=packed_audio,
+            timing_track=timing_track,
+            difficulty_bucket=difficulty_bucket,
+        )
     generated = list(condition_ids)
     state = ConstrainedDecodeState.after_prefix(
         open_hold_mask=open_hold_mask,
@@ -179,12 +189,18 @@ def constrained_greedy_decode(
             )
 
         decoder_input_ids = torch.tensor([generated], dtype=torch.long, device=device)
-        logits = model(
-            packed_audio=packed_audio,
-            timing_track=timing_track,
-            difficulty_bucket=difficulty_bucket,
-            decoder_input_ids=decoder_input_ids,
-        )[0, -1]
+        if memory is None:
+            logits = model(
+                packed_audio=packed_audio,
+                timing_track=timing_track,
+                difficulty_bucket=difficulty_bucket,
+                decoder_input_ids=decoder_input_ids,
+            )[0, -1]
+        else:
+            logits = model.decode_from_memory(
+                memory=memory,
+                decoder_input_ids=decoder_input_ids,
+            )[0, -1]
         legal_mask = state.legal_token_mask(vocab, device=device)
         masked_logits = logits.masked_fill(~legal_mask, -torch.inf)
         next_token_id = int(torch.argmax(masked_logits).item())

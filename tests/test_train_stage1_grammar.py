@@ -35,6 +35,47 @@ class _TokenSequenceModel:
         return logits
 
 
+class _SplitTokenSequenceModel:
+    def __init__(self, token_ids: list[int], *, vocab_size: int) -> None:
+        self.token_ids = token_ids
+        self.vocab_size = vocab_size
+        self.encode_calls = 0
+        self.decode_calls = 0
+
+    def __call__(self, **_: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("split decode path should not call model.forward()")
+
+    def encode_context(
+        self,
+        *,
+        packed_audio: torch.Tensor,
+        timing_track: torch.Tensor,
+        difficulty_bucket: torch.Tensor,
+    ) -> torch.Tensor:
+        self.encode_calls += 1
+        return difficulty_bucket.clone()
+
+    def decode_from_memory(
+        self,
+        *,
+        memory: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        decoder_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del memory, decoder_padding_mask
+        self.decode_calls += 1
+        step = decoder_input_ids.shape[1] - 3
+        next_token_id = self.token_ids[min(step, len(self.token_ids) - 1)]
+        logits = torch.full(
+            (decoder_input_ids.shape[0], decoder_input_ids.shape[1], self.vocab_size),
+            -1000.0,
+            dtype=torch.float32,
+            device=decoder_input_ids.device,
+        )
+        logits[:, -1, next_token_id] = 1000.0
+        return logits
+
+
 class Stage1GrammarTests(unittest.TestCase):
     def test_eos_is_legal_only_after_prefix_or_completed_event(self) -> None:
         vocab = Stage1Vocab()
@@ -217,6 +258,45 @@ class Stage1GrammarTests(unittest.TestCase):
         self.assertFalse(result.max_decode_len_reached)
         self.assertTrue(result.eos_emitted_by_model)
         self.assertFalse(result.eos_forced_after_pending_ts)
+
+    def test_constrained_decode_reuses_encoded_context_for_split_capable_models(self) -> None:
+        vocab = Stage1Vocab()
+        event_id = vocab.encode_timepoint_event((LaneAction.TAP, LaneAction.NONE, LaneAction.NONE, LaneAction.NONE))
+        condition_ids = [
+            vocab.bos_id,
+            vocab.diff_token_id(0),
+            vocab.open_token_id(0),
+        ]
+        model = _SplitTokenSequenceModel(
+            [vocab.ts_token_id(0), event_id, vocab.eos_id],
+            vocab_size=vocab.size,
+        )
+
+        result = constrained_greedy_decode(
+            model,
+            packed_audio=torch.zeros(1, 600, 160),
+            timing_track=torch.zeros(1, 600, 5),
+            difficulty_bucket=torch.tensor([0]),
+            condition_ids=condition_ids,
+            open_hold_mask=0,
+            write_duration_ms=8000,
+            vocab=vocab,
+            max_decode_len=4,
+        )
+
+        self.assertEqual(
+            result.token_ids,
+            [
+                vocab.bos_id,
+                vocab.diff_token_id(0),
+                vocab.open_token_id(0),
+                vocab.ts_token_id(0),
+                event_id,
+                vocab.eos_id,
+            ],
+        )
+        self.assertEqual(model.encode_calls, 1)
+        self.assertEqual(model.decode_calls, 3)
 
 
 if __name__ == "__main__":

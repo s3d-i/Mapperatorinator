@@ -61,6 +61,11 @@ class Stage1OracleMapper(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.decoder_layers)
         self.output_norm = nn.LayerNorm(config.d_model)
         self.token_head = nn.Linear(config.d_model, config.vocab_size)
+        self.register_buffer(
+            "_decoder_causal_mask",
+            _causal_mask(config.max_decode_len + 3),
+            persistent=False,
+        )
         self._reset_parameters()
 
     def forward(
@@ -70,6 +75,24 @@ class Stage1OracleMapper(nn.Module):
         difficulty_bucket: torch.Tensor,
         decoder_input_ids: torch.Tensor,
         decoder_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        memory = self.encode_context(
+            packed_audio=packed_audio,
+            timing_track=timing_track,
+            difficulty_bucket=difficulty_bucket,
+        )
+        return self.decode_from_memory(
+            memory=memory,
+            decoder_input_ids=decoder_input_ids,
+            decoder_padding_mask=decoder_padding_mask,
+        )
+
+    def encode_context(
+        self,
+        *,
+        packed_audio: torch.Tensor,
+        timing_track: torch.Tensor,
+        difficulty_bucket: torch.Tensor,
     ) -> torch.Tensor:
         if packed_audio.ndim != 3 or packed_audio.shape[-1] != self.config.audio_dim:
             raise ValueError(f"packed_audio must have shape [B, T, {self.config.audio_dim}], got {packed_audio.shape}")
@@ -83,17 +106,38 @@ class Stage1OracleMapper(nn.Module):
             raise ValueError(
                 f"encoder frame count must be exactly {self.config.encoder_frame_count}, got {frame_count}",
             )
-        if decoder_input_ids.shape[1] > self.decoder_position.shape[1]:
-            raise ValueError(f"decoder length {decoder_input_ids.shape[1]} exceeds configured maximum")
 
         audio_emb = self.audio_projection(packed_audio)
         timing_emb = self.timing_projection(timing_track)
         diff_emb = self.difficulty_embedding(difficulty_bucket).unsqueeze(1).expand(batch_size, frame_count, -1)
         fused = self.fused_projection(torch.cat([audio_emb, timing_emb, diff_emb], dim=-1))
-        memory = self.encoder(fused + self.encoder_position[:, :frame_count])
+        return self.encoder(fused + self.encoder_position[:, :frame_count])
+
+    def decode_from_memory(
+        self,
+        *,
+        memory: torch.Tensor,
+        decoder_input_ids: torch.Tensor,
+        decoder_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if memory.ndim != 3:
+            raise ValueError(f"memory must have shape [B, T, {self.config.d_model}], got {memory.shape}")
+        if decoder_input_ids.ndim != 2:
+            raise ValueError(f"decoder_input_ids must have shape [B, T], got {decoder_input_ids.shape}")
+        if memory.shape[0] != decoder_input_ids.shape[0]:
+            raise ValueError("memory and decoder_input_ids must share batch dimension")
+        if memory.shape[-1] != self.config.d_model:
+            raise ValueError(
+                f"memory hidden size must match configured d_model={self.config.d_model}, got {memory.shape[-1]}",
+            )
+        if decoder_input_ids.shape[1] > self.decoder_position.shape[1]:
+            raise ValueError(f"decoder length {decoder_input_ids.shape[1]} exceeds configured maximum")
 
         target = self.token_embedding(decoder_input_ids) + self.decoder_position[:, : decoder_input_ids.shape[1]]
-        causal_mask = _causal_mask(decoder_input_ids.shape[1], device=decoder_input_ids.device)
+        causal_mask = self._decoder_causal_mask[
+            : decoder_input_ids.shape[1],
+            : decoder_input_ids.shape[1],
+        ]
         hidden = self.decoder(
             target,
             memory,
@@ -110,5 +154,5 @@ class Stage1OracleMapper(nn.Module):
         nn.init.normal_(self.decoder_position, mean=0.0, std=0.02)
 
 
-def _causal_mask(length: int, *, device: torch.device) -> torch.Tensor:
+def _causal_mask(length: int, *, device: torch.device | None = None) -> torch.Tensor:
     return torch.triu(torch.ones(length, length, dtype=torch.bool, device=device), diagonal=1)
