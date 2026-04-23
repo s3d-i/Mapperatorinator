@@ -1,0 +1,26 @@
+# Balanced 1k-map Stage 1 oracle run with audio-group held-out validation.
+dataset_root: mania-dataset
+index_path: train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies.parquet
+gate_manifest: train/artifacts/reports/audits/pretraining_gates_stage1_4k_2to6_2026-04-22.json
+train_manifest: train/artifacts/splits/stage1_oracle/audio_group_holdout_seed1337_eval10_probe8/train_manifest.json
+eval_manifest: train/artifacts/splits/stage1_oracle/audio_group_holdout_seed1337_eval10_probe8/eval_manifest.json
+rollout_probe_manifest: train/artifacts/splits/stage1_oracle/audio_group_holdout_seed1337_eval10_probe8/rollout_probe_manifest.json
+rollout_eval_every: 4000
+output_dir: train/artifacts/runs/stage1_oracle/stage1_oracle_1k_split_audio_18m_dropout005_mps
+run_name: stage1_oracle_1k_split_audio_18m_dropout005_mps
+
+maps_per_bin: 250
+max_steps: 12000
+eval_every: 1000
+batch_size: 4
+learning_rate: 0.0002
+dropout: 0.05
+seed: 1337
+device: mps
+
+model:
+  d_model: 320
+  heads: 5
+  encoder_layers: 5
+  decoder_layers: 7
+  ffn_dim: 1280
