@@ -42,6 +42,15 @@ class ControlFeatureVisualizationV2NotebookTests(unittest.TestCase):
         self.assertIn("double_stair_event_order_randomize", source)
         self.assertIn("def evaluate_control_v2_audit(", source)
 
+    def test_notebook_can_build_section_audit_from_timeseries_parquet(self) -> None:
+        source = notebook_source()
+
+        self.assertIn("TIMESERIES_PATH = REPO_ROOT / \"train/artifacts/features/control_v2_timeseries_4k_no_timing_anomalies_2to6.parquet\"", source)
+        self.assertIn("def build_section_audit_from_timeseries_parquet(", source)
+        self.assertIn("timeseries_path: Path = TIMESERIES_PATH", source)
+        self.assertIn("pd.read_parquet(timeseries_path)", source)
+        self.assertIn("section_summaries_for_frame(", source)
+
 
 if __name__ == "__main__":
     unittest.main()
