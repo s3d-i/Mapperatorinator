@@ -10,7 +10,7 @@
 
 ## Testing
 
-- Run tests with `uv run python -m unittest discover`.
+- Run tests with `uv run python -m unittest discover -s tests`.
 
 ## Documentation
 
