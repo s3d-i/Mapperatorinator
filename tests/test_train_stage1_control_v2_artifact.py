@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 
 from train.stage1_oracle.features.control import HitObject
-from train.stage1_oracle.features.control_v2 import FeatureConfigV2, extract_control_features
+from train.stage1_oracle.features.control_v2 import (
+    DEBUG_ARRAY_NAMES,
+    MODEL_FEATURE_NAMES,
+    FeatureConfigV2,
+    extract_control_features,
+)
 from train.stage1_oracle.features.control_v2_artifact import (
     CONTROL_V2_DIAGNOSTIC_COLUMNS,
     CONTROL_V2_METADATA_COLUMNS,
@@ -46,6 +51,9 @@ class Stage1ControlV2ArtifactTests(unittest.TestCase):
         self.assertIn("density_level", frame.columns)
         self.assertIn("repeat_confidence", frame.columns)
         self.assertIn("control_confidence", frame.columns)
+        self.assertIn("control_confidence_debug_raw", frame.columns)
+        self.assertIn("jack_streak_confidence", frame.columns)
+        self.assertIn("jack_streak_confidence_debug_raw", frame.columns)
         self.assertIn("valid_control_mask", frame.columns)
         for column in CONTROL_V2_DIAGNOSTIC_COLUMNS:
             self.assertIn(column, frame.columns)
@@ -54,6 +62,12 @@ class Stage1ControlV2ArtifactTests(unittest.TestCase):
         self.assertEqual(frame["time_s"].dtype, np.dtype("float32"))
         self.assertEqual(frame["valid_control_mask"].dtype, np.dtype("bool"))
         self.assertEqual(len(frame), len(out["time"]))
+        for name in set(MODEL_FEATURE_NAMES) & set(DEBUG_ARRAY_NAMES):
+            np.testing.assert_allclose(frame[name].to_numpy(dtype=float), out["features"][name])
+            np.testing.assert_allclose(
+                frame[f"{name}_debug_raw"].to_numpy(dtype=float),
+                out["debug"][name],
+            )
 
     def test_summary_row_records_feature_ranges_and_error_state(self) -> None:
         row = pd.Series(
@@ -101,6 +115,7 @@ class Stage1ControlV2ArtifactTests(unittest.TestCase):
         self.assertIn("density_level_min", summary)
         self.assertIn("repeat_confidence_mean", summary)
         self.assertIn("control_confidence_mean", summary)
+        self.assertIn("jack_streak_confidence_mean", summary)
 
 
 if __name__ == "__main__":

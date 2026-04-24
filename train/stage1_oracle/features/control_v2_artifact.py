@@ -18,7 +18,8 @@ import pyarrow.parquet as pq
 
 from .control import mania_hit_objects_to_control_hits
 from .control import red_timing_points_to_beat_length_fn
-from .control_v2 import FEATURE_NAMES
+from .control_v2 import DEBUG_ARRAY_NAMES
+from .control_v2 import MODEL_FEATURE_NAMES
 from .control_v2 import FeatureConfigV2
 from .control_v2 import extract_control_features
 from ..osu.hitobjects import parse_mania_hit_objects
@@ -35,53 +36,8 @@ CONTROL_V2_METADATA_COLUMNS = [
 ]
 
 CONTROL_V2_DIAGNOSTIC_COLUMNS = [
-    "density_raw_short",
-    "density_raw_med",
-    "density_sum_w_short",
-    "density_sum_w2_short",
-    "density_n_eff_short",
-    "density_sum_w_med",
-    "density_sum_w2_med",
-    "density_n_eff_med",
-    "hold_active_columns",
-    "ln_change_raw",
-    "ln_change_sum_w",
-    "ln_change_sum_w2",
-    "ln_change_n_eff",
-    "chord_num",
-    "chord_den",
-    "chord_sum_w2",
-    "chord_n_eff",
-    "chord_ratio_raw",
-    "jack_observed",
-    "jack_expected_null",
-    "jack_pair_count",
-    "jack_sum_w",
-    "jack_sum_w2",
-    "jack_n_eff",
-    "jack_excess_raw",
-    "jack_streak_raw",
-    "jack_streak_n_eff",
-    "jack_streak_confidence",
-    "jack_streak_max",
-    "hand_left_load",
-    "hand_right_load",
-    "hand_n_eff",
-    "hand_balance_raw",
-    "repeat_exact_n_eff",
-    "repeat_shift_n_eff",
-    "repeat_motion_n_eff",
-    "repeat_rhythm_n_eff",
-    "repeat_exact_top1_freq",
-    "repeat_shift_top1_freq",
-    "repeat_motion_top1_freq",
-    "repeat_rhythm_top1_freq",
-    "repeat_exact_pattern_variety",
-    "repeat_shift_pattern_variety",
-    "repeat_motion_pattern_variety",
-    "repeat_rhythm_pattern_variety",
-    "control_confidence",
-    "valid_control_mask",
+    name if name not in MODEL_FEATURE_NAMES else f"{name}_debug_raw"
+    for name in DEBUG_ARRAY_NAMES
 ]
 
 DEFAULT_INDEX_PATH = Path("train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies_2to6.parquet")
@@ -116,22 +72,22 @@ def build_timeseries_frame(
             "time_s": time_s,
         }
     )
-    for name in FEATURE_NAMES:
+    for name in MODEL_FEATURE_NAMES:
         frame[name] = np.asarray(out["features"][name], dtype=np.float32)
 
-    for name in CONTROL_V2_DIAGNOSTIC_COLUMNS:
-        value = out["debug"].get(name)
+    for source_name, column_name in zip(DEBUG_ARRAY_NAMES, CONTROL_V2_DIAGNOSTIC_COLUMNS):
+        value = out["debug"].get(source_name)
         if value is None:
-            frame[name] = _empty_column(name, len(time_s))
+            frame[column_name] = _empty_column(source_name, len(time_s))
             continue
         array = np.asarray(value)
         if array.shape != time_s.shape:
-            frame[name] = _empty_column(name, len(time_s))
+            frame[column_name] = _empty_column(source_name, len(time_s))
             continue
-        if name == "valid_control_mask":
-            frame[name] = array.astype(bool, copy=False)
+        if source_name == "valid_control_mask":
+            frame[column_name] = array.astype(bool, copy=False)
         else:
-            frame[name] = array.astype(np.float32, copy=False)
+            frame[column_name] = array.astype(np.float32, copy=False)
     return frame
 
 
@@ -182,7 +138,7 @@ def summarize_map_output(
 
     all_finite = True
     ranges_ok = True
-    for name in [*FEATURE_NAMES, "control_confidence"]:
+    for name in MODEL_FEATURE_NAMES:
         values = _summary_values(out, name)
         if len(values) == 0:
             summary[f"{name}_min"] = 0.0
@@ -363,7 +319,8 @@ def build_control_v2_artifacts(
         "dataset_root": dataset_root.as_posix(),
         "timeseries_path": timeseries_path.as_posix(),
         "summary_path": summary_path.as_posix(),
-        "feature_names": FEATURE_NAMES,
+        "feature_names": MODEL_FEATURE_NAMES,
+        "model_feature_names": MODEL_FEATURE_NAMES,
         "diagnostic_columns": CONTROL_V2_DIAGNOSTIC_COLUMNS,
         "config": vars(cfg),
         "map_count": int(len(index_df)),
@@ -418,8 +375,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _summary_values(out: dict[str, Any], name: str) -> np.ndarray:
-    if name == "control_confidence":
-        return np.asarray(out["debug"].get("control_confidence", []), dtype=float)
     if name in out["features"]:
         return np.asarray(out["features"][name], dtype=float)
     return np.zeros((0,), dtype=float)

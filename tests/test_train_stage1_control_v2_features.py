@@ -4,8 +4,12 @@ import numpy as np
 
 from train.stage1_oracle.features.control import HitObject
 from train.stage1_oracle.features.control_v2 import (
+    CONFIDENCE_FEATURE_NAMES,
+    DEBUG_ARRAY_NAMES,
     FEATURE_NAMES,
     FeatureConfigV2,
+    MODEL_FEATURE_NAMES,
+    VALUE_FEATURE_NAMES,
     extract_control_features,
     extract_raw_for_norm_fit,
 )
@@ -24,8 +28,9 @@ class Stage1ControlV2FeatureTests(unittest.TestCase):
         out = extract_control_features(hits, cfg=cfg, start_time=0.0, end_time=0.4)
 
         self.assertEqual(out["feature_names"], FEATURE_NAMES)
+        self.assertEqual(out["model_feature_names"], MODEL_FEATURE_NAMES)
         self.assertEqual(
-            FEATURE_NAMES,
+            VALUE_FEATURE_NAMES,
             [
                 "density_level",
                 "density_burst",
@@ -40,18 +45,31 @@ class Stage1ControlV2FeatureTests(unittest.TestCase):
                 "repeat_shift",
                 "repeat_motion",
                 "repeat_rhythm",
+            ],
+        )
+        self.assertEqual(
+            CONFIDENCE_FEATURE_NAMES,
+            [
                 "density_confidence",
                 "ln_change_confidence",
                 "chord_confidence",
                 "jack_confidence",
+                "jack_streak_confidence",
                 "hand_confidence",
                 "repeat_confidence",
+                "control_confidence",
             ],
         )
+        self.assertEqual(MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES + CONFIDENCE_FEATURE_NAMES)
+        self.assertEqual(FEATURE_NAMES, MODEL_FEATURE_NAMES)
+        self.assertIn("control_confidence", DEBUG_ARRAY_NAMES)
+        self.assertIn("jack_streak_confidence", DEBUG_ARRAY_NAMES)
         self.assertEqual(out["time"].shape, (5,))
-        self.assertEqual(out["X"].shape, (5, len(FEATURE_NAMES)))
-        self.assertEqual(set(out["features"]), set(FEATURE_NAMES))
-        for column_index, name in enumerate(FEATURE_NAMES):
+        self.assertEqual(out["X"].shape, (5, len(MODEL_FEATURE_NAMES)))
+        self.assertEqual(out["X_model"].shape, out["X"].shape)
+        np.testing.assert_array_equal(out["X_model"], out["X"])
+        self.assertEqual(set(out["features"]), set(MODEL_FEATURE_NAMES))
+        for column_index, name in enumerate(MODEL_FEATURE_NAMES):
             np.testing.assert_array_equal(out["X"][:, column_index], out["features"][name])
 
         self.assertTrue(np.all(np.isfinite(out["X"])))
@@ -61,6 +79,30 @@ class Stage1ControlV2FeatureTests(unittest.TestCase):
         self.assertIn("repeat_exact_top1_freq", out["debug"])
         self.assertIn("valid_control_mask", out["debug"])
         self.assertIn("control_confidence", out["debug"])
+        self.assertIn("jack_streak_confidence", out["features"])
+        self.assertIn("control_confidence", out["features"])
+
+    def test_control_confidence_is_available_without_debug(self) -> None:
+        cfg = FeatureConfigV2(grid_step=0.1)
+        grid = np.array([-0.2, 0.0, 0.1, 0.2, 0.6], dtype=float)
+        hits = [
+            HitObject(col=0, start=0.0),
+            HitObject(col=0, start=0.1),
+            HitObject(col=0, start=0.2),
+        ]
+
+        out = extract_control_features(hits, cfg=cfg, grid=grid, return_debug=False)
+
+        self.assertEqual(out["debug"], {})
+        self.assertIn("control_confidence", out["features"])
+        self.assertIn("jack_streak_confidence", out["features"])
+        self.assertEqual(float(out["features"]["control_confidence"][0]), 0.0)
+        self.assertEqual(float(out["features"]["control_confidence"][-1]), 0.0)
+        control_index = MODEL_FEATURE_NAMES.index("control_confidence")
+        np.testing.assert_array_equal(
+            out["X_model"][:, control_index],
+            out["features"]["control_confidence"],
+        )
 
     def test_hand_balance_uses_raw_ratio_then_single_confidence_gate(self) -> None:
         cfg = FeatureConfigV2(grid_step=0.1, hand_L=1.0, hand_prior=1.0)

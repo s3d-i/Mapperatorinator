@@ -30,7 +30,7 @@ from .control import (
 )
 
 
-FEATURE_NAMES = [
+VALUE_FEATURE_NAMES = [
     "density_level",
     "density_burst",
     "hold_occupancy",
@@ -44,12 +44,77 @@ FEATURE_NAMES = [
     "repeat_shift",
     "repeat_motion",
     "repeat_rhythm",
+]
+
+CONFIDENCE_FEATURE_NAMES = [
     "density_confidence",
     "ln_change_confidence",
     "chord_confidence",
     "jack_confidence",
+    "jack_streak_confidence",
     "hand_confidence",
     "repeat_confidence",
+    "control_confidence",
+]
+
+MODEL_FEATURE_NAMES = VALUE_FEATURE_NAMES + CONFIDENCE_FEATURE_NAMES
+
+FEATURE_NAMES = MODEL_FEATURE_NAMES
+
+DEBUG_ARRAY_NAMES = [
+    "density_raw_short",
+    "density_raw_med",
+    "density_sum_w_short",
+    "density_sum_w2_short",
+    "density_n_eff_short",
+    "density_sum_w_med",
+    "density_sum_w2_med",
+    "density_n_eff_med",
+    "density_confidence",
+    "hold_active_columns",
+    "ln_change_raw",
+    "ln_change_sum_w",
+    "ln_change_sum_w2",
+    "ln_change_n_eff",
+    "ln_change_confidence",
+    "chord_num",
+    "chord_den",
+    "chord_sum_w2",
+    "chord_n_eff",
+    "chord_confidence",
+    "chord_ratio_raw",
+    "jack_observed",
+    "jack_expected_null",
+    "jack_pair_count",
+    "jack_sum_w",
+    "jack_sum_w2",
+    "jack_n_eff",
+    "jack_confidence",
+    "jack_excess_raw",
+    "jack_streak_raw",
+    "jack_streak_n_eff",
+    "jack_streak_confidence",
+    "jack_streak_max",
+    "hand_left_load",
+    "hand_right_load",
+    "hand_n_eff",
+    "hand_confidence",
+    "hand_balance_raw",
+    "repeat_exact_n_eff",
+    "repeat_shift_n_eff",
+    "repeat_motion_n_eff",
+    "repeat_rhythm_n_eff",
+    "repeat_exact_top1_freq",
+    "repeat_shift_top1_freq",
+    "repeat_motion_top1_freq",
+    "repeat_rhythm_top1_freq",
+    "repeat_exact_pattern_variety",
+    "repeat_shift_pattern_variety",
+    "repeat_motion_pattern_variety",
+    "repeat_rhythm_pattern_variety",
+    "repeat_confidence",
+    "control_confidence",
+    "valid_control_mask",
 ]
 
 
@@ -854,26 +919,24 @@ def extract_control_features(
     features["ln_change_confidence"] = hold_ln_debug["ln_change_confidence"]
     features["chord_confidence"] = chord_debug["chord_confidence"]
     features["jack_confidence"] = jack_debug["jack_confidence"]
+    features["jack_streak_confidence"] = jack_debug["jack_streak_confidence"]
     features["hand_confidence"] = hand_debug["hand_confidence"]
     features["repeat_confidence"] = repeat_debug["repeat_confidence"]
+    features["control_confidence"] = clip01(control_confidence)
 
     for name in list(features):
         features[name] = edge_neutralize(features[name], valid_mask, neutral=0.0)
 
     if len(grid) == 0:
-        x = np.zeros((0, len(FEATURE_NAMES)), dtype=float)
+        x = np.zeros((0, len(MODEL_FEATURE_NAMES)), dtype=float)
     else:
-        x = np.stack([features[name] for name in FEATURE_NAMES], axis=1)
+        x = np.stack([features[name] for name in MODEL_FEATURE_NAMES], axis=1)
 
     debug: dict[str, Any] = {}
     if return_debug:
         debug["onsets"] = onsets
         debug["valid_control_mask"] = valid_mask
-        debug["control_confidence"] = edge_neutralize(
-            clip01(control_confidence),
-            valid_mask,
-            neutral=0.0,
-        )
+        debug["control_confidence"] = clip01(control_confidence)
         debug.update(density_debug)
         debug.update(hold_ln_debug)
         debug.update(chord_debug)
@@ -884,7 +947,9 @@ def extract_control_features(
     return {
         "time": grid,
         "X": x,
-        "feature_names": FEATURE_NAMES,
+        "X_model": x,
+        "feature_names": MODEL_FEATURE_NAMES,
+        "model_feature_names": MODEL_FEATURE_NAMES,
         "features": features,
         "debug": debug,
     }
