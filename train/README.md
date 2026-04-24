@@ -1,23 +1,6 @@
-> 我们采用一个分层条件生成架构。
->
-> 上层是 **VAE-based control planner**，输入音频条件与 difficulty，生成整首谱面的 **低频 control track**；这里 latent 只是 planner 的内部压缩表示，真正提供给后续模块使用的是由 latent 解码得到的、按时间展开的 control 序列。
->
-> 这条 control track 在加入时间步位置编码后，输入 **control encoder**，被编码为一串可供检索的 **control memory**。
->
-> 同时，mel 等音频特征输入 **audio encoder**，得到对应的 **audio memory**。
->
-> 下层是 **seq2seq transformer decoder**，它自回归生成谱面 token。decoder 在每一步生成时，基于自身当前 state：
->
-> - 对历史已生成 token 做 self-attention
-> - 对 audio encoder 输出的 audio memory 做 cross-attention
-> - 对 control encoder 输出的 control memory 做 cross-attention
->
-> decoder 的 hidden states 上接两个输出分支：
->
-> - **token head**：作为主输出头，预测谱面 token
-> - **control prediction head**：作为辅助监督头，预测窗级 control feature，用于训练时提供可导的 control supervision，避免直接从离散生成结果反算 control feature 所带来的不可导问题
 
-训练数据集位于 `mania-dataset/` 目录。
+
+dataset is at `mania-dataset/` 
 
 ## Stage 1 directory layout
 
@@ -48,7 +31,7 @@ Generated files live under `train/artifacts/`:
 
 Add new Stage 1 packages only when they contain real implementation files.
 
-## Stage 1 oracle training commands
+### Stage 1 oracle training commands
 
 These run configs train with `device: mps` and use the pre-training gate manifest at
 `train/artifacts/reports/audits/pretraining_gates_stage1_4k_2to6_2026-04-22.json`.
@@ -83,7 +66,7 @@ uv run python -m train.stage1_oracle.training.overfit_32 \
   --resume-from train/artifacts/runs/stage1_oracle/stage1_oracle_overnight_18m_mps/checkpoint.pt
 ```
 
-## Stage 1 oracle inference commands
+### Stage 1 oracle inference commands
 
 Stage 1 inference is still oracle-timing inference: pass an audio file and a reference `.osu`
 file whose red timing points are rendered into the dense timing track. The current commands
@@ -122,17 +105,6 @@ eligible 4K map from `train/artifacts/indexes/beatmap_index_4k_no_timing_anomali
 uv run python -m train.stage1_oracle.inference.stream_probe --device cpu --max-windows 1
 ```
 
-## Feature family v1
+## Feature
 
-- A. 强度族：描述整体压力与密度
-- B. 占用族：描述资源持续占用状态
-- C. 重复/风险族：描述坏模式风险
-
-当前使用的 control feature 包括：
-
-- `density_env`
-- `hold_occupancy`
-- `chord_rate`
-- `jack_risk`
-- `hand_balance_ema`
-- `repeat_risk`
+for the control encoder: `train/stage1_oracle/features/control.py`
