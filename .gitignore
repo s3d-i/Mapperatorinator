@@ -21,5 +21,4 @@ train/artifacts/features/control_map_summary_4k_no_timing_anomalies_2to6.parquet
 **/.DS_Store
 train/artifacts/features/control_v2_map_summary_4k_no_timing_anomalies_2to6.parquet
 train/artifacts/features/control_v2_timeseries_4k_no_timing_anomalies_2to6.parquet
-train/artifacts/features/control_v2_audit/control_v2_section_audit_8s_stride4.parquet
-train/artifacts/features/control_v2_audit/control_v2_section_audit_8s_stride4_errors.parquet
+train/artifacts/features/control_v2_audit/*.parquet
