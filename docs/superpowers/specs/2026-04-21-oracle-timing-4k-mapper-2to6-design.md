@@ -1,4 +1,13 @@
+---
+date: 2026-04-21
+status: outdated
+outdated_on: 2026-04-26
+pinned_commit: e7d739610c33804008ecebb3dc6e8196e25eea51
+---
+
 # Oracle Timing 4K Mapper for 2–6* Mania Design
+
+> Outdated as of 2026-04-26. Retained for historical reference only.
 
 ## Goal
 
