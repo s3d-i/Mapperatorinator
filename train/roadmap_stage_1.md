@@ -1,3 +1,9 @@
+---
+commit: fb598ec3519a4e612e9f04b9cdf08510d797c541
+date: 20260429
+status: outdated
+---
+
 ## Phase 1 — Oracle Upper-Bound Mapper
 
 In Phase 1, the mapper is trained with oracle timing derived from ground-truth `.osu` timing data. The purpose of this phase is not to build the final deployable system, but to establish an upper bound on mapper quality under ideal timing conditions. This isolates the mapping problem from the timing-recovery problem and answers a critical question early: if timing were perfect, would the current mapper architecture, representation, and training setup already be good enough?
