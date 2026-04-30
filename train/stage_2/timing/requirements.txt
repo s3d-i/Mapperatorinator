@@ -1,1 +1,2 @@
 beat-this==1.1.0
+soundfile==0.13.1

@@ -2,9 +2,45 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+@dataclass(frozen=True)
+class TimingSegment:
+    offset_ms: float
+    beat_length_ms: float
+    meter: int = 4
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.offset_ms):
+            raise ValueError(f"offset_ms must be finite, got {self.offset_ms!r}")
+        if not np.isfinite(self.beat_length_ms) or self.beat_length_ms <= 0.0:
+            raise ValueError(f"beat_length_ms must be positive and finite, got {self.beat_length_ms!r}")
+        if self.meter <= 0:
+            raise ValueError(f"meter must be positive, got {self.meter!r}")
+
+    @property
+    def local_bpm(self) -> float:
+        return 60000.0 / self.beat_length_ms
+
+
+@dataclass(frozen=True)
+class FittedTimingGrid:
+    segments: Sequence[TimingSegment]
+
+    def __post_init__(self) -> None:
+        segments = tuple(self.segments)
+        if not segments:
+            raise ValueError("segments must be non-empty")
+
+        offsets = np.asarray([segment.offset_ms for segment in segments], dtype=np.float64)
+        if np.any(np.diff(offsets) <= 0.0):
+            raise ValueError("segments must be ordered by strictly increasing offset_ms")
+
+        object.__setattr__(self, "segments", segments)
 
 
 @dataclass(frozen=True)
