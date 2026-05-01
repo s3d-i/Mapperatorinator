@@ -1,0 +1,87 @@
+{
+  "plots": [
+    {
+      "name": "fit_seconds_by_candidate_count",
+      "path": "fit_seconds_by_candidate_count.png",
+      "pearson_r": 0.2846447634360559,
+      "point_count": 500,
+      "x_max": 19963.0,
+      "x_metric": "candidate_count",
+      "x_min": 993.0,
+      "y_max": 24.92466429201886,
+      "y_metric": "fit_seconds",
+      "y_min": 0.0564731250051409
+    },
+    {
+      "name": "fit_seconds_by_frame_count",
+      "path": "fit_seconds_by_frame_count.png",
+      "pearson_r": 0.9644598569866822,
+      "point_count": 500,
+      "x_max": 217906.0,
+      "x_metric": "frame_count",
+      "x_min": 1575.0,
+      "y_max": 24.92466429201886,
+      "y_metric": "fit_seconds",
+      "y_min": 0.0564731250051409
+    },
+    {
+      "name": "mean_phase_error_ms_by_segment_count_delta",
+      "path": "mean_phase_error_ms_by_segment_count_delta.png",
+      "pearson_r": -0.1690755397157064,
+      "point_count": 500,
+      "x_max": 15.0,
+      "x_metric": "segment_count_delta",
+      "x_min": -671.0,
+      "y_max": 161.89583962929396,
+      "y_metric": "mean_phase_error_ms",
+      "y_min": 1.1738757028939424
+    },
+    {
+      "name": "local_bpm_mae_by_tempo_multiplier",
+      "path": "local_bpm_mae_by_tempo_multiplier.png",
+      "pearson_r": -0.1967590383235987,
+      "point_count": 500,
+      "x_max": 2.0,
+      "x_metric": "tempo_multiplier",
+      "x_min": 1.0,
+      "y_max": 160.46481323242188,
+      "y_metric": "local_bpm_mae",
+      "y_min": 0.0
+    }
+  ],
+  "source_report_path": "train/artifacts/timing_diagnostics/beatthis_oracle_500_unique_audio_seed20260501_current.json",
+  "specs": [
+    {
+      "name": "fit_seconds_by_candidate_count",
+      "title": "GridFitter runtime by candidate count",
+      "x_label": "Grid candidates evaluated",
+      "x_metric": "candidate_count",
+      "y_label": "Fit seconds",
+      "y_metric": "fit_seconds"
+    },
+    {
+      "name": "fit_seconds_by_frame_count",
+      "title": "GridFitter runtime by frame count",
+      "x_label": "Frame count",
+      "x_metric": "frame_count",
+      "y_label": "Fit seconds",
+      "y_metric": "fit_seconds"
+    },
+    {
+      "name": "mean_phase_error_ms_by_segment_count_delta",
+      "title": "Phase error by segment-count delta",
+      "x_label": "Predicted segment count - oracle segment count",
+      "x_metric": "segment_count_delta",
+      "y_label": "Mean phase error (ms)",
+      "y_metric": "mean_phase_error_ms"
+    },
+    {
+      "name": "local_bpm_mae_by_tempo_multiplier",
+      "title": "Local BPM error by tempo multiplier",
+      "x_label": "Selected tempo multiplier",
+      "x_metric": "tempo_multiplier",
+      "y_label": "Local BPM MAE",
+      "y_metric": "local_bpm_mae"
+    }
+  ]
+}

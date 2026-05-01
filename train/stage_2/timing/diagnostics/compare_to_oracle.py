@@ -139,9 +139,12 @@ def run_beatthis_oracle_comparison(
 
     rows: list[dict[str, object]] = []
     for _, row in sample_df.iterrows():
+        total_start_seconds = time.perf_counter()
         beatmap_path, audio_path = _sample_paths(dataset_root, row)
         oracle_grid = oracle_grid_from_red_timing_points(require_red_timing_points(beatmap_path))
+        prediction_start_seconds = time.perf_counter()
         prediction = provider.predict_file(audio_path)
+        prediction_seconds = time.perf_counter() - prediction_start_seconds
         fit_start_seconds = time.perf_counter()
         fit_result = fitter.fit(prediction)
         fit_seconds = time.perf_counter() - fit_start_seconds
@@ -150,19 +153,20 @@ def run_beatthis_oracle_comparison(
             oracle_grid,
             frame_count=prediction.frame_count,
         )
-        predicted_segment = fit_result.grid.segments[0]
-        oracle_segment = oracle_grid.segments[0]
+        total_seconds = time.perf_counter() - total_start_seconds
         rows.append(
             _comparison_row(
                 beatmap_path=beatmap_path,
                 audio_path=audio_path,
                 frame_count=prediction.frame_count,
+                frame_rate_hz=prediction.frame_rate_hz,
+                prediction_seconds=prediction_seconds,
+                candidate_count=fit_result.diagnostics.candidate_count,
                 fit_score=fit_result.score,
                 fit_seconds=fit_seconds,
-                predicted_bpm=predicted_segment.local_bpm,
-                predicted_offset_ms=predicted_segment.offset_ms,
-                oracle_segment=oracle_segment,
-                oracle_segment_count=len(oracle_grid.segments),
+                total_seconds=total_seconds,
+                predicted_segments=fit_result.grid.segments,
+                oracle_segments=oracle_grid.segments,
                 raw_selected_bpm=fit_result.diagnostics.raw_selected_bpm,
                 raw_score=fit_result.diagnostics.raw_score,
                 half_tempo_score=fit_result.diagnostics.half_tempo_score,
@@ -248,12 +252,14 @@ def _comparison_row(
     beatmap_path: Path,
     audio_path: Path,
     frame_count: int,
+    frame_rate_hz: float,
+    prediction_seconds: float,
+    candidate_count: int,
     fit_score: float,
     fit_seconds: float,
-    predicted_bpm: float,
-    predicted_offset_ms: float,
-    oracle_segment: TimingSegment,
-    oracle_segment_count: int,
+    total_seconds: float,
+    predicted_segments: Sequence[TimingSegment],
+    oracle_segments: Sequence[TimingSegment],
     raw_selected_bpm: float,
     raw_score: float,
     half_tempo_score: float,
@@ -261,17 +267,31 @@ def _comparison_row(
     tempo_multiplier: float,
     comparison: TimingGridComparison,
 ) -> dict[str, object]:
+    predicted_first_segment = predicted_segments[0]
+    oracle_first_segment = oracle_segments[0]
+    predicted_segment_count = len(predicted_segments)
+    oracle_segment_count = len(oracle_segments)
     return {
         "beatmap_path": beatmap_path.as_posix(),
         "audio_path": audio_path.as_posix(),
         "frame_count": frame_count,
+        "audio_duration_seconds": float(frame_count) / frame_rate_hz,
+        "prediction_seconds": float(prediction_seconds),
+        "candidate_count": int(candidate_count),
         "fit_score": fit_score,
         "fit_seconds": fit_seconds,
-        "predicted_bpm": predicted_bpm,
-        "predicted_offset_ms": predicted_offset_ms,
-        "oracle_first_bpm": oracle_segment.local_bpm,
-        "oracle_first_offset_ms": oracle_segment.offset_ms,
+        "total_seconds": float(total_seconds),
+        "predicted_bpm": predicted_first_segment.local_bpm,
+        "predicted_offset_ms": predicted_first_segment.offset_ms,
+        "predicted_first_bpm": predicted_first_segment.local_bpm,
+        "predicted_first_offset_ms": predicted_first_segment.offset_ms,
+        "oracle_first_bpm": oracle_first_segment.local_bpm,
+        "oracle_first_offset_ms": oracle_first_segment.offset_ms,
+        "predicted_segment_count": predicted_segment_count,
         "oracle_segment_count": oracle_segment_count,
+        "segment_count_delta": predicted_segment_count - oracle_segment_count,
+        "predicted_segments": _segments_payload(predicted_segments),
+        "oracle_segments": _segments_payload(oracle_segments),
         "raw_selected_bpm": raw_selected_bpm,
         "raw_score": raw_score,
         "half_tempo_score": _finite_float_or_none(half_tempo_score),
@@ -320,6 +340,18 @@ def _finite_float_or_none(value: float) -> float | None:
     if not np.isfinite(value):
         return None
     return float(value)
+
+
+def _segments_payload(segments: Sequence[TimingSegment]) -> list[dict[str, float | int]]:
+    return [
+        {
+            "offset_ms": segment.offset_ms,
+            "beat_length_ms": segment.beat_length_ms,
+            "bpm": segment.local_bpm,
+            "meter": segment.meter,
+        }
+        for segment in segments
+    ]
 
 
 if __name__ == "__main__":
