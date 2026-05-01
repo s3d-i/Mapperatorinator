@@ -9,8 +9,6 @@ from train.stage_2.timing.schema import FittedTimingGrid, TimingSegment
 
 
 class Stage2TimingDiagnosticsTest(unittest.TestCase):
-    # TODO(s3d-i): Add an opt-in integration test for BeatThis audio -> GridFitter
-    # -> oracle comparison when model inference cost is acceptable in test runs.
     def test_compare_identical_grids_has_zero_error(self) -> None:
         grid = FittedTimingGrid(segments=(TimingSegment(offset_ms=0.0, beat_length_ms=500.0),))
 

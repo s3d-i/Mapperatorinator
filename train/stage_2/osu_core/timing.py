@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -31,25 +31,12 @@ class RedTimingInvalidCounts:
         return self.nonfinite + self.nonpositive + self.implausible
 
     def add_reason(self, reason: str) -> "RedTimingInvalidCounts":
-        if reason == "nonfinite":
-            return RedTimingInvalidCounts(
-                nonfinite=self.nonfinite + 1,
-                nonpositive=self.nonpositive,
-                implausible=self.implausible,
-            )
-        if reason == "nonpositive":
-            return RedTimingInvalidCounts(
-                nonfinite=self.nonfinite,
-                nonpositive=self.nonpositive + 1,
-                implausible=self.implausible,
-            )
-        if reason == "implausible":
-            return RedTimingInvalidCounts(
-                nonfinite=self.nonfinite,
-                nonpositive=self.nonpositive,
-                implausible=self.implausible + 1,
-            )
-        raise ValueError(f"unknown invalid red timing reason: {reason}")
+        if reason not in _INVALID_COUNT_FIELDS:
+            raise ValueError(f"unknown invalid red timing reason: {reason}")
+        return replace(self, **{reason: getattr(self, reason) + 1})
+
+
+_INVALID_COUNT_FIELDS = frozenset(("nonfinite", "nonpositive", "implausible"))
 
 
 class MissingRedTimingError(ValueError):

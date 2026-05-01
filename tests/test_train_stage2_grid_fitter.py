@@ -3,14 +3,12 @@ from unittest.mock import patch
 
 import numpy as np
 
-import train.stage_2.timing.grid_fitting.fitter as fitter_module
+import train.stage_2.timing.grid_fitting.scoring as scoring_module
 from train.stage_2.timing.grid_fitting import GridFitter, GridFitterConfig
-from train.stage_2.timing.grid_fitting.fitter import (
-    _SegmentFit,
-    _effective_config_for_prediction,
-    _merge_adjacent_segment_fits,
-    _timing_segments_from_fits,
-)
+from train.stage_2.timing.grid_fitting.config import _effective_config_for_prediction
+from train.stage_2.timing.grid_fitting.segments import _timing_segments_from_fits
+from train.stage_2.timing.grid_fitting.splitting import _merge_adjacent_segment_fits
+from train.stage_2.timing.grid_fitting.types import _SegmentFit
 from train.stage_2.timing.diagnostics.compare_to_oracle import compare_timing_grids
 from train.stage_2.timing.rendering.dense_timing_v2 import render_dense_timing_v2
 from train.stage_2.timing.schema import FittedTimingGrid, FrameTimingPrediction, TimingSegment
@@ -413,14 +411,14 @@ class Stage2GridFitterTest(unittest.TestCase):
             downbeat_refine_candidate_count=8,
         )
         call_count = 0
-        original_downbeat_fit = fitter_module._best_downbeat_grid_fit
+        original_downbeat_fit = scoring_module._best_downbeat_grid_fit
 
         def counted_downbeat_fit(*args: object, **kwargs: object) -> tuple[float, float]:
             nonlocal call_count
             call_count += 1
             return original_downbeat_fit(*args, **kwargs)
 
-        with patch.object(fitter_module, "_best_downbeat_grid_fit", side_effect=counted_downbeat_fit):
+        with patch.object(scoring_module, "_best_downbeat_grid_fit", side_effect=counted_downbeat_fit):
             result = GridFitter(config).fit(prediction)
 
         self.assertAlmostEqual(result.grid.segments[0].local_bpm, 120.0, delta=1.0)

@@ -5,7 +5,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -18,6 +18,23 @@ from train.stage_2.timing.rendering.dense_timing_v2 import (
     render_dense_timing_v2,
 )
 from train.stage_2.timing.schema import FittedTimingGrid, TimingSegment
+
+
+_BEAT_PULSE_CHANNEL = 0
+_PHASE_SIN_CHANNEL = 1
+_PHASE_COS_CHANNEL = 2
+_LOCAL_BPM_CHANNEL = 3
+
+_SUMMARY_METRICS = (
+    "fit_score",
+    "fit_seconds",
+    "beat_pulse_mae",
+    "local_bpm_mae",
+    "mean_phase_error_beats",
+    "max_phase_error_beats",
+    "mean_phase_error_ms",
+    "max_phase_error_ms",
+)
 
 
 @dataclass(frozen=True)
@@ -55,24 +72,28 @@ def compare_timing_grids(
         config=config,
     )
 
-    angle_delta = np.arctan2(
-        predicted_track[:, 1] * oracle_track[:, 2] - predicted_track[:, 2] * oracle_track[:, 1],
-        predicted_track[:, 2] * oracle_track[:, 2] + predicted_track[:, 1] * oracle_track[:, 1],
-    )
-    phase_error_beats = np.abs(angle_delta) / (2.0 * np.pi)
-
     frame_times_ms = dense_timing_v2_frame_times(
         input_start_ms,
         frame_count=frame_count,
         config=config,
     )
     _, oracle_beat_lengths_ms = active_timing_arrays(oracle_grid, frame_times_ms)
+
+    phase_error_beats = _phase_error_beats(predicted_track, oracle_track)
     phase_error_ms = phase_error_beats * oracle_beat_lengths_ms
 
     return TimingGridComparison(
         frame_count=frame_count,
-        beat_pulse_mae=float(np.mean(np.abs(predicted_track[:, 0] - oracle_track[:, 0]))),
-        local_bpm_mae=float(np.mean(np.abs(predicted_track[:, 3] - oracle_track[:, 3]))),
+        beat_pulse_mae=_mean_absolute_channel_delta(
+            predicted_track,
+            oracle_track,
+            _BEAT_PULSE_CHANNEL,
+        ),
+        local_bpm_mae=_mean_absolute_channel_delta(
+            predicted_track,
+            oracle_track,
+            _LOCAL_BPM_CHANNEL,
+        ),
         mean_phase_error_beats=float(np.mean(phase_error_beats)),
         max_phase_error_beats=float(np.max(phase_error_beats)),
         mean_phase_error_ms=float(np.mean(phase_error_ms)),
@@ -114,17 +135,11 @@ def run_beatthis_oracle_comparison(
     index_df = pd.read_parquet(index_path)
     sample_df = index_df.sample(n=min(sample_size, len(index_df)), random_state=seed)
     provider = BeatThisTimingProvider(device=device)
-    fitter_config = (
-        GridFitterConfig()
-        if double_tempo_score_ratio_threshold is None
-        else GridFitterConfig(double_tempo_score_ratio_threshold=double_tempo_score_ratio_threshold)
-    )
-    fitter = GridFitter(fitter_config)
+    fitter = GridFitter(_grid_fitter_config(double_tempo_score_ratio_threshold))
 
     rows: list[dict[str, object]] = []
     for _, row in sample_df.iterrows():
-        beatmap_path = dataset_root / str(row["shard"]) / str(row["beatmap_path"])
-        audio_path = dataset_root / str(row["shard"]) / str(row["audio_path"])
+        beatmap_path, audio_path = _sample_paths(dataset_root, row)
         oracle_grid = oracle_grid_from_red_timing_points(require_red_timing_points(beatmap_path))
         prediction = provider.predict_file(audio_path)
         fit_start_seconds = time.perf_counter()
@@ -138,24 +153,23 @@ def run_beatthis_oracle_comparison(
         predicted_segment = fit_result.grid.segments[0]
         oracle_segment = oracle_grid.segments[0]
         rows.append(
-            {
-                "beatmap_path": beatmap_path.as_posix(),
-                "audio_path": audio_path.as_posix(),
-                "frame_count": prediction.frame_count,
-                "fit_score": fit_result.score,
-                "fit_seconds": fit_seconds,
-                "predicted_bpm": predicted_segment.local_bpm,
-                "predicted_offset_ms": predicted_segment.offset_ms,
-                "oracle_first_bpm": oracle_segment.local_bpm,
-                "oracle_first_offset_ms": oracle_segment.offset_ms,
-                "oracle_segment_count": len(oracle_grid.segments),
-                "raw_selected_bpm": fit_result.diagnostics.raw_selected_bpm,
-                "raw_score": fit_result.diagnostics.raw_score,
-                "half_tempo_score": _finite_float_or_none(fit_result.diagnostics.half_tempo_score),
-                "double_tempo_score": _finite_float_or_none(fit_result.diagnostics.double_tempo_score),
-                "tempo_multiplier": fit_result.diagnostics.tempo_multiplier,
-                **asdict(comparison),
-            }
+            _comparison_row(
+                beatmap_path=beatmap_path,
+                audio_path=audio_path,
+                frame_count=prediction.frame_count,
+                fit_score=fit_result.score,
+                fit_seconds=fit_seconds,
+                predicted_bpm=predicted_segment.local_bpm,
+                predicted_offset_ms=predicted_segment.offset_ms,
+                oracle_segment=oracle_segment,
+                oracle_segment_count=len(oracle_grid.segments),
+                raw_selected_bpm=fit_result.diagnostics.raw_selected_bpm,
+                raw_score=fit_result.diagnostics.raw_score,
+                half_tempo_score=fit_result.diagnostics.half_tempo_score,
+                double_tempo_score=fit_result.diagnostics.double_tempo_score,
+                tempo_multiplier=fit_result.diagnostics.tempo_multiplier,
+                comparison=comparison,
+            )
         )
 
     summary = _summarize_rows(rows)
@@ -183,7 +197,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Fail if average GridFitter time exceeds this value; use 0 to disable.",
     )
     args = parser.parse_args(argv)
-    max_average_fit_seconds = None if args.max_average_fit_seconds <= 0.0 else args.max_average_fit_seconds
 
     report = run_beatthis_oracle_comparison(
         index_path=args.index_path,
@@ -192,28 +205,94 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         device=args.device,
         double_tempo_score_ratio_threshold=args.double_tempo_score_ratio_threshold,
-        max_average_fit_seconds=max_average_fit_seconds,
+        max_average_fit_seconds=_max_average_fit_seconds_from_args(args),
     )
     print(json.dumps(report, allow_nan=False, indent=2, sort_keys=True))
     return 0
+
+
+def _phase_error_beats(
+    predicted_track: np.ndarray,
+    oracle_track: np.ndarray,
+) -> np.ndarray:
+    angle_delta = np.arctan2(
+        predicted_track[:, _PHASE_SIN_CHANNEL] * oracle_track[:, _PHASE_COS_CHANNEL]
+        - predicted_track[:, _PHASE_COS_CHANNEL] * oracle_track[:, _PHASE_SIN_CHANNEL],
+        predicted_track[:, _PHASE_COS_CHANNEL] * oracle_track[:, _PHASE_COS_CHANNEL]
+        + predicted_track[:, _PHASE_SIN_CHANNEL] * oracle_track[:, _PHASE_SIN_CHANNEL],
+    )
+    return np.abs(angle_delta) / (2.0 * np.pi)
+
+
+def _mean_absolute_channel_delta(
+    predicted_track: np.ndarray,
+    oracle_track: np.ndarray,
+    channel_index: int,
+) -> float:
+    return float(np.mean(np.abs(predicted_track[:, channel_index] - oracle_track[:, channel_index])))
+
+
+def _grid_fitter_config(double_tempo_score_ratio_threshold: float | None) -> GridFitterConfig:
+    if double_tempo_score_ratio_threshold is None:
+        return GridFitterConfig()
+    return GridFitterConfig(double_tempo_score_ratio_threshold=double_tempo_score_ratio_threshold)
+
+
+def _sample_paths(dataset_root: Path, row: Mapping[str, object]) -> tuple[Path, Path]:
+    shard_path = dataset_root / str(row["shard"])
+    return shard_path / str(row["beatmap_path"]), shard_path / str(row["audio_path"])
+
+
+def _comparison_row(
+    *,
+    beatmap_path: Path,
+    audio_path: Path,
+    frame_count: int,
+    fit_score: float,
+    fit_seconds: float,
+    predicted_bpm: float,
+    predicted_offset_ms: float,
+    oracle_segment: TimingSegment,
+    oracle_segment_count: int,
+    raw_selected_bpm: float,
+    raw_score: float,
+    half_tempo_score: float,
+    double_tempo_score: float,
+    tempo_multiplier: float,
+    comparison: TimingGridComparison,
+) -> dict[str, object]:
+    return {
+        "beatmap_path": beatmap_path.as_posix(),
+        "audio_path": audio_path.as_posix(),
+        "frame_count": frame_count,
+        "fit_score": fit_score,
+        "fit_seconds": fit_seconds,
+        "predicted_bpm": predicted_bpm,
+        "predicted_offset_ms": predicted_offset_ms,
+        "oracle_first_bpm": oracle_segment.local_bpm,
+        "oracle_first_offset_ms": oracle_segment.offset_ms,
+        "oracle_segment_count": oracle_segment_count,
+        "raw_selected_bpm": raw_selected_bpm,
+        "raw_score": raw_score,
+        "half_tempo_score": _finite_float_or_none(half_tempo_score),
+        "double_tempo_score": _finite_float_or_none(double_tempo_score),
+        "tempo_multiplier": tempo_multiplier,
+        **asdict(comparison),
+    }
+
+
+def _max_average_fit_seconds_from_args(args: argparse.Namespace) -> float | None:
+    if args.max_average_fit_seconds <= 0.0:
+        return None
+    return args.max_average_fit_seconds
 
 
 def _summarize_rows(rows: Sequence[dict[str, object]]) -> dict[str, float]:
     if not rows:
         return {}
 
-    metric_names = (
-        "fit_score",
-        "fit_seconds",
-        "beat_pulse_mae",
-        "local_bpm_mae",
-        "mean_phase_error_beats",
-        "max_phase_error_beats",
-        "mean_phase_error_ms",
-        "max_phase_error_ms",
-    )
     summary: dict[str, float] = {}
-    for name in metric_names:
+    for name in _SUMMARY_METRICS:
         values = np.asarray([float(row[name]) for row in rows], dtype=np.float64)
         summary[f"{name}_mean"] = float(np.mean(values))
         summary[f"{name}_max"] = float(np.max(values))

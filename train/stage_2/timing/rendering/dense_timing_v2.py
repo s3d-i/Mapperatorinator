@@ -17,6 +17,10 @@ DENSE_TIMING_V2_CHANNELS = (
     "phase_cos",
     "local_bpm",
 )
+_BEAT_PULSE_CHANNEL = 0
+_PHASE_SIN_CHANNEL = 1
+_PHASE_COS_CHANNEL = 2
+_LOCAL_BPM_CHANNEL = 3
 
 DenseTimingV2Track: TypeAlias = NDArray[np.float32]
 
@@ -62,12 +66,19 @@ def render_dense_timing_v2(
         pulse_width_ms=config.pulse_width_ms,
     )
     local_bpm = 60000.0 / active_beat_lengths_ms
+    return _dense_timing_track(beat_pulse, beat_phase, local_bpm)
 
-    track = np.empty((frame_times_ms.shape[0], len(DENSE_TIMING_V2_CHANNELS)), dtype=np.float32)
-    track[:, 0] = beat_pulse.astype(np.float32)
-    track[:, 1] = np.sin(2.0 * math.pi * beat_phase).astype(np.float32)
-    track[:, 2] = np.cos(2.0 * math.pi * beat_phase).astype(np.float32)
-    track[:, 3] = local_bpm.astype(np.float32)
+
+def _dense_timing_track(
+    beat_pulse: NDArray[np.float64],
+    beat_phase: NDArray[np.float64],
+    local_bpm: NDArray[np.float64],
+) -> DenseTimingV2Track:
+    track = np.empty((beat_pulse.shape[0], len(DENSE_TIMING_V2_CHANNELS)), dtype=np.float32)
+    track[:, _BEAT_PULSE_CHANNEL] = beat_pulse.astype(np.float32)
+    track[:, _PHASE_SIN_CHANNEL] = np.sin(2.0 * math.pi * beat_phase).astype(np.float32)
+    track[:, _PHASE_COS_CHANNEL] = np.cos(2.0 * math.pi * beat_phase).astype(np.float32)
+    track[:, _LOCAL_BPM_CHANNEL] = local_bpm.astype(np.float32)
     return track
 
 

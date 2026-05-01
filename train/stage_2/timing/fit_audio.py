@@ -40,23 +40,12 @@ def fit_audio_file(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
-    default_config = GridFitterConfig()
-    fitter_config = GridFitterConfig(
-        min_bpm=args.min_bpm,
-        max_bpm=args.max_bpm,
-        max_segments=args.max_segments,
-        double_tempo_score_ratio_threshold=(
-            default_config.double_tempo_score_ratio_threshold
-            if args.double_tempo_score_ratio_threshold is None
-            else args.double_tempo_score_ratio_threshold
-        ),
-    )
     report = fit_audio_file(
         args.audio_path,
         checkpoint_path=args.checkpoint,
         device=args.device,
         float16=args.float16,
-        fitter_config=fitter_config,
+        fitter_config=_fitter_config_from_args(args),
     )
     if args.emit_json:
         print(json.dumps(report, allow_nan=False, indent=2, sort_keys=True))
@@ -66,7 +55,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def format_timing_report(report: dict[str, object]) -> str:
-    lines = [
+    lines = _report_header_lines(report)
+    lines.append("segments:")
+    lines.extend(
+        _format_segment_line(index, segment)
+        for index, segment in enumerate(_report_segments(report), start=1)
+    )
+    return "\n".join(lines)
+
+
+def _report_header_lines(report: dict[str, object]) -> list[str]:
+    return [
         f"source: {report['source_path']}",
         f"provider: {report['provider']}",
         f"checkpoint: {report['checkpoint_path']}",
@@ -74,21 +73,25 @@ def format_timing_report(report: dict[str, object]) -> str:
         f"frame_count: {report['frame_count']}",
         f"fit_seconds: {float(report['fit_seconds']):.3f}",
         f"score: {float(report['score']):.6f}",
-        "segments:",
     ]
+
+
+def _report_segments(report: dict[str, object]) -> list[dict[str, object]]:
     segments = report["segments"]
     if not isinstance(segments, list):
         raise TypeError("report['segments'] must be a list")
-    for index, segment in enumerate(segments, start=1):
-        lines.append(
-            "  "
-            f"{index}. "
-            f"offset_ms={float(segment['offset_ms']):.3f} "
-            f"beat_length_ms={float(segment['beat_length_ms']):.3f} "
-            f"bpm={float(segment['bpm']):.3f} "
-            f"meter={int(segment['meter'])}"
-        )
-    return "\n".join(lines)
+    return segments
+
+
+def _format_segment_line(index: int, segment: dict[str, object]) -> str:
+    return (
+        "  "
+        f"{index}. "
+        f"offset_ms={float(segment['offset_ms']):.3f} "
+        f"beat_length_ms={float(segment['beat_length_ms']):.3f} "
+        f"bpm={float(segment['bpm']):.3f} "
+        f"meter={int(segment['meter'])}"
+    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -104,6 +107,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-segments", type=int, default=default_config.max_segments)
     parser.add_argument("--double-tempo-score-ratio-threshold", type=float, default=None)
     return parser
+
+
+def _fitter_config_from_args(args: argparse.Namespace) -> GridFitterConfig:
+    default_config = GridFitterConfig()
+    double_tempo_threshold = (
+        default_config.double_tempo_score_ratio_threshold
+        if args.double_tempo_score_ratio_threshold is None
+        else args.double_tempo_score_ratio_threshold
+    )
+    return GridFitterConfig(
+        min_bpm=args.min_bpm,
+        max_bpm=args.max_bpm,
+        max_segments=args.max_segments,
+        double_tempo_score_ratio_threshold=double_tempo_threshold,
+    )
 
 
 def _timing_report(
