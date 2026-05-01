@@ -79,6 +79,48 @@ def _jittered_single_tempo_prediction(
 
 
 class Stage2GridFitterTest(unittest.TestCase):
+    def test_scores_grid_without_materializing_dense_pulse_template(self) -> None:
+        frame_times_ms = np.arange(7000, dtype=np.float64) / 50.0 * 1000.0
+        target_template = scoring_module._pulse_template(
+            frame_times_ms,
+            beat_length_ms=500.0,
+            offset_ms=120.0,
+            pulse_width_ms=40.0,
+        )
+        distractor_template = scoring_module._pulse_template(
+            frame_times_ms,
+            beat_length_ms=760.0,
+            offset_ms=200.0,
+            pulse_width_ms=40.0,
+        )
+        signal = (
+            target_template
+            + 0.25 * distractor_template
+            + np.linspace(0.0, 0.1, frame_times_ms.shape[0])
+        )
+        centered_signal = signal - float(np.mean(signal))
+        signal_norm = float(np.linalg.norm(centered_signal))
+        centered_template = target_template - float(np.mean(target_template))
+        expected_score = float(
+            np.dot(centered_signal, centered_template) / (signal_norm * np.linalg.norm(centered_template))
+        )
+
+        with patch.object(
+            scoring_module,
+            "_pulse_template",
+            side_effect=AssertionError("dense pulse template should not be materialized"),
+        ):
+            score = scoring_module._score_grid(
+                centered_signal,
+                signal_norm=signal_norm,
+                frame_times_ms=frame_times_ms,
+                beat_length_ms=500.0,
+                offset_ms=120.0,
+                pulse_width_ms=40.0,
+            )
+
+        self.assertAlmostEqual(score, expected_score, delta=1e-12)
+
     def test_fits_single_segment_offset_and_bpm_from_beat_probabilities(self) -> None:
         prediction = _synthetic_prediction(offset_ms=120.0, beat_length_ms=500.0)
 

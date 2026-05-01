@@ -333,17 +333,129 @@ def _score_grid(
     offset_ms: float,
     pulse_width_ms: float,
 ) -> float:
-    template = _pulse_template(
-        frame_times_ms,
+    frame_count = frame_times_ms.shape[0]
+    if frame_count == 0:
+        return -np.inf
+
+    template_sum, template_sum_squares, signal_template_dot = _pulse_template_stats(
+        centered_signal,
+        frame_times_ms=frame_times_ms,
         beat_length_ms=beat_length_ms,
         offset_ms=offset_ms,
         pulse_width_ms=pulse_width_ms,
     )
-    centered_template = template - float(np.mean(template))
-    template_norm = float(np.linalg.norm(centered_template))
-    if template_norm == 0.0:
+    centered_template_sum_squares = template_sum_squares - (template_sum * template_sum / float(frame_count))
+    if centered_template_sum_squares <= 0.0:
         return -np.inf
-    return float(np.dot(centered_signal, centered_template) / (signal_norm * template_norm))
+    return float(signal_template_dot / (signal_norm * float(np.sqrt(centered_template_sum_squares))))
+
+
+def _pulse_template_stats(
+    centered_signal: NDArray[np.float64],
+    *,
+    frame_times_ms: NDArray[np.float64],
+    beat_length_ms: float,
+    offset_ms: float,
+    pulse_width_ms: float,
+) -> tuple[float, float, float]:
+    if beat_length_ms <= pulse_width_ms * 2.0:
+        return _dense_pulse_template_stats(
+            centered_signal,
+            frame_times_ms=frame_times_ms,
+            beat_length_ms=beat_length_ms,
+            offset_ms=offset_ms,
+            pulse_width_ms=pulse_width_ms,
+        )
+    return _sparse_pulse_template_stats(
+        centered_signal,
+        frame_times_ms=frame_times_ms,
+        beat_length_ms=beat_length_ms,
+        offset_ms=offset_ms,
+        pulse_width_ms=pulse_width_ms,
+    )
+
+
+def _dense_pulse_template_stats(
+    centered_signal: NDArray[np.float64],
+    *,
+    frame_times_ms: NDArray[np.float64],
+    beat_length_ms: float,
+    offset_ms: float,
+    pulse_width_ms: float,
+) -> tuple[float, float, float]:
+    phase_ms = np.mod(frame_times_ms - offset_ms, beat_length_ms)
+    distance_ms = np.minimum(phase_ms, beat_length_ms - phase_ms)
+    weights = np.maximum(0.0, 1.0 - distance_ms / pulse_width_ms)
+    return (
+        float(np.sum(weights)),
+        float(np.dot(weights, weights)),
+        float(np.dot(centered_signal, weights)),
+    )
+
+
+def _sparse_pulse_template_stats(
+    centered_signal: NDArray[np.float64],
+    *,
+    frame_times_ms: NDArray[np.float64],
+    beat_length_ms: float,
+    offset_ms: float,
+    pulse_width_ms: float,
+) -> tuple[float, float, float]:
+    first_frame_time_ms = float(frame_times_ms[0])
+    last_frame_time_ms = float(frame_times_ms[-1])
+    if frame_times_ms.shape[0] == 1:
+        frame_step_ms = pulse_width_ms
+    else:
+        frame_step_ms = float(
+            (last_frame_time_ms - first_frame_time_ms) / float(frame_times_ms.shape[0] - 1)
+        )
+        if frame_step_ms <= 0.0:
+            return _dense_pulse_template_stats(
+                centered_signal,
+                frame_times_ms=frame_times_ms,
+                beat_length_ms=beat_length_ms,
+                offset_ms=offset_ms,
+                pulse_width_ms=pulse_width_ms,
+            )
+
+    first_beat_index = int(np.floor((first_frame_time_ms - offset_ms - pulse_width_ms) / beat_length_ms))
+    last_beat_index = int(np.ceil((last_frame_time_ms - offset_ms + pulse_width_ms) / beat_length_ms))
+    beat_times_ms = offset_ms + np.arange(first_beat_index, last_beat_index + 1, dtype=np.float64) * beat_length_ms
+    if beat_times_ms.shape[0] == 0:
+        return 0.0, 0.0, 0.0
+
+    radius_frames = int(np.ceil(pulse_width_ms / frame_step_ms)) + 2
+    if beat_times_ms.shape[0] * (2 * radius_frames + 1) >= frame_times_ms.shape[0]:
+        return _dense_pulse_template_stats(
+            centered_signal,
+            frame_times_ms=frame_times_ms,
+            beat_length_ms=beat_length_ms,
+            offset_ms=offset_ms,
+            pulse_width_ms=pulse_width_ms,
+        )
+
+    relative_frame_indices = np.arange(-radius_frames, radius_frames + 1, dtype=np.int64)
+    center_frame_indices = np.rint((beat_times_ms - first_frame_time_ms) / frame_step_ms).astype(np.int64)
+    frame_indices = center_frame_indices[:, np.newaxis] + relative_frame_indices[np.newaxis, :]
+    valid_frame_mask = (frame_indices >= 0) & (frame_indices < frame_times_ms.shape[0])
+    if not np.any(valid_frame_mask):
+        return 0.0, 0.0, 0.0
+
+    clamped_frame_indices = np.where(valid_frame_mask, frame_indices, 0)
+    candidate_frame_times_ms = frame_times_ms[clamped_frame_indices]
+    distances_ms = np.abs(candidate_frame_times_ms - beat_times_ms[:, np.newaxis])
+    weights = 1.0 - distances_ms / pulse_width_ms
+    support_mask = valid_frame_mask & (weights > 0.0)
+    if not np.any(support_mask):
+        return 0.0, 0.0, 0.0
+
+    support_weights = weights[support_mask]
+    support_frame_indices = frame_indices[support_mask]
+    return (
+        float(np.sum(support_weights)),
+        float(np.dot(support_weights, support_weights)),
+        float(np.dot(centered_signal[support_frame_indices], support_weights)),
+    )
 
 
 def _pulse_template(
