@@ -47,15 +47,34 @@ class GridFitterConfig:
     merge_alias_bpm_tolerance: float = 2.0
     merge_alias_phase_tolerance_ms: float = 60.0
     merge_alias_max_fit_score: float = 0.92
+    canonicalize_tempo_aliases: bool = True
+    alias_tempo_multipliers: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 4.0)
+    alias_score_tie_margin: float = 0.03
+    alias_score_ratio_threshold: float = 0.97
+    alias_preferred_min_bpm: float = 80.0
+    alias_preferred_max_bpm: float = 240.0
+    alias_preferred_band_bonus: float = 0.015
+    alias_current_tempo_bonus: float = 0.04
+    alias_downbeat_score_weight: float = 0.02
+    alias_continuity_penalty: float = 0.02
+    alias_demotion_dropped_support_ratio_threshold: float = 0.35
+    alias_promotion_inserted_support_ratio_threshold: float = 0.35
+    alias_beat_match_tolerance_ms: float = 45.0
 
     def __post_init__(self) -> None:
         _require_positive_finite(self, _POSITIVE_FINITE_FIELDS)
         _require_nonnegative_finite(self, _NONNEGATIVE_FINITE_FIELDS)
         _require_positive(self, _POSITIVE_COUNT_FIELDS)
         _require_nonnegative(self, _NONNEGATIVE_COUNT_FIELDS)
+        _require_alias_tempo_multipliers(self.alias_tempo_multipliers)
 
         if not np.isfinite(self.max_bpm) or self.max_bpm <= self.min_bpm:
             raise ValueError(f"max_bpm must be finite and greater than min_bpm, got {self.max_bpm!r}")
+        if self.alias_preferred_max_bpm <= self.alias_preferred_min_bpm:
+            raise ValueError(
+                "alias_preferred_max_bpm must be greater than alias_preferred_min_bpm, "
+                f"got {self.alias_preferred_max_bpm!r} <= {self.alias_preferred_min_bpm!r}",
+            )
 
 
 _POSITIVE_FINITE_FIELDS: Final[tuple[str, ...]] = (
@@ -84,6 +103,17 @@ _NONNEGATIVE_FINITE_FIELDS: Final[tuple[str, ...]] = (
     "merge_alias_bpm_tolerance",
     "merge_alias_phase_tolerance_ms",
     "merge_alias_max_fit_score",
+    "alias_score_tie_margin",
+    "alias_score_ratio_threshold",
+    "alias_preferred_min_bpm",
+    "alias_preferred_max_bpm",
+    "alias_preferred_band_bonus",
+    "alias_current_tempo_bonus",
+    "alias_downbeat_score_weight",
+    "alias_continuity_penalty",
+    "alias_demotion_dropped_support_ratio_threshold",
+    "alias_promotion_inserted_support_ratio_threshold",
+    "alias_beat_match_tolerance_ms",
 )
 
 _POSITIVE_COUNT_FIELDS: Final[tuple[str, ...]] = (
@@ -133,6 +163,16 @@ def _require_nonnegative(config: GridFitterConfig, fields: tuple[str, ...]) -> N
         value = getattr(config, field)
         if value < 0:
             raise ValueError(f"{field} must be non-negative, got {value!r}")
+
+
+def _require_alias_tempo_multipliers(multipliers: tuple[float, ...]) -> None:
+    if not multipliers:
+        raise ValueError("alias_tempo_multipliers must be non-empty")
+    if 1.0 not in multipliers:
+        raise ValueError("alias_tempo_multipliers must include 1.0")
+    for multiplier in multipliers:
+        if not np.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError(f"alias_tempo_multipliers must be positive and finite, got {multiplier!r}")
 
 
 def _effective_config_for_prediction(

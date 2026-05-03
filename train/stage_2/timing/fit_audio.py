@@ -145,6 +145,7 @@ def _timing_report(
             "raw_selected_bpm": fit_result.diagnostics.raw_selected_bpm,
             "tempo_multiplier": fit_result.diagnostics.tempo_multiplier,
             "candidate_count": fit_result.diagnostics.candidate_count,
+            "alias_candidate_count": fit_result.diagnostics.alias_candidate_count,
         },
         "segments": [
             {

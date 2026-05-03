@@ -10,6 +10,12 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from train.stage_2.timing.grid_fitting import GridFitter, GridFitterConfig
+from train.stage_2.timing.grid_fitting.alias import (
+    _alias_bpm_abs_error,
+    _alias_bpm_mae,
+    _distribution_or_default,
+    _segment_alias_switch_count,
+)
 from train.stage_2.timing.rendering.dense_timing_v2 import (
     DEFAULT_DENSE_TIMING_V2_CONFIG,
     DenseTimingV2Config,
@@ -30,6 +36,9 @@ _SUMMARY_METRICS = (
     "fit_seconds",
     "beat_pulse_mae",
     "local_bpm_mae",
+    "local_bpm_alias_mae",
+    "first_bpm_abs_error",
+    "first_bpm_alias_error",
     "mean_phase_error_beats",
     "max_phase_error_beats",
     "mean_phase_error_ms",
@@ -42,6 +51,7 @@ class TimingGridComparison:
     frame_count: int
     beat_pulse_mae: float
     local_bpm_mae: float
+    local_bpm_alias_mae: float
     mean_phase_error_beats: float
     max_phase_error_beats: float
     mean_phase_error_ms: float
@@ -93,6 +103,10 @@ def compare_timing_grids(
             predicted_track,
             oracle_track,
             _LOCAL_BPM_CHANNEL,
+        ),
+        local_bpm_alias_mae=_alias_bpm_mae(
+            predicted_track[:, _LOCAL_BPM_CHANNEL].astype(np.float64),
+            oracle_track[:, _LOCAL_BPM_CHANNEL].astype(np.float64),
         ),
         mean_phase_error_beats=float(np.mean(phase_error_beats)),
         max_phase_error_beats=float(np.max(phase_error_beats)),
@@ -162,6 +176,7 @@ def run_beatthis_oracle_comparison(
                 frame_rate_hz=prediction.frame_rate_hz,
                 prediction_seconds=prediction_seconds,
                 candidate_count=fit_result.diagnostics.candidate_count,
+                alias_candidate_count=fit_result.diagnostics.alias_candidate_count,
                 fit_score=fit_result.score,
                 fit_seconds=fit_seconds,
                 total_seconds=total_seconds,
@@ -172,6 +187,8 @@ def run_beatthis_oracle_comparison(
                 half_tempo_score=fit_result.diagnostics.half_tempo_score,
                 double_tempo_score=fit_result.diagnostics.double_tempo_score,
                 tempo_multiplier=fit_result.diagnostics.tempo_multiplier,
+                tempo_multiplier_distribution=fit_result.diagnostics.tempo_multiplier_distribution,
+                segment_alias_switch_count=fit_result.diagnostics.segment_alias_switch_count,
                 comparison=comparison,
             )
         )
@@ -255,6 +272,7 @@ def _comparison_row(
     frame_rate_hz: float,
     prediction_seconds: float,
     candidate_count: int,
+    alias_candidate_count: int,
     fit_score: float,
     fit_seconds: float,
     total_seconds: float,
@@ -266,11 +284,23 @@ def _comparison_row(
     double_tempo_score: float,
     tempo_multiplier: float,
     comparison: TimingGridComparison,
+    tempo_multiplier_distribution: Mapping[str, int] | None = None,
+    segment_alias_switch_count: int | None = None,
 ) -> dict[str, object]:
     predicted_first_segment = predicted_segments[0]
     oracle_first_segment = oracle_segments[0]
     predicted_segment_count = len(predicted_segments)
     oracle_segment_count = len(oracle_segments)
+    first_bpm_abs_error = abs(predicted_first_segment.local_bpm - oracle_first_segment.local_bpm)
+    first_bpm_alias_error = _alias_bpm_abs_error(
+        predicted_first_segment.local_bpm,
+        oracle_first_segment.local_bpm,
+    )
+    resolved_segment_alias_switch_count = (
+        _segment_alias_switch_count(predicted_segments, config=GridFitterConfig())
+        if segment_alias_switch_count is None
+        else int(segment_alias_switch_count)
+    )
     return {
         "beatmap_path": beatmap_path.as_posix(),
         "audio_path": audio_path.as_posix(),
@@ -278,6 +308,7 @@ def _comparison_row(
         "audio_duration_seconds": float(frame_count) / frame_rate_hz,
         "prediction_seconds": float(prediction_seconds),
         "candidate_count": int(candidate_count),
+        "alias_candidate_count": int(alias_candidate_count),
         "fit_score": fit_score,
         "fit_seconds": fit_seconds,
         "total_seconds": float(total_seconds),
@@ -287,9 +318,12 @@ def _comparison_row(
         "predicted_first_offset_ms": predicted_first_segment.offset_ms,
         "oracle_first_bpm": oracle_first_segment.local_bpm,
         "oracle_first_offset_ms": oracle_first_segment.offset_ms,
+        "first_bpm_abs_error": float(first_bpm_abs_error),
+        "first_bpm_alias_error": float(first_bpm_alias_error),
         "predicted_segment_count": predicted_segment_count,
         "oracle_segment_count": oracle_segment_count,
         "segment_count_delta": predicted_segment_count - oracle_segment_count,
+        "segment_alias_switch_count": resolved_segment_alias_switch_count,
         "predicted_segments": _segments_payload(predicted_segments),
         "oracle_segments": _segments_payload(oracle_segments),
         "raw_selected_bpm": raw_selected_bpm,
@@ -297,6 +331,11 @@ def _comparison_row(
         "half_tempo_score": _finite_float_or_none(half_tempo_score),
         "double_tempo_score": _finite_float_or_none(double_tempo_score),
         "tempo_multiplier": tempo_multiplier,
+        "tempo_multiplier_distribution": _distribution_or_default(
+            tempo_multiplier_distribution,
+            tempo_multiplier=tempo_multiplier,
+            segment_count=predicted_segment_count,
+        ),
         **asdict(comparison),
     }
 

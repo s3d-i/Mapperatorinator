@@ -5,6 +5,7 @@ import numpy as np
 
 import train.stage_2.timing.grid_fitting.scoring as scoring_module
 from train.stage_2.timing.grid_fitting import GridFitter, GridFitterConfig
+from train.stage_2.timing.grid_fitting.alias import _canonicalize_tempo_aliases, _segment_alias_switch_count
 from train.stage_2.timing.grid_fitting.config import _effective_config_for_prediction
 from train.stage_2.timing.grid_fitting.segments import _timing_segments_from_fits
 from train.stage_2.timing.grid_fitting.splitting import _merge_adjacent_segment_fits
@@ -51,6 +52,26 @@ def _synthetic_pulse(
     phase = beat_pos - np.floor(beat_pos)
     distance_ms = np.minimum(phase, 1.0 - phase) * beat_length_ms
     return amplitude * np.maximum(0.0, 1.0 - distance_ms / pulse_width_ms)
+
+
+def _alternating_pulse(
+    *,
+    frame_count: int,
+    frame_rate_hz: float,
+    offset_ms: float,
+    beat_length_ms: float,
+    odd_amplitude: float,
+    even_amplitude: float = 1.0,
+    pulse_width_ms: float = 40.0,
+) -> np.ndarray:
+    frame_times_ms = np.arange(frame_count, dtype=np.float64) / frame_rate_hz * 1000.0
+    beat_times_ms = np.arange(offset_ms, frame_times_ms[-1] + beat_length_ms, beat_length_ms, dtype=np.float64)
+    signal = np.zeros_like(frame_times_ms)
+    for beat_index, beat_time_ms in enumerate(beat_times_ms):
+        amplitude = even_amplitude if beat_index % 2 == 0 else odd_amplitude
+        distance_ms = np.abs(frame_times_ms - beat_time_ms)
+        signal = np.maximum(signal, amplitude * np.maximum(0.0, 1.0 - distance_ms / pulse_width_ms))
+    return signal
 
 
 def _jittered_single_tempo_prediction(
@@ -396,6 +417,103 @@ class Stage2GridFitterTest(unittest.TestCase):
         self.assertEqual(len(merged_segments), 1)
         self.assertAlmostEqual(merged_segments[0].beat_length_ms, 500.0, delta=1e-6)
         self.assertAlmostEqual(merged_segments[0].offset_ms % 500.0, 0.0, delta=1e-6)
+
+    def test_post_pass_canonicalizes_adjacent_alias_tempo_switches(self) -> None:
+        frame_times_ms = np.arange(1200, dtype=np.float64) / 50.0 * 1000.0
+        signal = _synthetic_pulse(
+            frame_count=1200,
+            frame_rate_hz=50.0,
+            offset_ms=0.0,
+            beat_length_ms=500.0,
+        ).astype(np.float64)
+        segment_fits = (
+            _SegmentFit(0, 600, 0.8, 500.0, 0.0, 0.1, 0.2, 120.0, 0.8, 1.0, 10),
+            _SegmentFit(600, 1200, 0.8, 1000.0, 0.0, 0.1, 0.2, 60.0, 0.8, 1.0, 10),
+        )
+
+        canonical_result = _canonicalize_tempo_aliases(
+            segment_fits,
+            signal,
+            frame_times_ms=frame_times_ms,
+            downbeat_signal=np.zeros_like(signal),
+            config=GridFitterConfig(),
+        )
+        canonical_fits = canonical_result.segment_fits
+        segments = _timing_segments_from_fits(canonical_fits, frame_times_ms, config=GridFitterConfig())
+
+        self.assertAlmostEqual(canonical_fits[1].bpm, 120.0, delta=1e-6)
+        self.assertEqual(_segment_alias_switch_count(segments, config=GridFitterConfig()), 0)
+        self.assertLessEqual(canonical_result.alias_candidate_count, 16)
+
+    def test_post_pass_can_lower_promoted_alias_tempo_switches(self) -> None:
+        frame_times_ms = np.arange(1200, dtype=np.float64) / 50.0 * 1000.0
+        signal = _synthetic_pulse(
+            frame_count=1200,
+            frame_rate_hz=50.0,
+            offset_ms=0.0,
+            beat_length_ms=500.0,
+        ).astype(np.float64)
+        segment_fits = (
+            _SegmentFit(0, 600, 0.95, 500.0, 0.0, 0.1, 0.2, 120.0, 0.95, 1.0, 10),
+            _SegmentFit(600, 1200, 0.85, 250.0, 0.0, 0.1, 0.85, 120.0, 0.84, 2.0, 10),
+        )
+
+        canonical_result = _canonicalize_tempo_aliases(
+            segment_fits,
+            signal,
+            frame_times_ms=frame_times_ms,
+            downbeat_signal=np.zeros_like(signal),
+            config=GridFitterConfig(),
+        )
+        canonical_fits = canonical_result.segment_fits
+        segments = _timing_segments_from_fits(canonical_fits, frame_times_ms, config=GridFitterConfig())
+
+        self.assertAlmostEqual(canonical_fits[1].bpm, 120.0, delta=1e-6)
+        self.assertEqual(canonical_fits[1].tempo_multiplier, 1.0)
+        self.assertEqual(_segment_alias_switch_count(segments, config=GridFitterConfig()), 0)
+
+    def test_post_pass_rejects_supported_first_segment_demotion(self) -> None:
+        frame_times_ms = np.arange(2400, dtype=np.float64) / 50.0 * 1000.0
+        signal = _alternating_pulse(
+            frame_count=2400,
+            frame_rate_hz=50.0,
+            offset_ms=0.0,
+            beat_length_ms=320.0,
+            odd_amplitude=0.7,
+        ).astype(np.float64)
+        segment_fits = (
+            _SegmentFit(0, 2400, 0.5, 320.0, 0.0, 0.1, 0.2, 187.5, 0.5, 1.0, 10),
+        )
+        config = GridFitterConfig(
+            alias_current_tempo_bonus=0.0,
+            alias_preferred_band_bonus=0.0,
+        )
+
+        canonical_result = _canonicalize_tempo_aliases(
+            segment_fits,
+            signal,
+            frame_times_ms=frame_times_ms,
+            downbeat_signal=np.zeros_like(signal),
+            config=config,
+        )
+
+        self.assertAlmostEqual(canonical_result.segment_fits[0].bpm, 187.5, delta=1e-6)
+        self.assertGreater(canonical_result.alias_candidate_count, 0)
+
+    def test_alias_post_pass_preserves_grid_candidate_count_diagnostics(self) -> None:
+        prediction = _synthetic_prediction(
+            frame_count=1800,
+            offset_ms=0.0,
+            beat_length_ms=500.0,
+        )
+        base_config = GridFitterConfig(canonicalize_tempo_aliases=False)
+        alias_config = GridFitterConfig(canonicalize_tempo_aliases=True)
+
+        base_result = GridFitter(base_config).fit(prediction)
+        alias_result = GridFitter(alias_config).fit(prediction)
+
+        self.assertEqual(alias_result.diagnostics.candidate_count, base_result.diagnostics.candidate_count)
+        self.assertGreater(alias_result.diagnostics.alias_candidate_count, 0)
 
     def test_collapses_many_same_tempo_phase_resets(self) -> None:
         frame_times_ms = np.arange(2400, dtype=np.float64) / 50.0 * 1000.0

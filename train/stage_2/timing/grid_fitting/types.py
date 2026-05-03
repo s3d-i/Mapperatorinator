@@ -16,6 +16,9 @@ class TimingFitDiagnostics:
     raw_selected_bpm: float
     raw_score: float
     tempo_multiplier: float
+    segment_alias_switch_count: int
+    tempo_multiplier_distribution: dict[str, int]
+    alias_candidate_count: int = 0
 
 
 @dataclass(frozen=True)

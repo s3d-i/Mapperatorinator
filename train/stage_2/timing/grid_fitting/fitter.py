@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from train.stage_2.timing.grid_fitting.alias import (
+    _canonicalize_tempo_aliases,
+    _segment_alias_switch_count,
+    _tempo_multiplier_distribution,
+)
 from train.stage_2.timing.grid_fitting.config import GridFitterConfig, _effective_config_for_prediction
 from train.stage_2.timing.grid_fitting.scoring import _candidate_period_frame_bounds
 from train.stage_2.timing.grid_fitting.segment_fit import _fit_segment_range
@@ -62,6 +67,14 @@ def fit_timing_grid(
         remaining_splits=config.max_segments - 1,
     )
     candidate_count = sum(fit.candidate_count for fit in segment_fits)
+    alias_result = _canonicalize_tempo_aliases(
+        segment_fits,
+        signal,
+        frame_times_ms=frame_times_ms,
+        downbeat_signal=downbeat_signal,
+        config=config,
+    )
+    segment_fits = alias_result.segment_fits
     best_score = _weighted_score(segment_fits)
     first_fit = segment_fits[0]
     grid = FittedTimingGrid(segments=_timing_segments_from_fits(segment_fits, frame_times_ms, config=config))
@@ -79,5 +92,8 @@ def fit_timing_grid(
             raw_selected_bpm=float(first_fit.raw_bpm),
             raw_score=float(first_fit.raw_score),
             tempo_multiplier=first_fit.tempo_multiplier,
+            segment_alias_switch_count=_segment_alias_switch_count(grid.segments, config=config),
+            tempo_multiplier_distribution=_tempo_multiplier_distribution(segment_fits),
+            alias_candidate_count=alias_result.alias_candidate_count,
         ),
     )

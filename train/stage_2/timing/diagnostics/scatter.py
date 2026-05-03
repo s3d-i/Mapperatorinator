@@ -22,6 +22,7 @@ class ScatterSpec:
     x_label: str
     y_label: str
     title: str
+    optional: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,15 @@ DEFAULT_SCATTER_SPECS: tuple[ScatterSpec, ...] = (
         y_label="Local BPM MAE",
         title="Local BPM error by tempo multiplier",
     ),
+    ScatterSpec(
+        name="local_bpm_alias_mae_by_tempo_multiplier",
+        x_metric="tempo_multiplier",
+        y_metric="local_bpm_alias_mae",
+        x_label="Selected tempo multiplier",
+        y_label="Alias-aware local BPM MAE",
+        title="Alias-aware local BPM error by tempo multiplier",
+        optional=True,
+    ),
 )
 
 
@@ -87,7 +97,18 @@ def write_scatter_artifacts(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     plots: list[dict[str, object]] = []
+    skipped_plots: list[dict[str, object]] = []
     for spec in specs:
+        missing_metrics = _missing_metrics(rows, spec)
+        if missing_metrics and spec.optional:
+            skipped_plots.append(
+                {
+                    "name": spec.name,
+                    "reason": "missing metric",
+                    "missing_metrics": missing_metrics,
+                }
+            )
+            continue
         points = _scatter_points(rows, spec)
         if len(points.x) == 0:
             raise ValueError(f"scatter plot {spec.name!r} has no finite points")
@@ -112,6 +133,7 @@ def write_scatter_artifacts(
     manifest: dict[str, object] = {
         "source_report_path": None if source_report_path is None else source_report_path.as_posix(),
         "plots": plots,
+        "skipped_plots": skipped_plots,
         "specs": [asdict(spec) for spec in specs],
     }
     manifest_path = output_dir / "diagnostics_scatter_manifest.json"
@@ -176,6 +198,15 @@ def _scatter_points(
         y=np.asarray(y_values, dtype=np.float64),
         sample_indexes=sample_indexes,
     )
+
+
+def _missing_metrics(rows: Sequence[Mapping[str, object]], spec: ScatterSpec) -> list[str]:
+    required_metrics = (spec.x_metric, spec.y_metric)
+    missing: list[str] = []
+    for metric in required_metrics:
+        if any(metric not in row for row in rows):
+            missing.append(metric)
+    return missing
 
 
 def _write_scatter_plot(
