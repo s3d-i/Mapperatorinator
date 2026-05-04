@@ -1,4 +1,7 @@
+import math
 import unittest
+from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -10,9 +13,127 @@ from train.stage_2.timing.grid_fitting.config import _effective_config_for_predi
 from train.stage_2.timing.grid_fitting.segments import _timing_segments_from_fits
 from train.stage_2.timing.grid_fitting.splitting import _merge_adjacent_segment_fits
 from train.stage_2.timing.grid_fitting.types import _SegmentFit
+from train.stage_2.osu_core.timing import require_red_timing_points
 from train.stage_2.timing.diagnostics.compare_to_oracle import compare_timing_grids
 from train.stage_2.timing.rendering.dense_timing_v2 import render_dense_timing_v2
 from train.stage_2.timing.schema import FittedTimingGrid, FrameTimingPrediction, TimingSegment
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DATASET_ROOT = _REPO_ROOT / "mania-dataset"
+_FRACTIONAL_FIXTURE_INDEX_PATH = (
+    _REPO_ROOT / "train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies_2to6.parquet"
+)
+
+
+@dataclass(frozen=True)
+class _IndexedFractionalBpmFixture:
+    name: str
+    family_part: float
+    shard: str
+    audio_path: str
+    beatmap_path: str
+    frame_count: int = 3000
+
+    @property
+    def dataset_audio_path(self) -> Path:
+        return _DATASET_ROOT / self.shard / self.audio_path
+
+    @property
+    def dataset_beatmap_path(self) -> Path:
+        return _DATASET_ROOT / self.shard / self.beatmap_path
+
+    @property
+    def index_key(self) -> tuple[str, str, str]:
+        return self.shard, self.audio_path, self.beatmap_path
+
+
+_INDEXED_FRACTIONAL_BPM_FIXTURES = (
+    _IndexedFractionalBpmFixture(
+        name="ninth_111_dear_you",
+        family_part=1.0 / 9.0,
+        shard="0",
+        audio_path="286309/Dear You.mp3",
+        beatmap_path="286309/DJ Genericname - Dear You (Satoshi Kazuki) [HD+].osu",
+        frame_count=10000,
+    ),
+    _IndexedFractionalBpmFixture(
+        name="ninth_222_freedom_dive",
+        family_part=2.0 / 9.0,
+        shard="0",
+        audio_path="173612/Freedom Dive.mp3",
+        beatmap_path="173612/xi - FREEDOM DiVE (razlteh) [4K Hyper].osu",
+    ),
+    _IndexedFractionalBpmFixture(
+        name="eighth_125_ultra_beatdown",
+        family_part=1.0 / 8.0,
+        shard="0",
+        audio_path="728851/ULTRA BEATDOWN SUPREME.mp3",
+        beatmap_path="728851/DragonForce - ULTRA BEATDOWN SUPREME (IcyWorld) [Marathon].osu",
+    ),
+    _IndexedFractionalBpmFixture(
+        name="eighth_375_swagg_anthem",
+        family_part=3.0 / 8.0,
+        shard="0",
+        audio_path="2021203/audio.ogg",
+        beatmap_path="2021203/natimernero! - #SWAGG ANTHEM! (Relae) [CHAT, OPZIONI, BLOCCO!].osu",
+    ),
+    _IndexedFractionalBpmFixture(
+        name="eighth_875_impulse",
+        family_part=7.0 / 8.0,
+        shard="0",
+        audio_path="1349658/Impulse.mp3",
+        beatmap_path="1349658/Culprate & Au5 - Impulse (Pope Gadget) [The Reaction].osu",
+    ),
+    _IndexedFractionalBpmFixture(
+        name="third_333_wizdomiot",
+        family_part=1.0 / 3.0,
+        shard="0",
+        audio_path="1360248/audio.mp3",
+        beatmap_path="1360248/LeaF - Wizdomiot (extended ver.) (FAMoss) [Green-eyed Jealousy].osu",
+    ),
+    _IndexedFractionalBpmFixture(
+        name="third_667_nest",
+        family_part=2.0 / 3.0,
+        shard="0",
+        audio_path="576883/Nest 1.2.mp3",
+        beatmap_path="576883/Cardboard Box - Nest (Guilhermeziat) [Yolk 1.2].osu",
+    ),
+)
+
+
+def _indexed_fractional_fixture_keys() -> set[tuple[str, str, str]]:
+    import pandas as pd
+
+    index_frame = pd.read_parquet(_FRACTIONAL_FIXTURE_INDEX_PATH)
+    return {
+        (str(row.shard), str(row.audio_path), str(row.beatmap_path))
+        for row in index_frame.itertuples(index=False)
+    }
+
+
+def _red_timing_point_nearest_fractional_part(
+    beatmap_path: Path,
+    *,
+    fractional_part: float,
+) -> tuple[float, float]:
+    best_distance = math.inf
+    best_beat_length_ms = math.nan
+    best_bpm = math.nan
+    for timing_point in require_red_timing_points(beatmap_path):
+        bpm = 60000.0 / timing_point.beat_length_ms
+        if bpm < 80.0 or bpm > 300.0:
+            continue
+        fractional_distance = abs((bpm - math.floor(bpm)) - fractional_part)
+        if fractional_distance < best_distance:
+            best_distance = fractional_distance
+            best_beat_length_ms = timing_point.beat_length_ms
+            best_bpm = bpm
+    if not math.isfinite(best_distance) or best_distance > 0.0035:
+        raise AssertionError(
+            f"{beatmap_path} has no indexed red BPM near fractional part {fractional_part:.6f}"
+        )
+    return best_beat_length_ms, best_bpm
 
 
 def _synthetic_prediction(
@@ -100,6 +221,19 @@ def _jittered_single_tempo_prediction(
 
 
 class Stage2GridFitterTest(unittest.TestCase):
+    def test_expands_half_bpm_candidates_with_hardcoded_fractional_parts(self) -> None:
+        config = GridFitterConfig(min_bpm=220.0, max_bpm=224.0)
+
+        candidates = scoring_module._with_fractional_bpm_candidates(
+            np.asarray([222.0, 222.5], dtype=np.float64),
+            config=config,
+        )
+
+        self.assertTrue(np.any(np.isclose(candidates, 222.0 + 2.0 / 9.0)))
+        self.assertTrue(np.any(np.isclose(candidates, 222.0 + 1.0 / 8.0)))
+        self.assertTrue(np.any(np.isclose(candidates, 222.0 + 1.0 / 3.0)))
+        self.assertTrue(np.any(np.isclose(candidates, 222.0 + 2.0 / 3.0)))
+
     def test_scores_grid_without_materializing_dense_pulse_template(self) -> None:
         frame_times_ms = np.arange(7000, dtype=np.float64) / 50.0 * 1000.0
         target_template = scoring_module._pulse_template(
@@ -155,6 +289,71 @@ class Stage2GridFitterTest(unittest.TestCase):
         self.assertAlmostEqual(segment.local_bpm, 120.0, delta=1e-6)
         self.assertEqual(result.diagnostics.selected_period_frames, 25)
         self.assertEqual(result.diagnostics.selected_offset_frames, 6)
+
+    def test_fits_fractional_ninth_family_bpm_from_beat_probabilities(self) -> None:
+        target_bpm = 222.0 + 2.0 / 9.0
+        prediction = _synthetic_prediction(
+            frame_count=3000,
+            offset_ms=0.0,
+            beat_length_ms=60000.0 / target_bpm,
+        )
+        fitter = GridFitter(
+            GridFitterConfig(
+                min_bpm=200.0,
+                max_bpm=240.0,
+                max_segments=1,
+                max_grid_candidates_per_segment=2000,
+            )
+        )
+
+        result = fitter.fit(prediction)
+
+        self.assertAlmostEqual(result.grid.segments[0].local_bpm, target_bpm, delta=1e-6)
+
+    def test_fits_indexed_fractional_red_tempos_from_rendered_oracles(self) -> None:
+        if not _FRACTIONAL_FIXTURE_INDEX_PATH.exists():
+            self.skipTest("fractional BPM fixture index is not available")
+        indexed_keys = _indexed_fractional_fixture_keys()
+        fitter = GridFitter(
+            GridFitterConfig(
+                min_bpm=80.0,
+                max_bpm=300.0,
+                max_segments=1,
+                max_grid_candidates_per_segment=3000,
+            )
+        )
+
+        for fixture in _INDEXED_FRACTIONAL_BPM_FIXTURES:
+            with self.subTest(fixture=fixture.name):
+                self.assertIn(fixture.index_key, indexed_keys)
+                if not fixture.dataset_audio_path.exists() or not fixture.dataset_beatmap_path.exists():
+                    self.skipTest(f"{fixture.name} indexed fixture files are not available")
+                beat_length_ms, expected_bpm = _red_timing_point_nearest_fractional_part(
+                    fixture.dataset_beatmap_path,
+                    fractional_part=fixture.family_part,
+                )
+                oracle_grid = FittedTimingGrid(
+                    segments=(TimingSegment(offset_ms=0.0, beat_length_ms=beat_length_ms),)
+                )
+                track = render_dense_timing_v2(
+                    oracle_grid,
+                    input_start_ms=0.0,
+                    frame_count=fixture.frame_count,
+                )
+                prediction = FrameTimingPrediction(
+                    provider="indexed-oracle-rendered",
+                    beat_prob=track[:, 0],
+                    downbeat_prob=np.zeros(track.shape[0], dtype=np.float32),
+                    frame_rate_hz=50.0,
+                    source_path=fixture.dataset_audio_path.as_posix(),
+                )
+
+                result = fitter.fit(prediction)
+                fitted_bpm = result.grid.segments[0].local_bpm
+                nearest_half_bpm = round(expected_bpm * 2.0) / 2.0
+
+                self.assertLess(abs(fitted_bpm - expected_bpm), abs(nearest_half_bpm - expected_bpm))
+                self.assertAlmostEqual(fitted_bpm, expected_bpm, delta=0.005)
 
     def test_prefers_true_tempo_over_half_and_double_tempo_aliases(self) -> None:
         prediction = _synthetic_prediction(offset_ms=80.0, beat_length_ms=500.0)

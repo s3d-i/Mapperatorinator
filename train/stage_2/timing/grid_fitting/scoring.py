@@ -8,6 +8,20 @@ from numpy.typing import NDArray
 from train.stage_2.timing.grid_fitting.config import GridFitterConfig
 from train.stage_2.timing.grid_fitting.types import _GridCandidate
 
+_FRACTIONAL_BPM_SEARCH_RADIUS = 0.25
+_MIN_FRACTIONAL_BPM = 80.0
+_FRACTIONAL_BPM_SCORE_MARGIN = 0.08
+_FRACTIONAL_BPM_PARTS = tuple(
+    sorted(
+        {
+            *(fraction / 9.0 for fraction in range(1, 9)),
+            *(fraction / 8.0 for fraction in (1, 3, 5, 7)),
+            1.0 / 3.0,
+            2.0 / 3.0,
+        }
+    )
+)
+
 
 def _candidate_period_frame_bounds(
     frame_rate_hz: float,
@@ -42,7 +56,8 @@ def _candidate_bpms(
             config.bpm_step,
             dtype=np.float64,
         )
-    return _limit_bpm_candidates_by_grid_count(candidate_bpms, config=config)
+    coarse_candidate_bpms = _limit_bpm_candidates_by_grid_count(candidate_bpms, config=config)
+    return _with_fractional_bpm_candidates(coarse_candidate_bpms, config=config)
 
 
 def _autocorrelation_candidate_bpms(
@@ -119,6 +134,38 @@ def _ordered_unique_bpms(bpms: Sequence[float], *, config: GridFitterConfig) -> 
     return np.asarray(ordered, dtype=np.float64)
 
 
+def _with_fractional_bpm_candidates(
+    candidate_bpms: NDArray[np.float64],
+    *,
+    config: GridFitterConfig,
+) -> NDArray[np.float64]:
+    seen: set[float] = set()
+    expanded: list[float] = []
+    for bpm in candidate_bpms:
+        for candidate_bpm in _fractional_bpm_candidates_near(float(bpm)):
+            rounded_bpm = round(candidate_bpm, 6)
+            if rounded_bpm < config.min_bpm or rounded_bpm > config.max_bpm:
+                continue
+            if rounded_bpm in seen:
+                continue
+            seen.add(rounded_bpm)
+            expanded.append(float(rounded_bpm))
+    return np.asarray(expanded, dtype=np.float64)
+
+
+def _fractional_bpm_candidates_near(bpm: float) -> list[float]:
+    candidates = [float(bpm)]
+    if bpm < _MIN_FRACTIONAL_BPM:
+        return candidates
+    integer_part = int(np.floor(bpm))
+    for candidate_integer_part in (integer_part - 1, integer_part, integer_part + 1):
+        for fractional_part in _FRACTIONAL_BPM_PARTS:
+            candidate_bpm = float(candidate_integer_part) + fractional_part
+            if abs(candidate_bpm - bpm) <= _FRACTIONAL_BPM_SEARCH_RADIUS:
+                candidates.append(candidate_bpm)
+    return sorted(candidates, key=lambda candidate_bpm: (abs(candidate_bpm - bpm), candidate_bpm))
+
+
 def _limit_bpm_candidates_by_grid_count(
     candidate_bpms: NDArray[np.float64],
     *,
@@ -157,7 +204,7 @@ def _best_grid_candidate(
         return -np.inf, -np.inf, config.min_bpm, 60000.0 / config.min_bpm, 0.0
 
     sorted_candidates = sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
-    best_candidate = sorted_candidates[0]
+    best_candidate = _best_grid_candidate_with_fractional_margin(sorted_candidates, config=config)
     if downbeat_centered_signal is None or downbeat_signal_norm == 0.0:
         return (
             float(best_candidate.score),
@@ -287,6 +334,34 @@ def _best_downbeat_grid_fit(
             best_score = score
             best_offset_ms = candidate_offset_ms
     return float(best_score), best_offset_ms
+
+
+def _best_grid_candidate_with_fractional_margin(
+    sorted_candidates: Sequence[_GridCandidate],
+    *,
+    config: GridFitterConfig,
+) -> _GridCandidate:
+    best_candidate = sorted_candidates[0]
+    if not _uses_fractional_bpm_candidate(best_candidate.bpm, config=config):
+        return best_candidate
+
+    best_coarse_candidate = next(
+        (
+            candidate
+            for candidate in sorted_candidates
+            if not _uses_fractional_bpm_candidate(candidate.bpm, config=config)
+        ),
+        None,
+    )
+    if best_coarse_candidate is None:
+        return best_candidate
+    if best_candidate.score >= best_coarse_candidate.score + _FRACTIONAL_BPM_SCORE_MARGIN:
+        return best_candidate
+    return best_coarse_candidate
+
+
+def _uses_fractional_bpm_candidate(bpm: float, *, config: GridFitterConfig) -> bool:
+    return abs(_quantize_bpm(bpm, config=config) - bpm) > 1e-6
 
 
 def _grid_candidate_is_better(
