@@ -1,5 +1,5 @@
 ---
-pinned_commit: 666b9df63582b4bac412fec59017e11c233f8d81
+pinned_commit: 85b7e196aca1596e4170cb218c43e33941ecbedd
 status: frozen
 date: 2026-05-04
 owner: s3d-i
@@ -69,15 +69,15 @@ target_valid_mask[b, i] =
 - 12 value channels from `VALUE_FEATURE_NAMES`
 - 8 confidence channels from `CONFIDENCE_FEATURE_NAMES`
 
-The model predicts both during training:
+The model predicts value and confidence channels during training:
 
 - `value_pred`: `[B, 100, 12]`
 - `confidence_pred`: `[B, 100, 8]`
-- `compound_confidence_pred`: `[B, 100, 1]`
 
 The 8 confidence channels are training and diagnostics signals. They are not
 part of the downstream mapper contract. The single compound confidence scalar is
-reserved for diagnostics and possible mapper ablations.
+reserved for diagnostics and possible mapper ablations, but it is derived from
+the predicted `control_confidence` channel instead of learned by a separate head.
 
 `ln_change_n_eff_target` is not part of `control_v3_target`, is not predicted by
 the model, and is not part of the downstream mapper contract. Load it from the
@@ -93,7 +93,7 @@ Expose this output object:
 class ControlEncoderOutput:
     value_pred: torch.Tensor                  # [B, 100, 12]
     confidence_pred: torch.Tensor             # [B, 100, 8]
-    compound_confidence_pred: torch.Tensor    # [B, 100, 1]
+    compound_confidence_pred: torch.Tensor    # [B, 100, 1], derived alias
     control_memory: torch.Tensor              # [B, 600, D]
     memory_padding_mask: torch.Tensor         # [B, 600]
 ```
@@ -118,7 +118,8 @@ mel/timing context
   -> difficulty FiLM after each block
   -> full context hidden states = control_memory
   -> center 100-frame slice
-  -> value, confidence, and compound-confidence heads
+  -> value and confidence heads
+  -> derived compound-confidence output
 ```
 
 ### Input Features
@@ -195,40 +196,70 @@ Heads:
 
 - `value_head`: `D -> 12`
 - `confidence_head`: `D -> 8`
-- `compound_confidence_head`: `D -> 1`
 
 Apply output ranges:
 
 - value channels: clamp or sigmoid only where the target contract requires
   `[0, 1]`; otherwise allow signed outputs such as `hand_balance_signed`
 - confidence channels: sigmoid
-- compound confidence: sigmoid
 
 Do not silently change target semantics. Use feature-name based range handling.
+
+Derive:
+
+```text
+compound_confidence_pred =
+  confidence_pred[..., control_confidence_index : control_confidence_index + 1]
+```
+
+Do not add an independent compound-confidence head in the first implementation.
 
 ## Loss
 
 Do not train with flat MSE over all 20 channels.
 
-Use three loss groups:
+Use two loss groups:
 
 ```text
 total_loss =
   value_loss
   + confidence_loss_weight * confidence_loss
-  + compound_confidence_loss_weight * compound_confidence_loss
 ```
 
 Recommended starting weights:
 
 - `confidence_loss_weight = 0.25`
-- `compound_confidence_loss_weight = 0.10`
 
 ### Value Loss
 
-Use confidence-weighted regression for the 12 value channels. Confidence weights
-come from the target confidence channels, not predicted confidence. Every value
-loss term is also multiplied by `target_valid_mask`.
+Use robust weighted regression for the 12 value channels. These channels are
+continuous control strengths, not binary labels; do not replace the primary
+value loss with BCE or focal BCE.
+
+For each value feature `f`:
+
+```text
+loss_f = weighted_mean(
+  smooth_l1(pred_f - target_f, delta[f]),
+  target_valid_mask
+    * confidence_weight[f]
+    * feature_weight[f]
+    * sparse_multiplier[f]
+)
+```
+
+Confidence weights come from target confidence channels, not predicted
+confidence. Normalize weighted losses by the sum of effective weights, not by
+`B * 100`, so masked target tails, low-support LN-change frames, and sparse
+boosting do not change loss scale accidentally.
+
+Use configurable Huber/SmoothL1 deltas. Starting values:
+
+```text
+density_level, ln_change_rate_gated    0.20
+bounded [0, 1] value channels          0.10
+hand_balance_signed                    0.10
+```
 
 Feature families:
 
@@ -242,8 +273,12 @@ hand_balance_signed                 -> hand_confidence
 hand_imbalance_abs                  -> hand_confidence
 repeat_exact, repeat_shift,
 repeat_motion                       -> repeat_confidence
-hold_occupancy                      -> control_confidence
+hold_occupancy                      -> 1.0
 ```
+
+`hold_occupancy` is deterministic LN interval occupancy. It should only be
+weighted by `target_valid_mask`, not by `control_confidence`,
+`density_confidence`, or any unrelated support signal.
 
 For `ln_change_rate_gated`, also multiply by a support weight derived from
 `ln_change_n_eff_target`:
@@ -255,6 +290,11 @@ ln_change_support_weight =
 
 This keeps full weight at the audit threshold `n_eff >= 3.0`, fades partial
 support between `2.0` and `3.0`, and masks very weak support below `2.0`.
+
+If `ln_change_n_eff_target` is not loaded in a first smoke implementation, state
+that the run is confidence-only for LN-change and set
+`ln_change_support_weight = 1.0`. Do not pretend support-aware weighting is
+active without the diagnostic sidecar.
 
 Apply feature weights:
 
@@ -273,26 +313,66 @@ repeat_shift            1.00
 repeat_motion           1.00
 ```
 
-Use MSE for the first implementation. Huber loss is allowed later only after a
-measured reason. Normalize weighted losses by the sum of effective weights, not
-by `B * 100`, so masked target tails and low-support LN-change frames do not
-shrink the loss scale.
+Sparse continuous features need target-dependent balancing in addition to the
+static feature weights. Apply sparse balancing to:
+
+```text
+jack_excess
+hand_imbalance_abs
+repeat_exact
+repeat_shift
+repeat_motion
+```
+
+Use:
+
+```text
+sparse_multiplier[f] =
+  1 + sparse_boost[f] * smoothstep(target_f, sparse_low[f], sparse_high[f])
+```
+
+Starting defaults:
+
+```text
+sparse_low[f] = 0.10
+sparse_high[f] = 0.50
+sparse_boost[f] = 4.0
+```
+
+Allow `sparse_boost` up to `8.0` if validation shows systematic positive-target
+underprediction. Do not apply sparse boost to `jack_streak_exposure` initially;
+it is much less sparse and should first train with `jack_streak_confidence`.
+
+For `hand_balance_signed`, train the sign only when the target has meaningful
+hand imbalance:
+
+```text
+hand_balance_weight =
+  target_valid_mask
+  * hand_confidence
+  * feature_weight[hand_balance_signed]
+  * clip(target_hand_imbalance_abs / 0.25, 0, 1)
+```
+
+Mirror augmentation must flip `hand_balance_signed`.
 
 ### Confidence Loss
 
-Train confidence predictions against the 8 target confidence channels using MSE
-or BCE-with-logits. If the head applies sigmoid, use MSE.
+Train confidence predictions against the 8 target confidence channels. Use MSE
+or Huber on sigmoid outputs. If the implementation keeps pre-sigmoid logits for
+loss computation, soft BCE-with-logits is also allowed, but the exposed
+`confidence_pred` must remain sigmoid-ranged. Every confidence loss term is
+multiplied by `target_valid_mask`.
 
-### Compound Confidence Target
+The `control_confidence` target is already one of the 8 target confidence
+channels. Supervise it directly as part of `confidence_loss`.
 
-Define the compound confidence target as the mean of the 8 target confidence
-channels:
+### Compound Confidence Output
 
-```text
-compound_confidence_target = mean(target_confidence_channels, dim=-1)
-```
-
-This scalar is diagnostic and reserved for future mapper ablations.
+Do not define a separate `compound_confidence_target` as
+`mean(target_confidence_channels)`. The 8 channels already include
+`control_confidence`, which is itself the Stage 1 aggregate confidence. Expose
+`compound_confidence_pred` as the predicted `control_confidence` channel.
 
 ## Metrics
 
@@ -301,14 +381,16 @@ Report at least:
 - total loss
 - value loss
 - confidence loss
-- compound confidence loss
 - per-value-feature MAE
-- per-value-feature weighted MSE
+- per-value-feature weighted Huber/SmoothL1
 - per-confidence-feature MAE
-- compound confidence MAE
+- control/compound confidence MAE
 - target valid frame rate
 - masked target frame count
 - `ln_change_rate_gated` support-weight mean and masked frame count
+- sparse positive-frame MAE for `jack_excess`, `hand_imbalance_abs`, and
+  `repeat_*` where target is at least `0.50`
+- sparse positive-window max-target versus max-pred MAE
 
 Keep metrics keyed by feature name.
 
@@ -344,10 +426,12 @@ Implement in this order:
 3. Control encoder model and output dataclass.
 4. Unit tests for model shapes, mask handling, FiLM identity initialization,
    and parameter budget.
-5. Loss module with feature-name based confidence weighting, `target_valid_mask`,
-   and `ln_change_n_eff_target` support weighting.
+5. Loss module with robust value regression, feature-name based confidence
+   weighting, `target_valid_mask`, sparse balancing, and
+   `ln_change_n_eff_target` support weighting.
 6. Unit tests for loss channel mapping, confidence weighting, target masking,
-   and LN-change support weighting.
+   sparse balancing, hand-balance magnitude gating, LN-change support weighting,
+   and derived compound-confidence output.
 7. Training entrypoint with synthetic smoke mode.
 8. Checkpoint/resume tests.
 9. Tiny overfit run on a small subset.
