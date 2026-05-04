@@ -16,6 +16,7 @@ from train.stage_2.training.control import (
     load_run_config,
     main,
     metrics_for_loader,
+    run_control_training,
     run_synthetic_smoke,
     split_train_eval_dataset,
 )
@@ -306,6 +307,7 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                         "seed: 2026",
                         "device: cpu",
                         "resume_from: checkpoint.pt",
+                        "final-train-eval-size: 5",
                         "synthetic_smoke: true",
                         "model:",
                         "  d_model: 24",
@@ -328,7 +330,18 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                 ),
             ) as run_smoke:
                 with redirect_stdout(io.StringIO()):
-                    main(["--config", str(config_path), "--max-steps", "6", "--d-model", "32"])
+                    main(
+                        [
+                            "--config",
+                            str(config_path),
+                            "--max-steps",
+                            "6",
+                            "--d-model",
+                            "32",
+                            "--final-train-eval-size",
+                            "3",
+                        ]
+                    )
 
         kwargs = run_smoke.call_args.kwargs
         self.assertEqual(kwargs["output_dir"], Path("configured-out"))
@@ -339,9 +352,44 @@ class Stage2ControlTrainingTests(unittest.TestCase):
         self.assertEqual(kwargs["seed"], 2026)
         self.assertEqual(kwargs["device_name"], "cpu")
         self.assertEqual(kwargs["resume_from"], Path("checkpoint.pt"))
+        self.assertEqual(kwargs["final_train_eval_size"], 3)
         self.assertEqual(kwargs["model_config_overrides"]["d_model"], 32)
         self.assertEqual(kwargs["model_config_overrides"]["heads"], 4)
         self.assertEqual(kwargs["loss_config_overrides"]["sparse_boost"], 2.0)
+
+    def test_run_control_training_limits_final_train_eval_loader(self) -> None:
+        dataset = _MetadataOnlyDataset(
+            [{"beatmap_path": f"maps/{index}.osu"} for index in range(10)]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("train.stage_2.training.control.ControlWindowDataset", return_value=dataset):
+                with patch(
+                    "train.stage_2.training.control._run_training",
+                    return_value=ControlTrainingResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_value_loss=0.0,
+                        final_confidence_loss=0.0,
+                        completed_steps=1,
+                    ),
+                ) as run_training:
+                    run_control_training(
+                        output_dir=Path(tmpdir),
+                        max_steps=1,
+                        batch_size=2,
+                        device_name="cpu",
+                        eval_fraction=0.0,
+                        eval_size=0,
+                        final_train_eval_size=3,
+                    )
+
+        kwargs = run_training.call_args.kwargs
+        self.assertEqual(len(kwargs["train_eval_loader"].dataset), 3)
+        self.assertEqual(kwargs["dataset_report"]["train_window_count"], 10)
+        self.assertEqual(kwargs["dataset_report"]["final_train_eval_size"], 3)
+        self.assertEqual(kwargs["dataset_report"]["final_train_eval_window_count"], 3)
 
 
 class _MetadataOnlyDataset:

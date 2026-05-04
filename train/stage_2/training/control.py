@@ -32,6 +32,7 @@ from train.stage_2.model_control import (
 CHECKPOINT_SCHEMA_VERSION = 1
 DEFAULT_RUNS_ROOT = Path("train/artifacts/runs/stage2_control")
 DEFAULT_OUTPUT_DIR = DEFAULT_RUNS_ROOT / "control_encoder"
+DEFAULT_FINAL_TRAIN_EVAL_SIZE = 1024
 RUN_CONFIG_KEYS = {
     "dataset_root",
     "index_path",
@@ -50,6 +51,7 @@ RUN_CONFIG_KEYS = {
     "resume_from",
     "eval_fraction",
     "eval_size",
+    "final_train_eval_size",
     "num_workers",
     "synthetic_smoke",
     "model",
@@ -120,6 +122,7 @@ def run_synthetic_smoke(
     seed: int = 1337,
     device_name: str = "auto",
     resume_from: Path | None = None,
+    final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
 ) -> ControlTrainingResult:
@@ -135,15 +138,26 @@ def run_synthetic_smoke(
     model_config = ControlEncoderConfig(**model_defaults)
     loss_config = ControlLossConfig(**dict(loss_config_overrides or {}))
     samples = _synthetic_control_samples()
+    train_eval_dataset = limit_final_train_eval_dataset(
+        samples,
+        final_train_eval_size=final_train_eval_size,
+        seed=seed,
+    )
     loader = DataLoader(
         samples,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_control_windows,
     )
+    train_eval_loader = DataLoader(
+        train_eval_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_control_windows,
+    )
     return _run_training(
         loader=loader,
-        train_eval_loader=loader,
+        train_eval_loader=train_eval_loader,
         eval_loader=loader,
         output_dir=output_dir,
         model_config=model_config,
@@ -156,7 +170,12 @@ def run_synthetic_smoke(
         seed=seed,
         device_name=device_name,
         run_name="synthetic_smoke",
-        dataset_report={"status": "synthetic_smoke", "sample_count": len(samples)},
+        dataset_report={
+            "status": "synthetic_smoke",
+            "sample_count": len(samples),
+            "final_train_eval_size": final_train_eval_size,
+            "final_train_eval_window_count": len(train_eval_dataset),
+        },
         resume_from=resume_from,
     )
 
@@ -180,6 +199,7 @@ def run_control_training(
     resume_from: Path | None = None,
     eval_fraction: float = 0.1,
     eval_size: int | None = None,
+    final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     num_workers: int = 0,
     model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
@@ -223,8 +243,13 @@ def run_control_training(
         num_workers=num_workers,
         collate_fn=collate_control_windows,
     )
-    train_eval_loader = DataLoader(
+    train_eval_dataset = limit_final_train_eval_dataset(
         train_dataset,
+        final_train_eval_size=final_train_eval_size,
+        seed=seed,
+    )
+    train_eval_loader = DataLoader(
+        train_eval_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -259,6 +284,8 @@ def run_control_training(
             "eval_index_path": eval_index_path.as_posix() if eval_index_path is not None else None,
             "eval_fraction": eval_fraction,
             "eval_size": eval_size,
+            "final_train_eval_size": final_train_eval_size,
+            "final_train_eval_window_count": len(train_eval_dataset),
         },
         resume_from=resume_from,
     )
@@ -297,6 +324,25 @@ def split_train_eval_dataset(
             seed=seed,
         )
     return Subset(dataset, train_indices), Subset(dataset, eval_indices)
+
+
+def limit_final_train_eval_dataset(
+    dataset: Dataset[Any],
+    *,
+    final_train_eval_size: int | None,
+    seed: int,
+) -> Dataset[Any]:
+    if final_train_eval_size is None:
+        return dataset
+    resolved_size = int(final_train_eval_size)
+    if resolved_size < 0:
+        raise ValueError(f"final_train_eval_size must be non-negative, got {final_train_eval_size}")
+    count = len(dataset)
+    if resolved_size >= count:
+        return dataset
+    indices = list(range(count))
+    random.Random(seed).shuffle(indices)
+    return Subset(dataset, sorted(indices[:resolved_size]))
 
 
 def _split_indices_by_window(count: int, eval_size: int, seed: int) -> tuple[list[int], list[int]]:
@@ -1075,6 +1121,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--resume-from", default=config_defaults.get("resume_from"))
     parser.add_argument("--eval-fraction", type=float, default=config_defaults.get("eval_fraction", 0.1))
     parser.add_argument("--eval-size", type=int, default=config_defaults.get("eval_size"))
+    parser.add_argument(
+        "--final-train-eval-size",
+        type=int,
+        default=config_defaults.get("final_train_eval_size", DEFAULT_FINAL_TRAIN_EVAL_SIZE),
+    )
     parser.add_argument("--num-workers", type=int, default=config_defaults.get("num_workers", 0))
     parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
     parser.add_argument("--d-model", type=int, default=model_defaults.get("d_model"))
@@ -1110,6 +1161,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             seed=args.seed,
             device_name=args.device,
             resume_from=Path(args.resume_from) if args.resume_from is not None else None,
+            final_train_eval_size=args.final_train_eval_size,
             model_config_overrides=model_overrides,
             loss_config_overrides=loss_overrides,
         )
@@ -1136,6 +1188,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume_from=Path(args.resume_from) if args.resume_from is not None else None,
             eval_fraction=args.eval_fraction,
             eval_size=args.eval_size,
+            final_train_eval_size=args.final_train_eval_size,
             num_workers=args.num_workers,
             model_config_overrides=model_overrides,
             loss_config_overrides=loss_overrides,
