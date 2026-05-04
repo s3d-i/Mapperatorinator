@@ -1,5 +1,5 @@
 ---
-pinned_commit: 26cc8382e58199f78be581dbd1aee806315bb31c
+pinned_commit: 666b9df63582b4bac412fec59017e11c233f8d81
 status: frozen
 date: 2026-05-04
 owner: s3d-i
@@ -29,6 +29,10 @@ features:
 - `normalized_difficulty`: `[B]`, continuous scalar in `[-1, 1]`
 - `target_start_frame`: `[B]`
 - `control_v3_target`: `[B, 100, 20]`
+- `target_valid_mask`: `[B, 100]`, `True` means the target frame is inside
+  the song and may contribute to loss and metrics
+- `ln_change_n_eff_target`: `[B, 100]`, training-only diagnostic support for
+  `ln_change_rate_gated`
 
 The model must train on fixed 12 second contexts:
 
@@ -46,7 +50,17 @@ target_offset_in_context = 250
 ```
 
 Out-of-song context frames are zero padded and marked in the context padding
-mask. The target remains exactly `target_start_frame : target_start_frame + 100`.
+mask. The target remains aligned to
+`target_start_frame : target_start_frame + 100`, but target frames beyond
+`frame_count` must have `target_valid_mask=False`.
+
+The target tensor may keep zero-filled out-of-song values for fixed shape, but
+all target losses and target metrics must ignore those frames. Compute:
+
+```text
+target_valid_mask[b, i] =
+  target_start_frame[b] + i < frame_count[b]
+```
 
 ## Targets
 
@@ -64,6 +78,11 @@ The model predicts both during training:
 The 8 confidence channels are training and diagnostics signals. They are not
 part of the downstream mapper contract. The single compound confidence scalar is
 reserved for diagnostics and possible mapper ablations.
+
+`ln_change_n_eff_target` is not part of `control_v3_target`, is not predicted by
+the model, and is not part of the downstream mapper contract. Load it from the
+`ln_change_n_eff` diagnostic column in the saved `control_v3` time series and
+resample it onto the same 100 target frame centers as `control_v3_target`.
 
 ## Downstream Contract
 
@@ -208,7 +227,8 @@ Recommended starting weights:
 ### Value Loss
 
 Use confidence-weighted regression for the 12 value channels. Confidence weights
-come from the target confidence channels, not predicted confidence.
+come from the target confidence channels, not predicted confidence. Every value
+loss term is also multiplied by `target_valid_mask`.
 
 Feature families:
 
@@ -224,6 +244,17 @@ repeat_exact, repeat_shift,
 repeat_motion                       -> repeat_confidence
 hold_occupancy                      -> control_confidence
 ```
+
+For `ln_change_rate_gated`, also multiply by a support weight derived from
+`ln_change_n_eff_target`:
+
+```text
+ln_change_support_weight =
+  clip((ln_change_n_eff_target - 2.0) / 1.0, 0, 1)
+```
+
+This keeps full weight at the audit threshold `n_eff >= 3.0`, fades partial
+support between `2.0` and `3.0`, and masks very weak support below `2.0`.
 
 Apply feature weights:
 
@@ -243,7 +274,9 @@ repeat_motion           1.00
 ```
 
 Use MSE for the first implementation. Huber loss is allowed later only after a
-measured reason.
+measured reason. Normalize weighted losses by the sum of effective weights, not
+by `B * 100`, so masked target tails and low-support LN-change frames do not
+shrink the loss scale.
 
 ### Confidence Loss
 
@@ -273,6 +306,9 @@ Report at least:
 - per-value-feature weighted MSE
 - per-confidence-feature MAE
 - compound confidence MAE
+- target valid frame rate
+- masked target frame count
+- `ln_change_rate_gated` support-weight mean and masked frame count
 
 Keep metrics keyed by feature name.
 
@@ -287,6 +323,9 @@ Required behavior:
 - device selection: `auto`, `cpu`, `mps`, `cuda`
 - DataLoader using existing `ControlWindowDataset`
 - fixed 12s context slicing in collate or a wrapper dataset
+- `target_valid_mask` generation before loss computation
+- `ln_change_n_eff_target` loading or derivation for support-aware
+  `ln_change_rate_gated` loss
 - train/eval split support before trusting larger runs
 - checkpoint save and resume
 - JSON report under `train/artifacts/runs/stage2_control/`
@@ -298,13 +337,17 @@ Use `uv run` for all Python commands.
 Implement in this order:
 
 1. `ControlContextDataset` or context-collate helper that converts full-song
-   batch tensors into `[B, 600, 160]`, `[B, 600, 4]`, and masks.
-2. Unit tests for context slicing at song start, middle, and song end.
+   batch tensors into `[B, 600, 160]`, `[B, 600, 4]`, context masks, and
+   `target_valid_mask`.
+2. Unit tests for context slicing and target masks at song start, middle, and
+   song end.
 3. Control encoder model and output dataclass.
 4. Unit tests for model shapes, mask handling, FiLM identity initialization,
    and parameter budget.
-5. Loss module with feature-name based confidence weighting.
-6. Unit tests for loss channel mapping and confidence weighting.
+5. Loss module with feature-name based confidence weighting, `target_valid_mask`,
+   and `ln_change_n_eff_target` support weighting.
+6. Unit tests for loss channel mapping, confidence weighting, target masking,
+   and LN-change support weighting.
 7. Training entrypoint with synthetic smoke mode.
 8. Checkpoint/resume tests.
 9. Tiny overfit run on a small subset.

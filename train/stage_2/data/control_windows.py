@@ -145,6 +145,10 @@ class ControlWindowDataset(Dataset):
             "full_mel": full_mel,
             "full_dense_timing_v2": full_dense_timing_v2,
             "control_v3_target": control_v3_target,
+            "target_valid_mask": target_valid_mask(
+                target_start_frame=record.target_start_frame,
+                frame_count=record.frame_count,
+            ),
             "difficulty": torch.tensor(record.difficulty, dtype=torch.float32),
             "normalized_difficulty": torch.tensor(normalize_difficulty(record.difficulty), dtype=torch.float32),
             "target_start_frame": torch.tensor(record.target_start_frame, dtype=torch.long),
@@ -314,6 +318,9 @@ def collate_control_windows(samples: Sequence[dict[str, Any]]) -> dict[str, Any]
         "control_v3_target": torch.stack(
             [_validate_control_v3_target(sample["control_v3_target"], source=sample["beatmap_path"]) for sample in samples]
         ),
+        "target_valid_mask": torch.stack(
+            [_validate_target_valid_mask(sample["target_valid_mask"], source=sample["beatmap_path"]) for sample in samples]
+        ),
         "difficulty": torch.stack([sample["difficulty"] for sample in samples]).reshape(batch_size),
         "normalized_difficulty": torch.stack([sample["normalized_difficulty"] for sample in samples]).reshape(batch_size),
         "target_start_frame": torch.stack([sample["target_start_frame"] for sample in samples]).reshape(batch_size),
@@ -431,6 +438,13 @@ def iter_target_start_frames(frame_count: int) -> range:
     if frame_count < 0:
         raise ValueError(f"frame_count must be non-negative, got {frame_count!r}")
     return range(0, frame_count, TARGET_WINDOW_STRIDE_FRAMES)
+
+
+def target_valid_mask(*, target_start_frame: int, frame_count: int) -> torch.Tensor:
+    target_start_frame = _validate_nonnegative_int(target_start_frame, "target_start_frame")
+    frame_count = _validate_positive_int(frame_count, "frame_count")
+    frame_offsets = torch.arange(TARGET_WINDOW_LENGTH_FRAMES, dtype=torch.long)
+    return target_start_frame + frame_offsets < frame_count
 
 
 def normalize_difficulty(difficulty: float) -> float:
@@ -687,6 +701,23 @@ def _validate_control_v3_target(value: Any, *, source: object) -> torch.Tensor:
     confidence = tensor[:, confidence_indexes]
     if torch.any((confidence < 0.0) | (confidence > 1.0)):
         raise ValueError(f"control_v3_target confidence channels for {source} must be in [0, 1]")
+    return tensor.contiguous()
+
+
+def _validate_target_valid_mask(value: Any, *, source: object) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if tensor.dtype != torch.bool:
+            raise ValueError(f"target_valid_mask for {source} must be bool, got {tensor.dtype}")
+    else:
+        array = np.asarray(value)
+        if array.dtype != np.bool_:
+            raise ValueError(f"target_valid_mask for {source} must be bool, got {array.dtype}")
+        tensor = torch.from_numpy(np.ascontiguousarray(array))
+
+    expected_shape = (TARGET_WINDOW_LENGTH_FRAMES,)
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(f"target_valid_mask for {source} must have shape {expected_shape}, got {tuple(tensor.shape)}")
     return tensor.contiguous()
 
 

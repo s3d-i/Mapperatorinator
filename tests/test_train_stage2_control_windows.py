@@ -14,6 +14,7 @@ from train.stage_2.data.control_windows import (
     build_control_window_index,
     collate_control_windows,
     normalize_difficulty,
+    target_valid_mask,
 )
 from train.stage_2.features.control_v3_targets import CONFIDENCE_FEATURE_NAMES, MODEL_FEATURE_NAMES
 
@@ -91,6 +92,10 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
             self.assertEqual(sample["full_mel"].shape, (250, 160))
             self.assertEqual(sample["full_dense_timing_v2"].shape, (250, 4))
             self.assertEqual(sample["control_v3_target"].shape, (100, 20))
+            self.assertEqual(sample["target_valid_mask"].shape, (100,))
+            self.assertEqual(sample["target_valid_mask"].dtype, torch.bool)
+            self.assertTrue(sample["target_valid_mask"][:50].all())
+            self.assertFalse(sample["target_valid_mask"][50:].any())
             self.assertEqual(sample["difficulty"].dtype, torch.float32)
             self.assertEqual(sample["normalized_difficulty"].dtype, torch.float32)
             self.assertAlmostEqual(float(sample["difficulty"].item()), 2.5)
@@ -118,6 +123,11 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
             self.assertEqual(batch["full_mel"].shape, (2, 250, 160))
             self.assertEqual(batch["full_dense_timing_v2"].shape, (2, 250, 4))
             self.assertEqual(batch["control_v3_target"].shape, (2, 100, 20))
+            self.assertEqual(batch["target_valid_mask"].shape, (2, 100))
+            self.assertEqual(batch["target_valid_mask"].dtype, torch.bool)
+            self.assertTrue(batch["target_valid_mask"][0].all())
+            self.assertTrue(batch["target_valid_mask"][1, :75].all())
+            self.assertFalse(batch["target_valid_mask"][1, 75:].any())
             self.assertFalse(batch["padding_mask"][0].any())
             self.assertFalse(batch["padding_mask"][1, :75].any())
             self.assertTrue(batch["padding_mask"][1, 75:].all())
@@ -287,6 +297,20 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
         self.assertEqual(normalize_difficulty(6.0), 1.0)
         with self.assertRaisesRegex(ValueError, "difficulty outside"):
             normalize_difficulty(6.01)
+
+    def test_target_valid_mask_marks_only_in_song_target_frames(self) -> None:
+        full = target_valid_mask(target_start_frame=0, frame_count=250)
+        self.assertTrue(full.all())
+
+        tail = target_valid_mask(target_start_frame=200, frame_count=250)
+        self.assertEqual(int(tail.sum().item()), 50)
+        self.assertTrue(tail[:50].all())
+        self.assertFalse(tail[50:].any())
+
+        short = target_valid_mask(target_start_frame=0, frame_count=75)
+        self.assertEqual(int(short.sum().item()), 75)
+        self.assertTrue(short[:75].all())
+        self.assertFalse(short[75:].any())
 
     def test_rejects_index_paths_that_escape_shard_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
