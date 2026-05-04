@@ -75,6 +75,7 @@ class ControlWindowRecord:
 
 
 ControlV3TargetLoader = Callable[[ControlWindowRecord], Any]
+LnChangeNEffTargetLoader = Callable[[ControlWindowRecord], Any]
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,8 @@ class ControlWindowDataset(Dataset):
         mel_loader: FullMelLoader | None = None,
         timing_loader: DenseTimingV2Loader | None = None,
         target_loader: ControlV3TargetLoader | None = None,
+        ln_change_n_eff_target_loader: LnChangeNEffTargetLoader | None = None,
+        allow_missing_ln_change_n_eff_target: bool = False,
         control_v3_timeseries_path: str | Path = DEFAULT_CONTROL_V3_TIMESERIES_PATH,
         max_cached_maps: int = 128,
         progress: bool = False,
@@ -115,6 +118,18 @@ class ControlWindowDataset(Dataset):
         self.mel_loader = _default_load_full_song_packed_mel if mel_loader is None else mel_loader
         self.timing_loader = _default_load_oracle_dense_timing_v2 if timing_loader is None else timing_loader
         self.target_loader = self._default_load_control_v3_target_window if target_loader is None else target_loader
+        if ln_change_n_eff_target_loader is None:
+            if target_loader is None:
+                self.ln_change_n_eff_target_loader = self._default_load_ln_change_n_eff_target_window
+            elif allow_missing_ln_change_n_eff_target:
+                self.ln_change_n_eff_target_loader = _full_support_ln_change_n_eff_target
+            else:
+                raise ValueError(
+                    "custom target_loader requires ln_change_n_eff_target_loader, "
+                    "or set allow_missing_ln_change_n_eff_target=True for explicit full-support smoke data"
+                )
+        else:
+            self.ln_change_n_eff_target_loader = ln_change_n_eff_target_loader
         self.max_cached_maps = _validate_cache_size(max_cached_maps)
         self._full_mel_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._dense_timing_cache: OrderedDict[tuple[str, int], torch.Tensor] = OrderedDict()
@@ -145,6 +160,10 @@ class ControlWindowDataset(Dataset):
             "full_mel": full_mel,
             "full_dense_timing_v2": full_dense_timing_v2,
             "control_v3_target": control_v3_target,
+            "ln_change_n_eff_target": _validate_ln_change_n_eff_target(
+                self.ln_change_n_eff_target_loader(record),
+                source=record.beatmap_path,
+            ),
             "target_valid_mask": target_valid_mask(
                 target_start_frame=record.target_start_frame,
                 frame_count=record.frame_count,
@@ -280,6 +299,13 @@ class ControlWindowDataset(Dataset):
         rows = _default_control_v3_rows(self.control_v3_timeseries_path.as_posix(), _target_selector(record))
         return slice_control_v3_target_window(rows, window_start_s)
 
+    def _default_load_ln_change_n_eff_target_window(self, record: ControlWindowRecord) -> Any:
+        from train.stage_2.features.control_v3_targets import slice_ln_change_n_eff_target_window
+
+        window_start_s = record.target_start_frame * FRAME_HOP_MS / 1000.0
+        rows = _default_control_v3_rows(self.control_v3_timeseries_path.as_posix(), _target_selector(record))
+        return slice_ln_change_n_eff_target_window(rows, window_start_s)
+
 
 def collate_control_windows(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if not samples:
@@ -317,6 +343,12 @@ def collate_control_windows(samples: Sequence[dict[str, Any]]) -> dict[str, Any]
         "frame_count": torch.tensor(frame_counts, dtype=torch.long),
         "control_v3_target": torch.stack(
             [_validate_control_v3_target(sample["control_v3_target"], source=sample["beatmap_path"]) for sample in samples]
+        ),
+        "ln_change_n_eff_target": torch.stack(
+            [
+                _validate_ln_change_n_eff_target(sample["ln_change_n_eff_target"], source=sample["beatmap_path"])
+                for sample in samples
+            ]
         ),
         "target_valid_mask": torch.stack(
             [_validate_target_valid_mask(sample["target_valid_mask"], source=sample["beatmap_path"]) for sample in samples]
@@ -721,6 +753,16 @@ def _validate_target_valid_mask(value: Any, *, source: object) -> torch.Tensor:
     return tensor.contiguous()
 
 
+def _validate_ln_change_n_eff_target(value: Any, *, source: object) -> torch.Tensor:
+    tensor = _as_float32_tensor(value, name="ln_change_n_eff_target", source=source)
+    expected_shape = (TARGET_WINDOW_LENGTH_FRAMES,)
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(f"ln_change_n_eff_target for {source} must have shape {expected_shape}, got {tuple(tensor.shape)}")
+    if torch.any(tensor < 0.0):
+        raise ValueError(f"ln_change_n_eff_target for {source} must be non-negative")
+    return tensor.contiguous()
+
+
 def _validate_feature_matrix(
     value: Any,
     *,
@@ -772,13 +814,17 @@ def _default_load_oracle_dense_timing_v2(beatmap_path: Path, frame_count: int) -
     return render_oracle_dense_timing_v2(beatmap_path, frame_count=frame_count)
 
 
+def _full_support_ln_change_n_eff_target(_record: ControlWindowRecord) -> torch.Tensor:
+    return torch.full((TARGET_WINDOW_LENGTH_FRAMES,), 3.0, dtype=torch.float32)
+
+
 @lru_cache(maxsize=128)
 def _default_control_v3_rows(timeseries_path: str, selector: tuple[str, int]) -> pd.DataFrame:
     from train.stage_2.features.control_v3_targets import load_control_v3_timeseries_rows
 
     field, value = selector
     kwargs = {field: value}
-    rows = load_control_v3_timeseries_rows(timeseries_path, **kwargs)
+    rows = load_control_v3_timeseries_rows(timeseries_path, include_ln_change_n_eff=True, **kwargs)
     if rows is None:
         raise FileNotFoundError(f"control_v3 timeseries rows not found for {field}={value}")
     return rows

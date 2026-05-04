@@ -16,7 +16,11 @@ from train.stage_2.data.control_windows import (
     normalize_difficulty,
     target_valid_mask,
 )
-from train.stage_2.features.control_v3_targets import CONFIDENCE_FEATURE_NAMES, MODEL_FEATURE_NAMES
+from train.stage_2.features.control_v3_targets import (
+    CONFIDENCE_FEATURE_NAMES,
+    LN_CHANGE_N_EFF_FEATURE_NAME,
+    MODEL_FEATURE_NAMES,
+)
 
 
 def _index_frame() -> pd.DataFrame:
@@ -81,6 +85,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                 mel_loader=_mel_loader,
                 timing_loader=_timing_loader,
                 target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
             )
 
             self.assertEqual(dataset.source_map_count, 4)
@@ -92,6 +97,8 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
             self.assertEqual(sample["full_mel"].shape, (250, 160))
             self.assertEqual(sample["full_dense_timing_v2"].shape, (250, 4))
             self.assertEqual(sample["control_v3_target"].shape, (100, 20))
+            self.assertEqual(sample["ln_change_n_eff_target"].shape, (100,))
+            self.assertTrue(torch.equal(sample["ln_change_n_eff_target"], torch.full((100,), 3.0)))
             self.assertEqual(sample["target_valid_mask"].shape, (100,))
             self.assertEqual(sample["target_valid_mask"].dtype, torch.bool)
             self.assertTrue(sample["target_valid_mask"][:50].all())
@@ -116,6 +123,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                 mel_loader=_mel_loader,
                 timing_loader=_timing_loader,
                 target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
             )
 
             batch = collate_control_windows([dataset[0], dataset[3]])
@@ -123,6 +131,8 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
             self.assertEqual(batch["full_mel"].shape, (2, 250, 160))
             self.assertEqual(batch["full_dense_timing_v2"].shape, (2, 250, 4))
             self.assertEqual(batch["control_v3_target"].shape, (2, 100, 20))
+            self.assertEqual(batch["ln_change_n_eff_target"].shape, (2, 100))
+            self.assertTrue(torch.equal(batch["ln_change_n_eff_target"], torch.full((2, 100), 3.0)))
             self.assertEqual(batch["target_valid_mask"].shape, (2, 100))
             self.assertEqual(batch["target_valid_mask"].dtype, torch.bool)
             self.assertTrue(batch["target_valid_mask"][0].all())
@@ -152,6 +162,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                 mel_loader=_mel_loader,
                 timing_loader=bad_timing_loader,
                 target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
             )
             with self.assertRaisesRegex(ValueError, "full_dense_timing_v2"):
                 dataset[0]
@@ -165,9 +176,24 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                 mel_loader=_mel_loader,
                 timing_loader=_timing_loader,
                 target_loader=bad_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
             )
             with self.assertRaisesRegex(ValueError, "control_v3_target"):
                 dataset[0]
+
+    def test_custom_target_loader_requires_explicit_ln_change_sidecar_or_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "index.parquet"
+            _index_frame().iloc[[1]].to_parquet(index_path, index=False)
+
+            with self.assertRaisesRegex(ValueError, "ln_change_n_eff_target_loader"):
+                ControlWindowDataset(
+                    index_path=index_path,
+                    dataset_root=Path(tmpdir) / "mania-dataset",
+                    mel_loader=_mel_loader,
+                    timing_loader=_timing_loader,
+                    target_loader=_target_loader,
+                )
 
     def test_default_target_loader_reads_control_v3_artifact_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -189,6 +215,8 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
 
             sample = dataset[1]
             self.assertEqual(sample["control_v3_target"].shape, (100, 20))
+            self.assertEqual(sample["ln_change_n_eff_target"].shape, (100,))
+            self.assertAlmostEqual(float(sample["ln_change_n_eff_target"][0].item()), 5.01, places=5)
             self.assertAlmostEqual(float(sample["control_v3_target"][0, 0].item()), 4.01, places=5)
             self.assertEqual(int(sample["beatmap_id"].item()), 2)
 
@@ -283,6 +311,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                 mel_loader=init_safe_mel_loader,
                 timing_loader=_timing_loader,
                 target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
             )
             self.assertEqual(init_mel_calls, [])
             self.assertEqual(len(dataset), 4)
@@ -333,6 +362,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                     mel_loader=_mel_loader,
                     timing_loader=_timing_loader,
                     target_loader=_target_loader,
+                    allow_missing_ln_change_n_eff_target=True,
                 )
 
             pd.DataFrame(
@@ -353,6 +383,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                     mel_loader=_mel_loader,
                     timing_loader=_timing_loader,
                     target_loader=_target_loader,
+                    allow_missing_ln_change_n_eff_target=True,
                 )
 
             pd.DataFrame(
@@ -373,6 +404,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                     mel_loader=_mel_loader,
                     timing_loader=_timing_loader,
                     target_loader=_target_loader,
+                    allow_missing_ln_change_n_eff_target=True,
                 )
 
     def test_rejects_nonfinite_feature_values(self) -> None:
@@ -392,6 +424,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                     mel_loader=bad_mel_loader,
                     timing_loader=_timing_loader,
                     target_loader=_target_loader,
+                    allow_missing_ln_change_n_eff_target=True,
                 )
 
     def test_rejects_out_of_range_control_target_confidence(self) -> None:
@@ -410,6 +443,7 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
                 mel_loader=_mel_loader,
                 timing_loader=_timing_loader,
                 target_loader=bad_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
             )
             with self.assertRaisesRegex(ValueError, "confidence"):
                 dataset[0]
@@ -472,6 +506,7 @@ def _timeseries_frame(
             frame[name] = np.full(len(times), 0.5, dtype=np.float32)
         else:
             frame[name] = np.asarray(times, dtype=np.float32) + np.float32(value_offset + column_index)
+    frame[LN_CHANGE_N_EFF_FEATURE_NAME] = np.asarray(times, dtype=np.float32) + np.float32(3.0)
     return frame
 
 

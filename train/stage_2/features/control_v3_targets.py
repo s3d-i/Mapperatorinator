@@ -39,6 +39,7 @@ target_dim = TARGET_DIM
 
 TIME_COLUMN = "time_s"
 CONTROL_CONFIDENCE_FEATURE_NAME = "control_confidence"
+LN_CHANGE_N_EFF_FEATURE_NAME = "ln_change_n_eff"
 
 
 @dataclass(frozen=True)
@@ -65,12 +66,20 @@ def compute_control_v3_full_map_features(
         cfg=cfg or FeatureConfigV3(),
         start_time=0.0,
         end_time=duration_s,
-        return_debug=False,
+        return_debug=True,
     )
 
-    frame = pd.DataFrame({TIME_COLUMN: np.asarray(out["time"], dtype=np.float32)})
+    time_s = np.asarray(out["time"], dtype=np.float32)
+    ln_change_n_eff = np.asarray(out["debug"][LN_CHANGE_N_EFF_FEATURE_NAME], dtype=np.float32)
+    if ln_change_n_eff.shape != time_s.shape:
+        raise ValueError(f"{LN_CHANGE_N_EFF_FEATURE_NAME} must match the control_v3 time grid")
+    if not np.all(np.isfinite(ln_change_n_eff)):
+        raise ValueError(f"{LN_CHANGE_N_EFF_FEATURE_NAME} contains non-finite values")
+
+    frame = pd.DataFrame({TIME_COLUMN: time_s})
     for name in MODEL_FEATURE_NAMES:
         frame[name] = np.asarray(out["features"][name], dtype=np.float32)
+    frame[LN_CHANGE_N_EFF_FEATURE_NAME] = ln_change_n_eff
     frame.attrs["beatmap_path"] = beatmap_path.as_posix()
     validate_control_v3_timeseries(frame)
     return frame
@@ -82,6 +91,7 @@ def load_control_v3_timeseries_rows(
     beatmap_id: int | None = None,
     filtered_index: int | None = None,
     source_index: int | None = None,
+    include_ln_change_n_eff: bool = False,
 ) -> pd.DataFrame | None:
     selector = _one_map_selector(
         beatmap_id=beatmap_id,
@@ -95,7 +105,7 @@ def load_control_v3_timeseries_rows(
     column, value = selector
     frame = pd.read_parquet(
         path,
-        columns=_timeseries_columns(),
+        columns=_timeseries_columns(include_ln_change_n_eff=include_ln_change_n_eff),
         filters=[(column, "==", value)],
     )
     if frame.empty:
@@ -150,6 +160,28 @@ def slice_control_v3_target_window(
         }
 
     return ControlV3TargetWindow(target=target, confidence=confidence, metadata=metadata)
+
+
+def slice_ln_change_n_eff_target_window(rows: pd.DataFrame, window_start_s: float) -> NDArray[np.float32]:
+    validate_control_v3_timeseries(rows)
+    if LN_CHANGE_N_EFF_FEATURE_NAME not in rows.columns:
+        raise ValueError(f"control_v3 timeseries is missing column: {LN_CHANGE_N_EFF_FEATURE_NAME}")
+
+    frame_times = control_v3_target_frame_times(window_start_s)
+    source_times = rows[TIME_COLUMN].to_numpy(dtype=np.float64, copy=False)
+    source_values = rows[LN_CHANGE_N_EFF_FEATURE_NAME].to_numpy(dtype=np.float32, copy=False)
+    if source_values.ndim != 1 or source_values.shape[0] != source_times.shape[0]:
+        raise ValueError(f"{LN_CHANGE_N_EFF_FEATURE_NAME} must be a one-dimensional timeseries")
+    if not np.all(np.isfinite(source_values)):
+        raise ValueError(f"{LN_CHANGE_N_EFF_FEATURE_NAME} contains non-finite values")
+
+    return np.interp(
+        frame_times,
+        source_times,
+        source_values,
+        left=0.0,
+        right=0.0,
+    ).astype(np.float32)
 
 
 def control_v3_target_frame_times(window_start_s: float) -> NDArray[np.float64]:
@@ -231,5 +263,8 @@ def _validate_selector_value(name: str, value: object) -> int:
     return integer
 
 
-def _timeseries_columns() -> list[str]:
-    return list(dict.fromkeys([*CONTROL_V3_METADATA_COLUMNS, *MODEL_FEATURE_NAMES]))
+def _timeseries_columns(*, include_ln_change_n_eff: bool = False) -> list[str]:
+    columns = [*CONTROL_V3_METADATA_COLUMNS, *MODEL_FEATURE_NAMES]
+    if include_ln_change_n_eff:
+        columns.append(LN_CHANGE_N_EFF_FEATURE_NAME)
+    return list(dict.fromkeys(columns))

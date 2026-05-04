@@ -18,6 +18,7 @@ from train.stage1_oracle.features.control_v3 import (
 from train.stage1_oracle.features.control_v3 import FeatureConfigV3
 from train.stage_2.features.control_v3_targets import (
     CONFIDENCE_FEATURE_NAMES,
+    LN_CHANGE_N_EFF_FEATURE_NAME,
     MODEL_FEATURE_NAMES,
     TARGET_DIM,
     TARGET_FRAME_COUNT,
@@ -25,6 +26,7 @@ from train.stage_2.features.control_v3_targets import (
     ControlV3TargetWindow,
     compute_control_v3_full_map_features,
     load_control_v3_timeseries_rows,
+    slice_ln_change_n_eff_target_window,
     slice_control_v3_target_window,
     validate_control_v3_timeseries,
 )
@@ -45,11 +47,13 @@ class Stage2ControlV3TargetTests(unittest.TestCase):
 
             frame = compute_control_v3_full_map_features(osu_path, cfg=FeatureConfigV3(grid_step=0.1))
 
-        self.assertEqual(list(frame.columns), ["time_s", *MODEL_FEATURE_NAMES])
-        self.assertEqual(frame.shape[1], TARGET_DIM + 1)
+        self.assertEqual(list(frame.columns), ["time_s", *MODEL_FEATURE_NAMES, LN_CHANGE_N_EFF_FEATURE_NAME])
+        self.assertEqual(frame.shape[1], TARGET_DIM + 2)
         np.testing.assert_allclose(frame["time_s"].to_numpy(), [0.0, 0.1, 0.2, 0.3])
         self.assertEqual(frame[MODEL_FEATURE_NAMES].to_numpy().dtype, np.dtype("float32"))
         self.assertTrue(np.all(np.isfinite(frame[MODEL_FEATURE_NAMES].to_numpy())))
+        self.assertEqual(frame[LN_CHANGE_N_EFF_FEATURE_NAME].to_numpy().dtype, np.dtype("float32"))
+        self.assertTrue(np.all(np.isfinite(frame[LN_CHANGE_N_EFF_FEATURE_NAME].to_numpy())))
 
     def test_load_timeseries_rows_filters_cached_parquet_and_sorts_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -106,6 +110,16 @@ class Stage2ControlV3TargetTests(unittest.TestCase):
         self.assertEqual(result.metadata["window_start_s"], 0.0)
         self.assertEqual(result.metadata["window_end_s"], 2.0)
         self.assertEqual(result.metadata["feature_names"], tuple(MODEL_FEATURE_NAMES))
+
+    def test_slice_ln_change_n_eff_target_window_resamples_diagnostic_sidecar(self) -> None:
+        rows = _timeseries_frame(beatmap_id=1, times=np.arange(0.0, 2.1, 0.1).tolist(), value_offset=0.0)
+
+        target = slice_ln_change_n_eff_target_window(rows, 0.0)
+
+        self.assertEqual(target.shape, (100,))
+        self.assertEqual(target.dtype, np.dtype("float32"))
+        self.assertAlmostEqual(float(target[0]), 1.01, places=6)
+        self.assertAlmostEqual(float(target[-1]), 2.99, places=6)
 
     def test_slice_target_window_returns_array_by_default_and_zero_fills_edges(self) -> None:
         rows = _timeseries_frame(beatmap_id=1, times=[0.0], value_offset=5.0)
@@ -180,6 +194,7 @@ def _timeseries_frame(*, beatmap_id: int, times: list[float], value_offset: floa
             frame[name] = np.full(len(times), 0.5, dtype=np.float32)
         else:
             frame[name] = np.asarray(times, dtype=np.float32) + np.float32(value_offset + column_index)
+    frame[LN_CHANGE_N_EFF_FEATURE_NAME] = np.asarray(times, dtype=np.float32) + np.float32(1.0)
     return frame
 
 
