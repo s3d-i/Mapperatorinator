@@ -8,11 +8,13 @@ from unittest.mock import patch
 
 import torch
 
+from train.stage_2.data.control_windows import DEFAULT_MAX_CACHED_MAPS
 from train.stage_2.features.control_v3_targets import CONFIDENCE_FEATURE_NAMES, MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
 from train.stage_2.model_control import ControlModelLoss
 from train.stage_2.model_control.model import ControlEncoderOutput
 from train.stage_2.training.control import (
     ControlTrainingResult,
+    _resume_training_config,
     load_run_config,
     main,
     metrics_for_loader,
@@ -31,6 +33,7 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                     [
                         "output-dir: out",
                         "max_steps: 3",
+                        "log-every: 10",
                         "model:",
                         "  d-model: 32",
                         "  conv-blocks: 1",
@@ -43,6 +46,7 @@ class Stage2ControlTrainingTests(unittest.TestCase):
 
             config = load_run_config(config_path)
             self.assertEqual(config["output_dir"], "out")
+            self.assertEqual(config["log_every"], 10)
             self.assertEqual(config["model"]["d_model"], 32)
             self.assertEqual(config["model"]["conv_blocks"], 1)
             self.assertEqual(config["loss"]["confidence_loss_weight"], 0.5)
@@ -81,6 +85,27 @@ class Stage2ControlTrainingTests(unittest.TestCase):
             self.assertEqual(checkpoint["training_state"]["step"], 2)
             self.assertIn("optimizer_state_dict", checkpoint)
             self.assertIn("rng_state", checkpoint["training_state"])
+
+    def test_synthetic_smoke_logs_at_requested_step_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                run_synthetic_smoke(
+                    output_dir=Path(tmpdir),
+                    max_steps=4,
+                    eval_every=4,
+                    save_every=4,
+                    log_every=2,
+                    device_name="cpu",
+                    seed=7,
+                )
+
+            output = stdout.getvalue()
+            self.assertIn("train_progress step=1/4", output)
+            self.assertIn("train_progress step=2/4", output)
+            self.assertNotIn("train_progress step=3/4", output)
+            self.assertIn("train_progress step=4/4", output)
+            self.assertIn("steps_per_s=", output)
 
     def test_metrics_for_loader_aggregates_with_loss_specific_denominators(self) -> None:
         model = _MarkerControlModel()
@@ -172,6 +197,37 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                     save_every=1,
                     device_name="cpu",
                     seed=19,
+                    resume_from=first.checkpoint_path,
+                )
+
+            self.assertEqual(resumed.completed_steps, 2)
+
+    def test_resume_ignores_runtime_dataset_metadata_from_checkpoint_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            with redirect_stdout(io.StringIO()):
+                first = run_synthetic_smoke(
+                    output_dir=output_dir,
+                    max_steps=1,
+                    eval_every=1,
+                    save_every=1,
+                    device_name="cpu",
+                    seed=23,
+                )
+
+            checkpoint = torch.load(first.checkpoint_path, map_location="cpu", weights_only=True)
+            checkpoint["training_config"]["dataset"]["max_cached_maps"] = 16
+            checkpoint["training_config"]["dataset"]["num_workers"] = 2
+            torch.save(checkpoint, first.checkpoint_path)
+
+            with redirect_stdout(io.StringIO()):
+                resumed = run_synthetic_smoke(
+                    output_dir=output_dir,
+                    max_steps=2,
+                    eval_every=1,
+                    save_every=1,
+                    device_name="cpu",
+                    seed=23,
                     resume_from=first.checkpoint_path,
                 )
 
@@ -302,6 +358,7 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                         "output_dir: configured-out",
                         "max_steps: 4",
                         "eval_every: 2",
+                        "log_every: 3",
                         "batch_size: 4",
                         "learning_rate: 0.01",
                         "seed: 2026",
@@ -336,6 +393,8 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                             str(config_path),
                             "--max-steps",
                             "6",
+                            "--log-every",
+                            "5",
                             "--d-model",
                             "32",
                             "--final-train-eval-size",
@@ -347,6 +406,7 @@ class Stage2ControlTrainingTests(unittest.TestCase):
         self.assertEqual(kwargs["output_dir"], Path("configured-out"))
         self.assertEqual(kwargs["max_steps"], 6)
         self.assertEqual(kwargs["eval_every"], 2)
+        self.assertEqual(kwargs["log_every"], 5)
         self.assertEqual(kwargs["batch_size"], 4)
         self.assertEqual(kwargs["learning_rate"], 0.01)
         self.assertEqual(kwargs["seed"], 2026)
@@ -357,13 +417,89 @@ class Stage2ControlTrainingTests(unittest.TestCase):
         self.assertEqual(kwargs["model_config_overrides"]["heads"], 4)
         self.assertEqual(kwargs["loss_config_overrides"]["sparse_boost"], 2.0)
 
+    def test_main_passes_max_cached_maps_for_real_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "run.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "output_dir: configured-out",
+                        "max_cached_maps: 16",
+                        "model:",
+                        "  d_model: 24",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "train.stage_2.training.control.run_control_training",
+                return_value=ControlTrainingResult(
+                    report_path=Path("report.json"),
+                    checkpoint_path=Path("checkpoint.pt"),
+                    final_loss=0.0,
+                    final_value_loss=0.0,
+                    final_confidence_loss=0.0,
+                    completed_steps=1,
+                ),
+            ) as run_training:
+                with redirect_stdout(io.StringIO()):
+                    main(
+                        [
+                            "--config",
+                            str(config_path),
+                            "--max-cached-maps",
+                            "5",
+                        ]
+                    )
+
+        kwargs = run_training.call_args.kwargs
+        self.assertEqual(kwargs["max_cached_maps"], 5)
+        self.assertEqual(kwargs["model_config_overrides"]["d_model"], 24)
+
     def test_run_control_training_limits_final_train_eval_loader(self) -> None:
         dataset = _MetadataOnlyDataset(
             [{"beatmap_path": f"maps/{index}.osu"} for index in range(10)]
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("train.stage_2.training.control.ControlWindowDataset", return_value=dataset):
+            with patch("train.stage_2.training.control.ControlWindowDataset", return_value=dataset) as dataset_cls:
+                with patch(
+                    "train.stage_2.training.control._run_training",
+                    return_value=ControlTrainingResult(
+                        report_path=Path("report.json"),
+                        checkpoint_path=Path("checkpoint.pt"),
+                        final_loss=0.0,
+                        final_value_loss=0.0,
+                        final_confidence_loss=0.0,
+                        completed_steps=1,
+                    ),
+                ) as run_training:
+                    run_control_training(
+                        output_dir=Path(tmpdir),
+                        max_steps=1,
+                        batch_size=2,
+                        device_name="cpu",
+                        eval_fraction=0.0,
+                        eval_size=0,
+                        final_train_eval_size=3,
+                        max_cached_maps=5,
+                    )
+
+        kwargs = run_training.call_args.kwargs
+        self.assertEqual(dataset_cls.call_args.kwargs["max_cached_maps"], 5)
+        self.assertEqual(len(kwargs["train_eval_loader"].dataset), 3)
+        self.assertEqual(kwargs["dataset_report"]["train_window_count"], 10)
+        self.assertEqual(kwargs["dataset_report"]["final_train_eval_size"], 3)
+        self.assertEqual(kwargs["dataset_report"]["final_train_eval_window_count"], 3)
+        self.assertEqual(kwargs["dataset_report"]["max_cached_maps"], 5)
+
+    def test_run_control_training_reports_effective_default_cache_limit(self) -> None:
+        dataset = _MetadataOnlyDataset(
+            [{"beatmap_path": f"maps/{index}.osu"} for index in range(10)]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("train.stage_2.training.control.ControlWindowDataset", return_value=dataset) as dataset_cls:
                 with patch(
                     "train.stage_2.training.control._run_training",
                     return_value=ControlTrainingResult(
@@ -386,10 +522,33 @@ class Stage2ControlTrainingTests(unittest.TestCase):
                     )
 
         kwargs = run_training.call_args.kwargs
-        self.assertEqual(len(kwargs["train_eval_loader"].dataset), 3)
-        self.assertEqual(kwargs["dataset_report"]["train_window_count"], 10)
-        self.assertEqual(kwargs["dataset_report"]["final_train_eval_size"], 3)
-        self.assertEqual(kwargs["dataset_report"]["final_train_eval_window_count"], 3)
+        self.assertEqual(dataset_cls.call_args.kwargs["max_cached_maps"], DEFAULT_MAX_CACHED_MAPS)
+        self.assertEqual(kwargs["dataset_report"]["max_cached_maps"], DEFAULT_MAX_CACHED_MAPS)
+
+    def test_resume_training_config_excludes_runtime_dataset_knobs(self) -> None:
+        config = _resume_training_config(
+            seed=7,
+            run_name="control",
+            batch_size=2,
+            learning_rate=1e-3,
+            weight_decay=0.01,
+            eval_every=10,
+            save_every=10,
+            dataset_report={
+                "train_window_count": 100,
+                "eval_window_count": 20,
+                "max_cached_maps": 5,
+                "num_workers": 2,
+            },
+        )
+
+        self.assertEqual(
+            config["dataset"],
+            {
+                "train_window_count": 100,
+                "eval_window_count": 20,
+            },
+        )
 
 
 class _MetadataOnlyDataset:

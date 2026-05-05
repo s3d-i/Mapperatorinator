@@ -6,6 +6,7 @@ import math
 import pickle
 import random
 import shutil
+import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,7 +18,8 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from train.stage_2.data.control_windows import (
     ControlWindowDataset,
-    collate_control_windows,
+    DEFAULT_MAX_CACHED_MAPS,
+    collate_control_context_windows,
 )
 from train.stage_2.features.control_v3_targets import CONFIDENCE_FEATURE_NAMES, MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
 from train.stage_2.model_control import (
@@ -42,6 +44,7 @@ RUN_CONFIG_KEYS = {
     "max_steps",
     "eval_every",
     "save_every",
+    "log_every",
     "batch_size",
     "learning_rate",
     "weight_decay",
@@ -53,12 +56,25 @@ RUN_CONFIG_KEYS = {
     "eval_size",
     "final_train_eval_size",
     "num_workers",
+    "max_cached_maps",
     "synthetic_smoke",
     "model",
     "loss",
 }
 MODEL_CONFIG_KEYS = {field.name for field in fields(ControlEncoderConfig)}
 LOSS_CONFIG_KEYS = {field.name for field in fields(ControlLossConfig)}
+LOSS_BATCH_TENSOR_KEYS = frozenset(
+    (
+        "context_mel",
+        "context_dense_timing_v2",
+        "normalized_difficulty",
+        "context_padding_mask",
+        "control_v3_target",
+        "target_valid_mask",
+        "ln_change_n_eff_target",
+    )
+)
+RESUME_DATASET_RUNTIME_KEYS = frozenset(("max_cached_maps", "num_workers"))
 
 
 @dataclass(frozen=True)
@@ -117,6 +133,7 @@ def run_synthetic_smoke(
     max_steps: int = 2,
     eval_every: int | None = None,
     save_every: int | None = None,
+    log_every: int | None = None,
     batch_size: int = 2,
     learning_rate: float = 1e-2,
     seed: int = 1337,
@@ -147,13 +164,13 @@ def run_synthetic_smoke(
         samples,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_control_windows,
+        collate_fn=collate_control_context_windows,
     )
     train_eval_loader = DataLoader(
         train_eval_dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_control_windows,
+        collate_fn=collate_control_context_windows,
     )
     return _run_training(
         loader=loader,
@@ -165,6 +182,7 @@ def run_synthetic_smoke(
         max_steps=max_steps,
         eval_every=max(1, max_steps) if eval_every is None else eval_every,
         save_every=save_every,
+        log_every=log_every,
         learning_rate=learning_rate,
         weight_decay=0.0,
         seed=seed,
@@ -190,6 +208,7 @@ def run_control_training(
     max_steps: int = 5000,
     eval_every: int = 100,
     save_every: int | None = None,
+    log_every: int | None = None,
     batch_size: int = 8,
     learning_rate: float = 3e-4,
     weight_decay: float = 0.01,
@@ -201,6 +220,7 @@ def run_control_training(
     eval_size: int | None = None,
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     num_workers: int = 0,
+    max_cached_maps: int | None = None,
     model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
 ) -> ControlTrainingResult:
@@ -212,6 +232,8 @@ def run_control_training(
         dataset_kwargs["index_path"] = index_path
     if control_v3_timeseries_path is not None:
         dataset_kwargs["control_v3_timeseries_path"] = control_v3_timeseries_path
+    effective_max_cached_maps = DEFAULT_MAX_CACHED_MAPS if max_cached_maps is None else max_cached_maps
+    dataset_kwargs["max_cached_maps"] = effective_max_cached_maps
     train_source = ControlWindowDataset(**dataset_kwargs)
     if len(train_source) == 0:
         raise ValueError("ControlWindowDataset produced no training windows")
@@ -241,7 +263,7 @@ def run_control_training(
         shuffle=True,
         generator=generator,
         num_workers=num_workers,
-        collate_fn=collate_control_windows,
+        collate_fn=collate_control_context_windows,
     )
     train_eval_dataset = limit_final_train_eval_dataset(
         train_dataset,
@@ -253,14 +275,14 @@ def run_control_training(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_control_windows,
+        collate_fn=collate_control_context_windows,
     )
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_control_windows,
+        collate_fn=collate_control_context_windows,
     )
     return _run_training(
         loader=loader,
@@ -272,6 +294,7 @@ def run_control_training(
         max_steps=max_steps,
         eval_every=eval_every,
         save_every=save_every,
+        log_every=log_every,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         seed=seed,
@@ -286,6 +309,8 @@ def run_control_training(
             "eval_size": eval_size,
             "final_train_eval_size": final_train_eval_size,
             "final_train_eval_window_count": len(train_eval_dataset),
+            "max_cached_maps": int(getattr(train_source, "max_cached_maps", effective_max_cached_maps)),
+            "num_workers": num_workers,
         },
         resume_from=resume_from,
     )
@@ -463,6 +488,7 @@ def _run_training(
     max_steps: int,
     eval_every: int,
     save_every: int | None,
+    log_every: int | None,
     learning_rate: float,
     weight_decay: float,
     seed: int,
@@ -475,6 +501,7 @@ def _run_training(
         max_steps=max_steps,
         eval_every=eval_every,
         save_every=save_every,
+        log_every=log_every,
         batch_size=getattr(loader, "batch_size", 1) or 1,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
@@ -526,6 +553,8 @@ def _run_training(
         iterator = _advance_training_iterator(iterator, completed_step)
         print(f"resume_progress checkpoint={resume_from} step={completed_step}/{max_steps}", flush=True)
 
+    log_start_time = time.monotonic()
+    log_start_step = completed_step
     for step in range(completed_step + 1, max_steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -539,8 +568,17 @@ def _run_training(
 
         should_eval = step == 1 or step % eval_every == 0 or step == max_steps
         should_save = step == 1 or step % save_every == 0 or step == max_steps
-        if should_eval or should_save:
-            print(f"train_progress step={step}/{max_steps} loss={last_train_metrics['loss/total']:.6f}", flush=True)
+        should_log = log_every is not None and (step == 1 or step % log_every == 0 or step == max_steps)
+        if should_log or should_eval or should_save:
+            elapsed_s = time.monotonic() - log_start_time
+            completed_since_start = max(step - log_start_step, 1)
+            steps_per_s = completed_since_start / max(elapsed_s, 1e-9)
+            print(
+                f"train_progress step={step}/{max_steps} "
+                f"loss={last_train_metrics['loss/total']:.6f} "
+                f"elapsed_s={elapsed_s:.1f} steps_per_s={steps_per_s:.3f}",
+                flush=True,
+            )
         if should_eval:
             final_eval_metrics = metrics_for_loader(model, loss_fn, eval_loader, device=device)
             history_entry: dict[str, Any] = {
@@ -572,6 +610,7 @@ def _run_training(
                 completed_steps=completed_step,
                 eval_every=eval_every,
                 save_every=save_every,
+                log_every=log_every,
                 learning_rate=learning_rate,
                 weight_decay=weight_decay,
                 device=device,
@@ -604,6 +643,7 @@ def _run_training(
             completed_steps=completed_step,
             eval_every=eval_every,
             save_every=save_every,
+            log_every=log_every,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             device=device,
@@ -681,8 +721,8 @@ def _loss_for_raw_batch(
     *,
     device: torch.device,
 ):
-    batch = _move_batch_tensors(raw_batch, device)
-    batch = prepare_control_context_batch(batch)
+    batch = dict(raw_batch) if "context_mel" in raw_batch else prepare_control_context_batch(raw_batch)
+    batch = _move_batch_tensors(batch, device, keys=LOSS_BATCH_TENSOR_KEYS)
     output = model(
         context_mel=batch["context_mel"],
         context_dense_timing_v2=batch["context_dense_timing_v2"],
@@ -712,6 +752,7 @@ def _write_checkpoint_and_report(
     completed_steps: int,
     eval_every: int,
     save_every: int,
+    log_every: int | None,
     learning_rate: float,
     weight_decay: float,
     device: torch.device,
@@ -740,6 +781,7 @@ def _write_checkpoint_and_report(
             "is_complete": completed_steps >= max_steps,
             "eval_every": eval_every,
             "save_every": save_every,
+            "log_every": log_every,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
             "device": str(device),
@@ -761,6 +803,7 @@ def _write_checkpoint_and_report(
         "is_complete": completed_steps >= max_steps,
         "eval_every": eval_every,
         "save_every": save_every,
+        "log_every": log_every,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "model_config": asdict(model_config),
@@ -802,7 +845,7 @@ def _resume_training_config(
         "weight_decay": weight_decay,
         "eval_every": eval_every,
         "save_every": save_every,
-        "dataset": _json_safe(dataset_report),
+        "dataset": _json_safe(_strict_resume_dataset_report(dataset_report)),
     }
 
 
@@ -828,7 +871,9 @@ def _load_resume_checkpoint(
         raise ValueError("resume checkpoint model_config does not match the requested run")
     if checkpoint.get("loss_config") != asdict(expected_loss_config):
         raise ValueError("resume checkpoint loss_config does not match the requested run")
-    if checkpoint.get("training_config") != dict(expected_training_config):
+    if _normalized_resume_training_config(checkpoint.get("training_config")) != _normalized_resume_training_config(
+        expected_training_config
+    ):
         raise ValueError("resume checkpoint training_config does not match the requested run")
     if "model_state_dict" not in checkpoint:
         raise ValueError("resume checkpoint missing model_state_dict")
@@ -846,11 +891,30 @@ def _load_resume_checkpoint(
     return checkpoint
 
 
+def _normalized_resume_training_config(config: object) -> dict[str, Any]:
+    if not isinstance(config, Mapping):
+        return {}
+    normalized = dict(config)
+    dataset = normalized.get("dataset")
+    if isinstance(dataset, Mapping):
+        normalized["dataset"] = _strict_resume_dataset_report(dataset)
+    return normalized
+
+
+def _strict_resume_dataset_report(dataset_report: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in dataset_report.items()
+        if key not in RESUME_DATASET_RUNTIME_KEYS
+    }
+
+
 def _validate_training_args(
     *,
     max_steps: int,
     eval_every: int,
     save_every: int | None,
+    log_every: int | None,
     batch_size: int,
     learning_rate: float,
     weight_decay: float,
@@ -863,6 +927,8 @@ def _validate_training_args(
         raise ValueError(f"eval_every must be positive, got {eval_every}")
     if save_every is not None and save_every <= 0:
         raise ValueError(f"save_every must be positive, got {save_every}")
+    if log_every is not None and log_every <= 0:
+        raise ValueError(f"log_every must be positive, got {log_every}")
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if learning_rate <= 0.0:
@@ -1016,9 +1082,16 @@ def _advance_training_iterator(iterator: Any, completed_step: int) -> Any:
     return iterator
 
 
-def _move_batch_tensors(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+def _move_batch_tensors(
+    batch: Mapping[str, Any],
+    device: torch.device,
+    *,
+    keys: frozenset[str] | None = None,
+) -> dict[str, Any]:
     moved: dict[str, Any] = {}
     for key, value in batch.items():
+        if keys is not None and key not in keys:
+            continue
         moved[key] = value.to(device) if isinstance(value, torch.Tensor) else value
     return moved
 
@@ -1112,6 +1185,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--max-steps", type=int, default=config_defaults.get("max_steps", 5000))
     parser.add_argument("--eval-every", type=int, default=config_defaults.get("eval_every", 100))
     parser.add_argument("--save-every", type=int, default=config_defaults.get("save_every"))
+    parser.add_argument("--log-every", type=int, default=config_defaults.get("log_every"))
     parser.add_argument("--batch-size", type=int, default=config_defaults.get("batch_size", 8))
     parser.add_argument("--learning-rate", type=float, default=config_defaults.get("learning_rate", 3e-4))
     parser.add_argument("--weight-decay", type=float, default=config_defaults.get("weight_decay", 0.01))
@@ -1127,6 +1201,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=config_defaults.get("final_train_eval_size", DEFAULT_FINAL_TRAIN_EVAL_SIZE),
     )
     parser.add_argument("--num-workers", type=int, default=config_defaults.get("num_workers", 0))
+    parser.add_argument("--max-cached-maps", type=int, default=config_defaults.get("max_cached_maps"))
     parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
     parser.add_argument("--d-model", type=int, default=model_defaults.get("d_model"))
     parser.add_argument("--heads", type=int, default=model_defaults.get("heads"))
@@ -1156,6 +1231,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_steps=args.max_steps,
             eval_every=args.eval_every,
             save_every=args.save_every,
+            log_every=args.log_every,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             seed=args.seed,
@@ -1179,6 +1255,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_steps=args.max_steps,
             eval_every=args.eval_every,
             save_every=args.save_every,
+            log_every=args.log_every,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
@@ -1190,6 +1267,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             eval_size=args.eval_size,
             final_train_eval_size=args.final_train_eval_size,
             num_workers=args.num_workers,
+            max_cached_maps=args.max_cached_maps,
             model_config_overrides=model_overrides,
             loss_config_overrides=loss_overrides,
         )

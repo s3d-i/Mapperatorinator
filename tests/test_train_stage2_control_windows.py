@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -10,8 +11,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from train.stage_2.data.control_windows import (
+    CONTEXT_LENGTH_FRAMES,
     ControlWindowDataset,
+    DEFAULT_MAX_CACHED_MAPS,
+    TARGET_OFFSET_IN_CONTEXT,
     build_control_window_index,
+    collate_control_context_windows,
     collate_control_windows,
     normalize_difficulty,
     target_valid_mask,
@@ -148,6 +153,81 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
             loader_batch = next(iter(loader))
             self.assertEqual(loader_batch["full_mel"].shape, (2, 250, 160))
 
+    def test_context_collate_slices_fixed_context_without_full_song_padding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "index.parquet"
+            _index_frame().to_parquet(index_path, index=False)
+            dataset = ControlWindowDataset(
+                index_path=index_path,
+                dataset_root=Path(tmpdir) / "mania-dataset",
+                mel_loader=_mel_loader,
+                timing_loader=_timing_loader,
+                target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
+            )
+
+            batch = collate_control_context_windows([dataset[0], dataset[2]])
+
+            self.assertNotIn("full_mel", batch)
+            self.assertNotIn("full_dense_timing_v2", batch)
+            self.assertEqual(batch["context_mel"].shape, (2, CONTEXT_LENGTH_FRAMES, 160))
+            self.assertEqual(batch["context_dense_timing_v2"].shape, (2, CONTEXT_LENGTH_FRAMES, 4))
+            self.assertEqual(batch["context_start_frame"].tolist(), [-TARGET_OFFSET_IN_CONTEXT, -50])
+            self.assertTrue(batch["context_padding_mask"][0, :TARGET_OFFSET_IN_CONTEXT].all())
+            self.assertFalse(batch["context_padding_mask"][0, TARGET_OFFSET_IN_CONTEXT:500].any())
+            self.assertTrue(batch["context_padding_mask"][0, 500:].all())
+            self.assertTrue(batch["context_padding_mask"][1, :50].all())
+            self.assertFalse(batch["context_padding_mask"][1, 50:300].any())
+            self.assertTrue(batch["context_padding_mask"][1, 300:].all())
+
+    def test_context_collate_recomputes_target_valid_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "index.parquet"
+            _index_frame().to_parquet(index_path, index=False)
+            dataset = ControlWindowDataset(
+                index_path=index_path,
+                dataset_root=Path(tmpdir) / "mania-dataset",
+                mel_loader=_mel_loader,
+                timing_loader=_timing_loader,
+                target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
+            )
+            stale_tail_sample = dataset[2]
+            stale_tail_sample["target_valid_mask"] = torch.ones(100, dtype=torch.bool)
+
+            batch = collate_control_context_windows([stale_tail_sample])
+
+            self.assertTrue(batch["target_valid_mask"][0, :50].all())
+            self.assertFalse(batch["target_valid_mask"][0, 50:].any())
+
+    def test_context_collate_rejects_invalid_frame_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "index.parquet"
+            _index_frame().to_parquet(index_path, index=False)
+            dataset = ControlWindowDataset(
+                index_path=index_path,
+                dataset_root=Path(tmpdir) / "mania-dataset",
+                mel_loader=_mel_loader,
+                timing_loader=_timing_loader,
+                target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
+            )
+            base_sample = dataset[0]
+            cases = [
+                ("fractional_target_start_frame", {"target_start_frame": torch.tensor(0.9)}, "target_start_frame"),
+                ("negative_target_start_frame", {"target_start_frame": torch.tensor(-1)}, "target_start_frame"),
+                ("target_start_frame_past_end", {"target_start_frame": torch.tensor(250)}, "target_start_frame"),
+                ("zero_frame_count", {"frame_count": torch.tensor(0)}, "frame_count"),
+                ("target_start_ms_mismatch", {"target_start_ms": torch.tensor(20)}, "target_start_ms"),
+            ]
+
+            for name, updates, message in cases:
+                with self.subTest(name=name):
+                    sample = dict(base_sample)
+                    sample.update(updates)
+                    with self.assertRaisesRegex(ValueError, message):
+                        collate_control_context_windows([sample])
+
     def test_validates_target_and_timing_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             index_path = Path(tmpdir) / "index.parquet"
@@ -219,6 +299,69 @@ class TrainStage2ControlWindowTests(unittest.TestCase):
             self.assertAlmostEqual(float(sample["ln_change_n_eff_target"][0].item()), 5.01, places=5)
             self.assertAlmostEqual(float(sample["control_v3_target"][0, 0].item()), 4.01, places=5)
             self.assertEqual(int(sample["beatmap_id"].item()), 2)
+
+    def test_default_control_v3_rows_cache_uses_dataset_cache_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "index.parquet"
+            _index_frame().iloc[[1]].to_parquet(index_path, index=False)
+            fake_rows = pd.DataFrame({"time": [0.0]})
+
+            dataset = ControlWindowDataset(
+                index_path=index_path,
+                dataset_root=Path(tmpdir) / "mania-dataset",
+                mel_loader=_mel_loader,
+                timing_loader=_timing_loader,
+                target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
+                max_cached_maps=0,
+            )
+            with patch("train.stage_2.data.control_windows._default_control_v3_rows", return_value=fake_rows) as rows_loader:
+                dataset._load_control_v3_rows(("filtered_index", 1))
+                dataset._load_control_v3_rows(("filtered_index", 1))
+
+            self.assertEqual(rows_loader.call_count, 2)
+            self.assertEqual(len(dataset._control_v3_rows_cache), 0)
+
+            cached_dataset = ControlWindowDataset(
+                index_path=index_path,
+                dataset_root=Path(tmpdir) / "mania-dataset",
+                mel_loader=_mel_loader,
+                timing_loader=_timing_loader,
+                target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
+            )
+            with patch("train.stage_2.data.control_windows._default_control_v3_rows", return_value=fake_rows) as rows_loader:
+                cached_dataset._load_control_v3_rows(("filtered_index", 1))
+                cached_dataset._load_control_v3_rows(("filtered_index", 1))
+
+            self.assertEqual(rows_loader.call_count, 1)
+            self.assertEqual(len(cached_dataset._control_v3_rows_cache), 1)
+            self.assertEqual(cached_dataset.max_cached_maps, DEFAULT_MAX_CACHED_MAPS)
+
+    def test_default_control_v3_rows_cache_evicts_lru_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            index_path = Path(tmpdir) / "index.parquet"
+            _index_frame().iloc[[1]].to_parquet(index_path, index=False)
+            dataset = ControlWindowDataset(
+                index_path=index_path,
+                dataset_root=Path(tmpdir) / "mania-dataset",
+                mel_loader=_mel_loader,
+                timing_loader=_timing_loader,
+                target_loader=_target_loader,
+                allow_missing_ln_change_n_eff_target=True,
+                max_cached_maps=2,
+            )
+            with patch(
+                "train.stage_2.data.control_windows._default_control_v3_rows",
+                side_effect=lambda _path, selector: pd.DataFrame({"selector": [selector[1]]}),
+            ) as rows_loader:
+                dataset._load_control_v3_rows(("filtered_index", 1))
+                dataset._load_control_v3_rows(("filtered_index", 2))
+                dataset._load_control_v3_rows(("filtered_index", 3))
+                dataset._load_control_v3_rows(("filtered_index", 1))
+
+            self.assertEqual(rows_loader.call_count, 4)
+            self.assertEqual(list(dataset._control_v3_rows_cache), [("filtered_index", 3), ("filtered_index", 1)])
 
     def test_default_target_loader_prefers_filtered_index_over_duplicated_beatmap_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

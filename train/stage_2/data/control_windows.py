@@ -9,9 +9,8 @@ import sys
 import time
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -37,12 +36,15 @@ DEFAULT_CONTROL_WINDOW_INDEX_REPORT_PATH = Path(
 )
 DEFAULT_DATASET_ROOT = Path("mania-dataset")
 DEFAULT_INDEX_PATH = DEFAULT_CONTROL_WINDOW_INDEX_PATH
+DEFAULT_MAX_CACHED_MAPS = 16
 
 DIFFICULTY_MIN = 2.0
 DIFFICULTY_MAX = 6.0
 FRAME_HOP_MS = 20
 TARGET_WINDOW_LENGTH_FRAMES = 100
 TARGET_WINDOW_STRIDE_FRAMES = TARGET_WINDOW_LENGTH_FRAMES
+CONTEXT_LENGTH_FRAMES = 600
+TARGET_OFFSET_IN_CONTEXT = 250
 PACKED_MEL_CHANNELS = 160
 DENSE_TIMING_V2_CHANNELS = 4
 CONTROL_V3_TARGET_CHANNELS = 20
@@ -109,7 +111,7 @@ class ControlWindowDataset(Dataset):
         ln_change_n_eff_target_loader: LnChangeNEffTargetLoader | None = None,
         allow_missing_ln_change_n_eff_target: bool = False,
         control_v3_timeseries_path: str | Path = DEFAULT_CONTROL_V3_TIMESERIES_PATH,
-        max_cached_maps: int = 128,
+        max_cached_maps: int = DEFAULT_MAX_CACHED_MAPS,
         progress: bool = False,
     ) -> None:
         self.index_path = Path(index_path)
@@ -133,6 +135,7 @@ class ControlWindowDataset(Dataset):
         self.max_cached_maps = _validate_cache_size(max_cached_maps)
         self._full_mel_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._dense_timing_cache: OrderedDict[tuple[str, int], torch.Tensor] = OrderedDict()
+        self._control_v3_rows_cache: OrderedDict[tuple[str, int], pd.DataFrame] = OrderedDict()
 
         index_df = pd.read_parquet(self.index_path)
         _require_index_columns(index_df, self.index_path)
@@ -296,15 +299,22 @@ class ControlWindowDataset(Dataset):
         from train.stage_2.features.control_v3_targets import slice_control_v3_target_window
 
         window_start_s = record.target_start_frame * FRAME_HOP_MS / 1000.0
-        rows = _default_control_v3_rows(self.control_v3_timeseries_path.as_posix(), _target_selector(record))
+        rows = self._load_control_v3_rows(_target_selector(record))
         return slice_control_v3_target_window(rows, window_start_s)
 
     def _default_load_ln_change_n_eff_target_window(self, record: ControlWindowRecord) -> Any:
         from train.stage_2.features.control_v3_targets import slice_ln_change_n_eff_target_window
 
         window_start_s = record.target_start_frame * FRAME_HOP_MS / 1000.0
-        rows = _default_control_v3_rows(self.control_v3_timeseries_path.as_posix(), _target_selector(record))
+        rows = self._load_control_v3_rows(_target_selector(record))
         return slice_ln_change_n_eff_target_window(rows, window_start_s)
+
+    def _load_control_v3_rows(self, selector: tuple[str, int]) -> pd.DataFrame:
+        cached = _lru_get(self._control_v3_rows_cache, selector)
+        if cached is None:
+            cached = _default_control_v3_rows(self.control_v3_timeseries_path, selector)
+            _lru_put(self._control_v3_rows_cache, selector, cached, max_items=self.max_cached_maps)
+        return cached
 
 
 def collate_control_windows(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -369,6 +379,122 @@ def collate_control_windows(samples: Sequence[dict[str, Any]]) -> dict[str, Any]
                 "source_index": _metadata_optional_int(sample, "source_index"),
             }
             for sample in samples
+        ],
+    }
+
+
+def collate_control_context_windows(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("collate_control_context_windows requires at least one sample")
+
+    batch_size = len(samples)
+    context_mel = torch.zeros((batch_size, CONTEXT_LENGTH_FRAMES, PACKED_MEL_CHANNELS), dtype=torch.float32)
+    context_dense_timing_v2 = torch.zeros(
+        (batch_size, CONTEXT_LENGTH_FRAMES, DENSE_TIMING_V2_CHANNELS),
+        dtype=torch.float32,
+    )
+    context_padding_mask = torch.ones((batch_size, CONTEXT_LENGTH_FRAMES), dtype=torch.bool)
+    frame_counts: list[int] = []
+    target_start_frames: list[int] = []
+    target_start_ms_values: list[int] = []
+    for sample in samples:
+        source = sample.get("beatmap_path", "<sample>")
+        frame_count = _sample_positive_int(sample, "frame_count", source=source)
+        target_start_frame = _sample_nonnegative_int(sample, "target_start_frame", source=source)
+        if target_start_frame >= frame_count:
+            raise ValueError(
+                f"target_start_frame for {source} must be less than frame_count: "
+                f"{target_start_frame} >= {frame_count}"
+            )
+        target_start_ms = _sample_nonnegative_int(sample, "target_start_ms", source=source)
+        expected_ms = target_start_frame * FRAME_HOP_MS
+        if target_start_ms != expected_ms:
+            raise ValueError(f"target_start_ms for {source} must equal {expected_ms}, got {target_start_ms}")
+        frame_counts.append(frame_count)
+        target_start_frames.append(target_start_frame)
+        target_start_ms_values.append(target_start_ms)
+
+    for batch_index, sample in enumerate(samples):
+        frame_count = frame_counts[batch_index]
+        target_start_frame = target_start_frames[batch_index]
+        sample_full_mel = _context_source_feature_matrix(
+            sample["full_mel"],
+            name="full_mel",
+            expected_channels=PACKED_MEL_CHANNELS,
+            expected_frame_count=frame_count,
+            source=sample["audio_path"],
+        )
+        sample_full_dense_timing_v2 = _context_source_feature_matrix(
+            sample["full_dense_timing_v2"],
+            name="full_dense_timing_v2",
+            expected_channels=DENSE_TIMING_V2_CHANNELS,
+            expected_frame_count=frame_count,
+            source=sample["beatmap_path"],
+        )
+
+        context_start_frame = target_start_frame - TARGET_OFFSET_IN_CONTEXT
+        source_start = max(context_start_frame, 0)
+        source_end = min(context_start_frame + CONTEXT_LENGTH_FRAMES, frame_count)
+        if source_start >= source_end:
+            continue
+        destination_start = source_start - context_start_frame
+        destination_end = destination_start + (source_end - source_start)
+        context_mel[batch_index, destination_start:destination_end] = sample_full_mel[source_start:source_end]
+        context_dense_timing_v2[batch_index, destination_start:destination_end] = sample_full_dense_timing_v2[
+            source_start:source_end
+        ]
+        if not torch.isfinite(context_mel[batch_index, destination_start:destination_end]).all():
+            raise ValueError(f"context_mel for {sample['audio_path']} must contain only finite values")
+        if not torch.isfinite(context_dense_timing_v2[batch_index, destination_start:destination_end]).all():
+            raise ValueError(
+                f"context_dense_timing_v2 for {sample['beatmap_path']} must contain only finite values"
+            )
+        context_padding_mask[batch_index, destination_start:destination_end] = False
+
+    target_offsets = torch.arange(TARGET_WINDOW_LENGTH_FRAMES, dtype=torch.long)
+    target_valid_masks = torch.stack(
+        [
+            target_start_frame + target_offsets < frame_count
+            for target_start_frame, frame_count in zip(target_start_frames, frame_counts, strict=True)
+        ]
+    )
+
+    return {
+        "context_mel": context_mel,
+        "context_dense_timing_v2": context_dense_timing_v2,
+        "context_padding_mask": context_padding_mask,
+        "control_v3_target": torch.stack(
+            [_validate_control_v3_target(sample["control_v3_target"], source=sample["beatmap_path"]) for sample in samples]
+        ),
+        "ln_change_n_eff_target": torch.stack(
+            [
+                _validate_ln_change_n_eff_target(sample["ln_change_n_eff_target"], source=sample["beatmap_path"])
+                for sample in samples
+            ]
+        ),
+        "target_valid_mask": target_valid_masks,
+        "difficulty": torch.stack([sample["difficulty"] for sample in samples]).reshape(batch_size),
+        "normalized_difficulty": torch.stack([sample["normalized_difficulty"] for sample in samples]).reshape(batch_size),
+        "target_start_frame": torch.tensor(target_start_frames, dtype=torch.long),
+        "target_start_ms": torch.tensor(target_start_ms_values, dtype=torch.long),
+        "frame_count": torch.tensor(frame_counts, dtype=torch.long),
+        "context_start_frame": torch.tensor(
+            [target_start_frame - TARGET_OFFSET_IN_CONTEXT for target_start_frame in target_start_frames],
+            dtype=torch.long,
+        ),
+        "target_offset_in_context": torch.full((batch_size,), TARGET_OFFSET_IN_CONTEXT, dtype=torch.long),
+        "metadata": [
+            {
+                "beatmap_path": sample["beatmap_path"],
+                "audio_path": sample["audio_path"],
+                "difficulty": float(sample["difficulty"].item()),
+                "target_start_frame": int(sample["target_start_frame"].item()),
+                "target_start_ms": target_start_ms_values[index],
+                "beatmap_id": _metadata_optional_int(sample, "beatmap_id"),
+                "filtered_index": _metadata_optional_int(sample, "filtered_index"),
+                "source_index": _metadata_optional_int(sample, "source_index"),
+            }
+            for index, sample in enumerate(samples)
         ],
     }
 
@@ -679,6 +805,54 @@ def _metadata_optional_int(sample: dict[str, Any], field: str) -> int | None:
     return integer
 
 
+def _sample_positive_int(sample: Mapping[str, Any], field: str, *, source: object) -> int:
+    integer = _sample_integer(sample, field, source=source)
+    if integer <= 0:
+        raise ValueError(f"{field} for {source} must be positive, got {integer}")
+    return integer
+
+
+def _sample_nonnegative_int(sample: Mapping[str, Any], field: str, *, source: object) -> int:
+    integer = _sample_integer(sample, field, source=source)
+    if integer < 0:
+        raise ValueError(f"{field} for {source} must be non-negative, got {integer}")
+    return integer
+
+
+def _sample_integer(sample: Mapping[str, Any], field: str, *, source: object) -> int:
+    value = sample[field]
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if tensor.numel() != 1:
+            raise ValueError(f"{field} for {source} must be scalar, got shape {tuple(tensor.shape)}")
+        if tensor.dtype == torch.bool:
+            raise ValueError(f"{field} for {source} must be an integer, got bool")
+        if tensor.dtype.is_complex:
+            raise ValueError(f"{field} for {source} must be an integer, got {tensor.dtype}")
+        scalar = tensor.item()
+    elif isinstance(value, np.ndarray):
+        array = np.asarray(value)
+        if array.size != 1:
+            raise ValueError(f"{field} for {source} must be scalar, got shape {array.shape}")
+        if array.dtype == np.bool_:
+            raise ValueError(f"{field} for {source} must be an integer, got bool")
+        if np.issubdtype(array.dtype, np.complexfloating):
+            raise ValueError(f"{field} for {source} must be an integer, got {array.dtype}")
+        scalar = array.item()
+    else:
+        scalar = value
+    if isinstance(scalar, (bool, np.bool_)):
+        raise ValueError(f"{field} for {source} must be an integer, got bool")
+    if isinstance(scalar, (int, np.integer)):
+        return int(scalar)
+    if isinstance(scalar, (float, np.floating)):
+        scalar_float = float(scalar)
+        if not math.isfinite(scalar_float) or not scalar_float.is_integer():
+            raise ValueError(f"{field} for {source} must be an integer, got {scalar!r}")
+        return int(scalar_float)
+    raise TypeError(f"{field} for {source} must be an integer, got {type(scalar).__name__}")
+
+
 def _validate_cache_size(max_cached_maps: int) -> int:
     if not isinstance(max_cached_maps, int) or isinstance(max_cached_maps, bool):
         raise TypeError(f"max_cached_maps must be an integer, got {type(max_cached_maps).__name__}")
@@ -687,7 +861,7 @@ def _validate_cache_size(max_cached_maps: int) -> int:
     return max_cached_maps
 
 
-def _lru_get(cache: OrderedDict[Any, torch.Tensor], key: Any) -> torch.Tensor | None:
+def _lru_get(cache: OrderedDict[Any, Any], key: Any) -> Any | None:
     try:
         value = cache.pop(key)
     except KeyError:
@@ -696,7 +870,7 @@ def _lru_get(cache: OrderedDict[Any, torch.Tensor], key: Any) -> torch.Tensor | 
     return value
 
 
-def _lru_put(cache: OrderedDict[Any, torch.Tensor], key: Any, value: torch.Tensor, *, max_items: int) -> None:
+def _lru_put(cache: OrderedDict[Any, Any], key: Any, value: Any, *, max_items: int) -> None:
     if max_items == 0:
         return
     cache[key] = value
@@ -785,6 +959,31 @@ def _validate_feature_matrix(
     return tensor.contiguous()
 
 
+def _context_source_feature_matrix(
+    value: Any,
+    *,
+    name: str,
+    source: object,
+    expected_channels: int,
+    expected_frame_count: int,
+) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu()
+        if tensor.dtype != torch.float32:
+            raise ValueError(f"{name} for {source} must be float32, got {tensor.dtype}")
+    else:
+        array = np.asarray(value)
+        if array.dtype != np.float32:
+            raise ValueError(f"{name} for {source} must be float32, got {array.dtype}")
+        tensor = torch.as_tensor(array)
+    if tensor.ndim != 2:
+        raise ValueError(f"{name} for {source} must be rank 2, got shape {tuple(tensor.shape)}")
+    expected_shape = (expected_frame_count, expected_channels)
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(f"{name} for {source} must have shape {expected_shape}, got {tuple(tensor.shape)}")
+    return tensor
+
+
 def _as_float32_tensor(value: Any, *, name: str, source: object) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         tensor = value.detach().cpu()
@@ -818,8 +1017,7 @@ def _full_support_ln_change_n_eff_target(_record: ControlWindowRecord) -> torch.
     return torch.full((TARGET_WINDOW_LENGTH_FRAMES,), 3.0, dtype=torch.float32)
 
 
-@lru_cache(maxsize=128)
-def _default_control_v3_rows(timeseries_path: str, selector: tuple[str, int]) -> pd.DataFrame:
+def _default_control_v3_rows(timeseries_path: str | Path, selector: tuple[str, int]) -> pd.DataFrame:
     from train.stage_2.features.control_v3_targets import load_control_v3_timeseries_rows
 
     field, value = selector

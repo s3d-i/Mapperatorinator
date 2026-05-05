@@ -6,14 +6,12 @@ from typing import Any
 import torch
 
 from train.stage_2.data.control_windows import (
+    CONTEXT_LENGTH_FRAMES,
     DENSE_TIMING_V2_CHANNELS,
     PACKED_MEL_CHANNELS,
+    TARGET_OFFSET_IN_CONTEXT,
     TARGET_WINDOW_LENGTH_FRAMES,
 )
-
-
-CONTEXT_LENGTH_FRAMES = 600
-TARGET_OFFSET_IN_CONTEXT = 250
 
 
 def prepare_control_context_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
