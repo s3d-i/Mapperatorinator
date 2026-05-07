@@ -1,0 +1,38 @@
+# Stage 2 density-only control demo, initialized from the usable 8k full-control checkpoint.
+dataset_root: mania-dataset
+index_path: train/artifacts/indexes/stage2_control_windows_4k_2to6_dense_local_bpm_norm_unique_le3.parquet
+control_v3_timeseries_path: train/artifacts/features/control_v3_timeseries_4k_no_timing_anomalies_2to6.parquet
+output_dir: train/artifacts/runs/stage2_control_demo/stage2_control_demo_12k_mps_d384_l3_4x
+run_name: stage2_control_demo_12k_mps_d384_l3_4x
+init_from_control_checkpoint: train/artifacts/runs/stage2_control/stage2_control_12k_mps_d384_l3_4x/checkpoints/checkpoint_step_008000.pt
+
+max_steps: 12000
+eval_every: 500
+save_every: 500
+log_every: 10
+
+batch_size: 12
+learning_rate: 0.00012
+weight_decay: 0.01
+seed: 1337
+device: mps
+
+eval_fraction: 0.01
+eval_size: 1024
+final_train_eval_size: 1024
+
+num_workers: 0
+max_cached_maps: 16
+
+model:
+  d_model: 384
+  heads: 8
+  layers: 3
+  ffn_dim: 1536
+  dropout: 0.1
+  conv_blocks: 2
+  conv_kernel_size: 5
+
+loss:
+  density_loss_weight: 1.0
+  smooth_l1_delta: 0.20
