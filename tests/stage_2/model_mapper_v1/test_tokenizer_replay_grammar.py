@@ -125,6 +125,23 @@ class MapperV1TokenizerReplayGrammarTests(unittest.TestCase):
         self.assertEqual(float(mask[0, 0, vocab.eos_id].item()), 0.0)
         self.assertTrue(torch.isneginf(mask[0, 0, vocab.pad_id]))
 
+    def test_grammar_has_no_reachable_10ms_grid_dead_ends(self) -> None:
+        vocab = MapperV1Vocab()
+
+        for current_ms in range(0, 8001, 10):
+            for open_mask_bits in range(16):
+                with self.subTest(current_ms=current_ms, open_mask_bits=open_mask_bits):
+                    mask = valid_token_mask(
+                        position=3,
+                        current_ms=current_ms,
+                        open_mask=open_mask_bits,
+                        write_start_ms=0,
+                        write_end_ms=8000,
+                        vocab=vocab,
+                    )
+                    expected_dead_end = current_ms == 8000 and open_mask_bits != 0
+                    self.assertEqual(bool(mask.any().item()), not expected_dead_end)
+
     def test_replay_rejects_bos_after_position_zero(self) -> None:
         vocab = MapperV1Vocab()
 
