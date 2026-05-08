@@ -1,0 +1,108 @@
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from train.stage_2.data.mapper_v1_windows import (
+    collate_mapper_v1_windows,
+    concatenate_density_teacher_8s,
+    control_teacher_slice_batch,
+    extract_mapper_density_8s,
+)
+from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
+from train.stage_2.model_mapper_v1.tokenizer import encode_mapper_window
+from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
+
+
+class MapperV1DataWindowTests(unittest.TestCase):
+    def test_extract_mapper_density_8s_uses_named_control_v3_channels(self) -> None:
+        target = torch.zeros(400, len(MODEL_FEATURE_NAMES), dtype=torch.float32)
+        target[:, MODEL_FEATURE_NAMES.index("density_level")] = torch.linspace(0.0, 1.0, 400)
+        target[:, MODEL_FEATURE_NAMES.index("density_confidence")] = 0.75
+
+        density_target, density_confidence = extract_mapper_density_8s(target)
+
+        self.assertEqual(density_target.shape, (400, 1))
+        self.assertEqual(density_confidence.shape, (400, 1))
+        self.assertTrue(torch.equal(density_target[:, 0], torch.linspace(0.0, 1.0, 400)))
+        self.assertTrue(torch.equal(density_confidence, torch.full((400, 1), 0.75)))
+
+    def test_extract_mapper_density_8s_rejects_nonfinite_values(self) -> None:
+        target = torch.zeros(400, len(MODEL_FEATURE_NAMES), dtype=torch.float32)
+        target[:, MODEL_FEATURE_NAMES.index("density_confidence")] = 1.0
+        target[7, MODEL_FEATURE_NAMES.index("density_confidence")] = float("nan")
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            extract_mapper_density_8s(target)
+
+    def test_collate_mapper_v1_windows_pads_tokens_and_states(self) -> None:
+        vocab = MapperV1Vocab()
+        first = _sample(encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000))
+        second = _sample(encode_mapper_window([], vocab=vocab, write_start_ms=8000, write_end_ms=16000))
+        second["target_tokens"] = second["target_tokens"][:-1]
+        second["teacher_current_ms"] = second["teacher_current_ms"][:-1]
+        second["teacher_open_mask"] = second["teacher_open_mask"][:-1]
+        second["teacher_open_age_ms"] = second["teacher_open_age_ms"][:-1]
+        second["close_labels"] = second["close_labels"][:-1]
+        second["close_label_mask"] = second["close_label_mask"][:-1]
+
+        batch = collate_mapper_v1_windows([first, second], pad_id=vocab.pad_id)
+
+        self.assertEqual(batch["target_tokens"].shape, (2, 4))
+        self.assertEqual(batch["teacher_open_mask"].shape, (2, 4, 4))
+        self.assertTrue(batch["target_token_mask"][0].all().item())
+        self.assertFalse(batch["target_token_mask"][1, -1].item())
+        self.assertEqual(int(batch["target_tokens"][1, -1].item()), vocab.pad_id)
+        self.assertEqual(batch["density_target_8s"].shape, (2, 400, 1))
+
+    def test_control_teacher_slice_batch_prepares_four_aligned_control_contexts(self) -> None:
+        vocab = MapperV1Vocab()
+        sample = _sample(encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000))
+        sample["full_mel"] = torch.zeros(500, 160, dtype=torch.float32)
+        sample["full_dense_timing_v2"] = torch.zeros(500, 4, dtype=torch.float32)
+        sample["frame_count"] = torch.tensor(500, dtype=torch.long)
+        sample["control_slice_start_frames"] = torch.tensor([0, 100, 200, 300], dtype=torch.long)
+        batch = collate_mapper_v1_windows([sample], pad_id=vocab.pad_id)
+
+        control_batch = control_teacher_slice_batch(batch, 3)
+
+        self.assertEqual(control_batch["target_start_frame"].tolist(), [300])
+        self.assertEqual(control_batch["context_mel"].shape, (1, 600, 160))
+        self.assertEqual(control_batch["context_dense_timing_v2"].shape, (1, 600, 4))
+
+    def test_concatenate_density_teacher_8s_requires_four_two_second_outputs(self) -> None:
+        density_index = VALUE_FEATURE_NAMES.index("density_level")
+        outputs = []
+        for index in range(4):
+            value_pred = torch.zeros(2, 100, len(VALUE_FEATURE_NAMES), dtype=torch.float32)
+            value_pred[:, :, density_index] = float(index)
+            outputs.append(SimpleNamespace(value_pred=value_pred))
+
+        density_teacher = concatenate_density_teacher_8s(outputs)
+
+        self.assertEqual(density_teacher.shape, (2, 400, 1))
+        self.assertTrue(torch.equal(density_teacher[:, :100], torch.zeros(2, 100, 1)))
+        self.assertTrue(torch.equal(density_teacher[:, 300:], torch.full((2, 100, 1), 3.0)))
+
+
+def _sample(tokenized) -> dict[str, torch.Tensor]:
+    return {
+        "mel_context": torch.zeros(400, 160, dtype=torch.float32),
+        "timing_context": torch.zeros(400, 4, dtype=torch.float32),
+        "context_padding_mask": torch.zeros(400, dtype=torch.bool),
+        "difficulty": torch.zeros(1, dtype=torch.float32),
+        "target_tokens": tokenized.target_tensor(),
+        "teacher_current_ms": tokenized.teacher_current_ms,
+        "teacher_open_mask": tokenized.teacher_open_mask,
+        "teacher_open_age_ms": tokenized.teacher_open_age_ms,
+        "close_labels": tokenized.close_labels,
+        "close_label_mask": tokenized.close_label_mask,
+        "density_target_8s": torch.zeros(400, 1, dtype=torch.float32),
+        "density_confidence_8s": torch.ones(400, 1, dtype=torch.float32),
+        "write_start_ms": torch.tensor(tokenized.write_start_ms, dtype=torch.long),
+        "write_end_ms": torch.tensor(tokenized.write_end_ms, dtype=torch.long),
+    }
+
+
+if __name__ == "__main__":
+    unittest.main()
