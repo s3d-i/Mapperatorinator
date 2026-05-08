@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,11 @@ from train.stage_2.data.mapper_v1_windows import (
     MapperV1WindowDataset,
     collate_mapper_v1_windows,
     concatenate_density_teacher_8s,
+    control_teacher_cache_path,
     control_teacher_slice_batch,
     extract_mapper_density_8s,
+    load_control_teacher_cache_entry,
+    save_control_teacher_cache_entry,
 )
 from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
 from train.stage_2.model_mapper_v1.tokenizer import encode_mapper_window, hitobjects_to_mapper_timepoints
@@ -107,6 +111,34 @@ class MapperV1DataWindowTests(unittest.TestCase):
         self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["3.00"], 1.0)
         self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["4.00"], 0.0)
 
+    def test_control_teacher_cache_hit_skips_full_control_inputs_and_collates_teacher(self) -> None:
+        record = _record("cached.osu", difficulty=4.0)
+        control_memory = torch.arange(400 * 3, dtype=torch.float32).reshape(400, 3)
+        density_teacher = torch.linspace(0.0, 1.0, 400, dtype=torch.float32).reshape(400, 1)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = control_teacher_cache_path(temp_dir, record)
+            save_control_teacher_cache_entry(
+                cache_path,
+                record=record,
+                control_memory_8s=control_memory,
+                density_teacher_8s=density_teacher,
+            )
+            loaded = load_control_teacher_cache_entry(cache_path, record=record)
+            self.assertTrue(torch.equal(loaded["control_memory_8s"], control_memory))
+            self.assertTrue(torch.equal(loaded["density_teacher_8s"], density_teacher))
+
+            dataset = _MapperDatasetWithControlTeacherCache([record], cache_dir=Path(temp_dir))
+            sample = dataset[0]
+
+            self.assertTrue(torch.equal(sample["control_memory_8s"], control_memory))
+            self.assertTrue(torch.equal(sample["density_teacher_8s"], density_teacher))
+            self.assertNotIn("full_mel", sample)
+            batch = collate_mapper_v1_windows([sample], pad_id=MapperV1Vocab().pad_id)
+            self.assertEqual(batch["control_memory_8s"].shape, (1, 400, 3))
+            self.assertEqual(batch["density_teacher_8s"].shape, (1, 400, 1))
+            self.assertNotIn("full_mel", batch)
+
 
 def _sample(tokenized) -> dict[str, torch.Tensor]:
     return {
@@ -152,6 +184,22 @@ class _MapperDatasetWithUnsupportedActions(MapperV1WindowDataset):
                     ],
                 ),
             )
+        return ()
+
+
+class _RaisingControlDataset:
+    def __init__(self, records: list[ControlWindowRecord]) -> None:
+        self.records = records
+
+    def __getitem__(self, index: int):
+        raise AssertionError("control dataset should not be read on cache hit")
+
+
+class _MapperDatasetWithControlTeacherCache(MapperV1WindowDataset):
+    def __init__(self, records: list[ControlWindowRecord], *, cache_dir: Path) -> None:
+        super().__init__(control_dataset=_RaisingControlDataset(records), control_teacher_cache_dir=cache_dir)
+
+    def _load_timepoints(self, beatmap_path: Path) -> tuple:
         return ()
 
 

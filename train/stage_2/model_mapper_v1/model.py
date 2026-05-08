@@ -361,11 +361,6 @@ class MapperV1Model(nn.Module):
         return decoder_hidden, base_logits
 
     def _control_teacher_8s(self, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        from train.stage_2.data.mapper_v1_windows import (
-            concatenate_density_teacher_8s,
-            control_teacher_slice_batch,
-        )
-
         batch_size = int(_require_tensor(batch, "target_tokens", ndim=2).shape[0])
         device = _require_tensor(batch, "target_tokens", ndim=2).device
         if self.control_encoder is None:
@@ -375,24 +370,7 @@ class MapperV1Model(nn.Module):
             )
 
         self.control_encoder.eval()
-        outputs = []
-        with torch.no_grad():
-            for slice_index in range(4):
-                control_batch = control_teacher_slice_batch(dict(batch), slice_index)
-                outputs.append(
-                    self.control_encoder(
-                        context_mel=control_batch["context_mel"],
-                        context_dense_timing_v2=control_batch["context_dense_timing_v2"],
-                        normalized_difficulty=control_batch["normalized_difficulty"].reshape(batch_size),
-                        context_padding_mask=control_batch["context_padding_mask"],
-                        full_mel=control_batch.get("full_mel"),
-                        full_dense_timing_v2=control_batch.get("full_dense_timing_v2"),
-                        padding_mask=control_batch.get("padding_mask"),
-                        frame_count=control_batch.get("frame_count"),
-                        target_start_frame=control_batch.get("target_start_frame"),
-                    )
-                )
-        return concatenate_control_memory_8s(outputs), concatenate_density_teacher_8s(outputs)
+        return compute_control_teacher_8s(self.control_encoder, batch)
 
     def _reset_parameters(self) -> None:
         nn.init.normal_(self.position, mean=0.0, std=0.01)
@@ -412,6 +390,35 @@ def concatenate_control_memory_8s(control_outputs: Sequence[Any]) -> torch.Tenso
             raise ValueError(f"control output {index} memory is too short for target slice: {memory.shape[1]} < {end}")
         slices.append(memory[:, start:end])
     return torch.cat(slices, dim=1).contiguous()
+
+
+def compute_control_teacher_8s(control_encoder: nn.Module, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    from train.stage_2.data.mapper_v1_windows import (
+        concatenate_density_teacher_8s,
+        control_teacher_slice_batch,
+    )
+
+    target_tokens = _require_tensor(batch, "target_tokens", ndim=2)
+    batch_size = int(target_tokens.shape[0])
+    control_encoder.eval()
+    outputs = []
+    with torch.no_grad():
+        for slice_index in range(4):
+            control_batch = control_teacher_slice_batch(dict(batch), slice_index)
+            outputs.append(
+                control_encoder(
+                    context_mel=control_batch["context_mel"],
+                    context_dense_timing_v2=control_batch["context_dense_timing_v2"],
+                    normalized_difficulty=control_batch["normalized_difficulty"].reshape(batch_size),
+                    context_padding_mask=control_batch["context_padding_mask"],
+                    full_mel=control_batch.get("full_mel"),
+                    full_dense_timing_v2=control_batch.get("full_dense_timing_v2"),
+                    padding_mask=control_batch.get("padding_mask"),
+                    frame_count=control_batch.get("frame_count"),
+                    target_start_frame=control_batch.get("target_start_frame"),
+                )
+            )
+    return concatenate_control_memory_8s(outputs), concatenate_density_teacher_8s(outputs)
 
 
 def load_frozen_control_encoder_from_checkpoint(checkpoint_path: str | Path) -> ControlDemoGlobalEncoder:

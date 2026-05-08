@@ -4,7 +4,13 @@ from collections.abc import Sequence
 
 import torch
 
+from .tokenizer import MAPPER_WRITE_MS
 from .vocab import KEY_COUNT, LaneAction, MapperV1Vocab
+
+_TOKEN_GRID_MS = 10
+_OPEN_MASK_COUNT = 2**KEY_COUNT
+_GRAMMAR_TABLE_CACHE: dict[tuple[tuple[str, ...], int | None, int], torch.Tensor] = {}
+_GRAMMAR_DEVICE_TABLE_CACHE: dict[tuple[tuple[str, ...], int | None, int, str], torch.Tensor] = {}
 
 
 def valid_token_mask(
@@ -87,6 +93,50 @@ def build_grammar_mask(
 
     write_start_values = _broadcast_window_tensor(write_start_ms, batch_size=batch_size, device=device)
     write_end_values = _broadcast_window_tensor(write_end_ms, batch_size=batch_size, device=device)
+    remaining_ms = write_end_values.reshape(batch_size, 1) - current_ms.to(dtype=torch.long)
+    if (
+        bool((remaining_ms < 0).any())
+        or bool((remaining_ms > MAPPER_WRITE_MS).any())
+        or bool((remaining_ms % _TOKEN_GRID_MS != 0).any())
+    ):
+        valid = _build_grammar_valid_slow(
+            current_ms=current_ms,
+            open_mask=open_mask,
+            write_start_values=write_start_values,
+            write_end_values=write_end_values,
+            vocab=vocab,
+            positions=positions,
+            min_ln_duration_ms=min_ln_duration_ms,
+            device=device,
+        )
+        return torch.zeros_like(valid, dtype=torch.float32).masked_fill(~valid, invalid_value)
+
+    table = _grammar_lookup_table(vocab=vocab, min_ln_duration_ms=min_ln_duration_ms, device=device)
+    remaining_index = (remaining_ms // _TOKEN_GRID_MS).to(dtype=torch.long)
+    lane_bits = torch.tensor([1, 2, 4, 8], dtype=torch.long, device=device).reshape(1, 1, KEY_COUNT)
+    open_bits = (open_mask.to(dtype=torch.long) * lane_bits).sum(dim=-1)
+    position_positive = (positions > 0).to(dtype=torch.long)
+    valid = table[remaining_index, open_bits, position_positive]
+    negative_position = positions < 0
+    if bool(negative_position.any()):
+        valid = valid.clone()
+        valid[negative_position] = False
+        valid[:, :, vocab.bos_id] = valid[:, :, vocab.bos_id] | negative_position
+    return torch.zeros_like(valid, dtype=torch.float32).masked_fill(~valid, invalid_value)
+
+
+def _build_grammar_valid_slow(
+    *,
+    current_ms: torch.Tensor,
+    open_mask: torch.Tensor,
+    write_start_values: torch.Tensor,
+    write_end_values: torch.Tensor,
+    vocab: MapperV1Vocab,
+    positions: torch.Tensor,
+    min_ln_duration_ms: int | None,
+    device: torch.device,
+) -> torch.Tensor:
+    batch_size, steps = current_ms.shape
     valid = torch.zeros((batch_size, steps, vocab.size), dtype=torch.bool, device=device)
     for batch_index in range(batch_size):
         for step in range(steps):
@@ -100,7 +150,68 @@ def build_grammar_mask(
                 min_ln_duration_ms=min_ln_duration_ms,
                 device=device,
             )
-    return torch.zeros_like(valid, dtype=torch.float32).masked_fill(~valid, invalid_value)
+    return valid
+
+
+def _grammar_lookup_table(
+    *,
+    vocab: MapperV1Vocab,
+    min_ln_duration_ms: int | None,
+    device: torch.device,
+) -> torch.Tensor:
+    max_remaining_units = MAPPER_WRITE_MS // _TOKEN_GRID_MS
+    cache_key = (tuple(vocab.id_to_token), min_ln_duration_ms, max_remaining_units)
+    table = _GRAMMAR_TABLE_CACHE.get(cache_key)
+    if table is None:
+        table = _build_grammar_lookup_table(
+            vocab=vocab,
+            min_ln_duration_ms=min_ln_duration_ms,
+            max_remaining_units=max_remaining_units,
+        )
+        _GRAMMAR_TABLE_CACHE[cache_key] = table
+    if device.type == "cpu":
+        return table
+
+    device_key = (*cache_key, str(device))
+    device_table = _GRAMMAR_DEVICE_TABLE_CACHE.get(device_key)
+    if device_table is None or device_table.device != device:
+        device_table = table.to(device=device)
+        _GRAMMAR_DEVICE_TABLE_CACHE[device_key] = device_table
+    return device_table
+
+
+def _build_grammar_lookup_table(
+    *,
+    vocab: MapperV1Vocab,
+    min_ln_duration_ms: int | None,
+    max_remaining_units: int,
+) -> torch.Tensor:
+    table = torch.zeros((max_remaining_units + 1, _OPEN_MASK_COUNT, 2, vocab.size), dtype=torch.bool)
+    time_shift_values = tuple(vocab.time_shift_value(token_id) for token_id in vocab.time_shift_token_ids)
+    event_actions = tuple(vocab.decode_event(token_id) for token_id in vocab.event_token_ids)
+    for remaining_units in range(max_remaining_units + 1):
+        remaining_ms = remaining_units * _TOKEN_GRID_MS
+        for open_bits in range(_OPEN_MASK_COUNT):
+            open_tuple = tuple(bool(open_bits & (1 << lane)) for lane in range(KEY_COUNT))
+            any_open = any(open_tuple)
+
+            if remaining_ms == 0 and not any_open:
+                table[remaining_units, open_bits, 1, vocab.eos_id] = True
+
+            for token_id, delta_ms in zip(vocab.time_shift_token_ids, time_shift_values, strict=True):
+                if delta_ms <= remaining_ms and (not any_open or delta_ms < remaining_ms):
+                    table[remaining_units, open_bits, :, token_id] = True
+
+            if remaining_ms > 0:
+                for token_id, lane_actions in zip(vocab.event_token_ids, event_actions, strict=True):
+                    if _event_is_legal(
+                        lane_actions,
+                        open_tuple,
+                        remaining_ms=remaining_ms,
+                        min_ln_duration_ms=min_ln_duration_ms,
+                    ):
+                        table[remaining_units, open_bits, :, token_id] = True
+    return table
 
 
 def _event_is_legal(

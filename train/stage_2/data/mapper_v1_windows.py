@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 from torch.utils.data import Dataset
@@ -16,6 +17,7 @@ from train.stage_2.data.control_windows import (
     TARGET_WINDOW_LENGTH_FRAMES,
     ControlWindowDataset,
     ControlWindowRecord,
+    normalize_difficulty,
 )
 from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
 from train.stage_2.model_mapper_v1.tokenizer import (
@@ -36,6 +38,7 @@ MAPPER_WRITE_FRAMES = MAPPER_WRITE_MS // FRAME_HOP_MS
 MAPPER_CONTEXT_FRAMES = MAPPER_WRITE_FRAMES
 DENSITY_LEVEL_TARGET_INDEX = MODEL_FEATURE_NAMES.index("density_level")
 DENSITY_CONFIDENCE_TARGET_INDEX = MODEL_FEATURE_NAMES.index("density_confidence")
+CONTROL_TEACHER_CACHE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,8 @@ class MapperV1WindowDataset(Dataset):
         control_dataset: ControlWindowDataset | None = None,
         vocab: MapperV1Vocab | None = None,
         mapper_stride_frames: int = MAPPER_WRITE_FRAMES,
+        control_teacher_cache_dir: str | Path | None = None,
+        require_control_teacher_cache: bool = False,
         progress: bool = False,
         **control_dataset_kwargs: Any,
     ) -> None:
@@ -95,6 +100,8 @@ class MapperV1WindowDataset(Dataset):
         )
         self.vocab = MapperV1Vocab() if vocab is None else vocab
         self.mapper_stride_frames = int(mapper_stride_frames)
+        self.control_teacher_cache_dir = None if control_teacher_cache_dir is None else Path(control_teacher_cache_dir)
+        self.require_control_teacher_cache = bool(require_control_teacher_cache)
         self._timepoints_by_beatmap: dict[str, tuple] = {}
         self.records, self.filter_report = self._build_records(
             progress=progress,
@@ -106,8 +113,48 @@ class MapperV1WindowDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         mapper_record = self.records[index]
         record = mapper_record.control_record
-        base_sample = self.control_dataset[mapper_record.control_record_index]
         tokenized = self._tokenize_record(record)
+        cache_path = self.control_teacher_cache_path(record)
+        cache_entry = None
+        if cache_path is not None and cache_path.exists():
+            cache_entry = load_control_teacher_cache_entry(cache_path, record=record)
+        elif self.require_control_teacher_cache and cache_path is not None:
+            raise FileNotFoundError(f"missing mapper v1 control teacher cache entry: {cache_path}")
+        elif self.require_control_teacher_cache:
+            raise ValueError("require_control_teacher_cache=True requires control_teacher_cache_dir")
+
+        metadata = {
+            "beatmap_path": record.beatmap_path.as_posix(),
+            "audio_path": record.audio_path.as_posix(),
+            "difficulty": record.difficulty,
+            "target_start_frame": record.target_start_frame,
+            "target_start_ms": record.target_start_ms,
+            "control_record_index": mapper_record.control_record_index,
+        }
+        if cache_path is not None:
+            metadata["control_teacher_cache_key"] = control_teacher_cache_key(record)
+            metadata["control_teacher_cache_path"] = cache_path.as_posix()
+            metadata["control_teacher_cache_hit"] = cache_entry is not None
+
+        sample: dict[str, Any] = {
+            "difficulty": torch.tensor([record.difficulty], dtype=torch.float32),
+            "normalized_difficulty": torch.tensor([normalize_difficulty(record.difficulty)], dtype=torch.float32),
+            "target_tokens": tokenized.target_tensor(),
+            "teacher_current_ms": tokenized.teacher_current_ms,
+            "teacher_open_mask": tokenized.teacher_open_mask,
+            "teacher_open_age_ms": tokenized.teacher_open_age_ms,
+            "close_labels": tokenized.close_labels,
+            "close_label_mask": tokenized.close_label_mask,
+            "write_start_ms": torch.tensor(tokenized.write_start_ms, dtype=torch.long),
+            "write_end_ms": torch.tensor(tokenized.write_end_ms, dtype=torch.long),
+            "metadata": metadata,
+        }
+        if cache_entry is not None:
+            sample["control_memory_8s"] = cache_entry["control_memory_8s"]
+            sample["density_teacher_8s"] = cache_entry["density_teacher_8s"]
+            return sample
+
+        base_sample = self.control_dataset[mapper_record.control_record_index]
         density_target_8s, density_confidence_8s = extract_mapper_density_8s(
             self._load_control_v3_target_8s(record),
         )
@@ -118,38 +165,34 @@ class MapperV1WindowDataset(Dataset):
             raise ValueError(f"mapper write span exceeds frame_count: {write_end_frame} > {frame_count}")
         full_mel = base_sample["full_mel"]
         full_dense_timing_v2 = base_sample["full_dense_timing_v2"]
-        return {
-            "full_mel": base_sample["full_mel"],
-            "full_dense_timing_v2": base_sample["full_dense_timing_v2"],
-            "frame_count": base_sample["frame_count"],
-            "target_start_frame": base_sample["target_start_frame"],
-            "control_slice_start_frames": torch.tensor(
-                [record.target_start_frame + offset for offset in range(0, MAPPER_WRITE_FRAMES, TARGET_WINDOW_LENGTH_FRAMES)],
-                dtype=torch.long,
-            ),
-            "mel_context": full_mel[write_start_frame:write_end_frame].contiguous(),
-            "timing_context": full_dense_timing_v2[write_start_frame:write_end_frame].contiguous(),
-            "context_padding_mask": torch.zeros(MAPPER_CONTEXT_FRAMES, dtype=torch.bool),
-            "difficulty": base_sample["difficulty"].reshape(1),
-            "normalized_difficulty": base_sample["normalized_difficulty"].reshape(1),
-            "target_tokens": tokenized.target_tensor(),
-            "teacher_current_ms": tokenized.teacher_current_ms,
-            "teacher_open_mask": tokenized.teacher_open_mask,
-            "teacher_open_age_ms": tokenized.teacher_open_age_ms,
-            "close_labels": tokenized.close_labels,
-            "close_label_mask": tokenized.close_label_mask,
-            "density_target_8s": density_target_8s,
-            "density_confidence_8s": density_confidence_8s,
-            "write_start_ms": torch.tensor(tokenized.write_start_ms, dtype=torch.long),
-            "write_end_ms": torch.tensor(tokenized.write_end_ms, dtype=torch.long),
-            "metadata": {
-                "beatmap_path": record.beatmap_path.as_posix(),
-                "audio_path": record.audio_path.as_posix(),
-                "difficulty": record.difficulty,
-                "target_start_frame": record.target_start_frame,
-                "target_start_ms": record.target_start_ms,
-            },
-        }
+        sample.update(
+            {
+                "full_mel": base_sample["full_mel"],
+                "full_dense_timing_v2": base_sample["full_dense_timing_v2"],
+                "frame_count": base_sample["frame_count"],
+                "target_start_frame": base_sample["target_start_frame"],
+                "control_slice_start_frames": torch.tensor(
+                    [
+                        record.target_start_frame + offset
+                        for offset in range(0, MAPPER_WRITE_FRAMES, TARGET_WINDOW_LENGTH_FRAMES)
+                    ],
+                    dtype=torch.long,
+                ),
+                "mel_context": full_mel[write_start_frame:write_end_frame].contiguous(),
+                "timing_context": full_dense_timing_v2[write_start_frame:write_end_frame].contiguous(),
+                "context_padding_mask": torch.zeros(MAPPER_CONTEXT_FRAMES, dtype=torch.bool),
+                "difficulty": base_sample["difficulty"].reshape(1),
+                "normalized_difficulty": base_sample["normalized_difficulty"].reshape(1),
+                "density_target_8s": density_target_8s,
+                "density_confidence_8s": density_confidence_8s,
+            }
+        )
+        return sample
+
+    def control_teacher_cache_path(self, record: ControlWindowRecord) -> Path | None:
+        if self.control_teacher_cache_dir is None:
+            return None
+        return control_teacher_cache_path(self.control_teacher_cache_dir, record)
 
     def _build_records(
         self,
@@ -271,6 +314,108 @@ def extract_mapper_density_8s(control_v3_target_8s: torch.Tensor) -> tuple[torch
     return density_target, density_confidence
 
 
+def control_teacher_cache_key(record: ControlWindowRecord) -> str:
+    identity = "\n".join(
+        (
+            record.beatmap_path.as_posix(),
+            record.audio_path.as_posix(),
+            f"difficulty={float(record.difficulty):.8f}",
+            f"frame_count={int(record.frame_count)}",
+            f"target_start_frame={int(record.target_start_frame)}",
+        )
+    )
+    return hashlib.sha1(identity.encode("utf-8")).hexdigest()
+
+
+def control_teacher_cache_path(cache_dir: str | Path, record: ControlWindowRecord) -> Path:
+    key = control_teacher_cache_key(record)
+    return Path(cache_dir) / key[:2] / f"{key}.pt"
+
+
+def load_control_teacher_cache_entry(path: str | Path, *, record: ControlWindowRecord | None = None) -> dict[str, torch.Tensor]:
+    cache_path = Path(path)
+    payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"control teacher cache entry must contain a mapping: {cache_path}")
+    schema_version = payload.get("schema_version")
+    if int(schema_version) != CONTROL_TEACHER_CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported control teacher cache schema {schema_version}; "
+            f"expected {CONTROL_TEACHER_CACHE_SCHEMA_VERSION}"
+        )
+    if record is not None:
+        expected_key = control_teacher_cache_key(record)
+        if payload.get("cache_key") != expected_key:
+            raise ValueError(f"control teacher cache key mismatch for {cache_path}")
+        if int(payload.get("write_start_ms", -1)) != int(record.target_start_ms):
+            raise ValueError(f"control teacher cache write_start_ms mismatch for {cache_path}")
+        if int(payload.get("write_end_ms", -1)) != int(record.target_start_ms + MAPPER_WRITE_MS):
+            raise ValueError(f"control teacher cache write_end_ms mismatch for {cache_path}")
+
+    control_memory = payload.get("control_memory_8s")
+    density_teacher = payload.get("density_teacher_8s")
+    if not isinstance(control_memory, torch.Tensor):
+        raise ValueError(f"control teacher cache missing control_memory_8s tensor: {cache_path}")
+    if not isinstance(density_teacher, torch.Tensor):
+        raise ValueError(f"control teacher cache missing density_teacher_8s tensor: {cache_path}")
+    control_memory = control_memory.to(dtype=torch.float32).contiguous()
+    density_teacher = density_teacher.to(dtype=torch.float32).contiguous()
+    if control_memory.ndim != 2 or int(control_memory.shape[0]) != MAPPER_DENSITY_FRAMES:
+        raise ValueError(
+            f"control_memory_8s cache tensor must have shape [{MAPPER_DENSITY_FRAMES},D], "
+            f"got {tuple(control_memory.shape)}"
+        )
+    if int(control_memory.shape[1]) <= 0:
+        raise ValueError("control_memory_8s cache tensor must have a positive hidden dimension")
+    if tuple(density_teacher.shape) != (MAPPER_DENSITY_FRAMES, 1):
+        raise ValueError(
+            f"density_teacher_8s cache tensor must have shape [{MAPPER_DENSITY_FRAMES},1], "
+            f"got {tuple(density_teacher.shape)}"
+        )
+    if not torch.isfinite(control_memory).all() or not torch.isfinite(density_teacher).all():
+        raise ValueError(f"control teacher cache contains non-finite values: {cache_path}")
+    return {
+        "control_memory_8s": control_memory,
+        "density_teacher_8s": density_teacher,
+    }
+
+
+def save_control_teacher_cache_entry(
+    path: str | Path,
+    *,
+    record: ControlWindowRecord,
+    control_memory_8s: torch.Tensor,
+    density_teacher_8s: torch.Tensor,
+) -> None:
+    cache_path = Path(path)
+    control_memory = control_memory_8s.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    density_teacher = density_teacher_8s.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if control_memory.ndim != 2 or int(control_memory.shape[0]) != MAPPER_DENSITY_FRAMES:
+        raise ValueError(
+            f"control_memory_8s must have shape [{MAPPER_DENSITY_FRAMES},D], got {tuple(control_memory.shape)}"
+        )
+    if tuple(density_teacher.shape) != (MAPPER_DENSITY_FRAMES, 1):
+        raise ValueError(
+            f"density_teacher_8s must have shape [{MAPPER_DENSITY_FRAMES},1], got {tuple(density_teacher.shape)}"
+        )
+    if not torch.isfinite(control_memory).all() or not torch.isfinite(density_teacher).all():
+        raise ValueError("control teacher cache tensors must contain only finite values")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": CONTROL_TEACHER_CACHE_SCHEMA_VERSION,
+        "cache_key": control_teacher_cache_key(record),
+        "write_start_ms": int(record.target_start_ms),
+        "write_end_ms": int(record.target_start_ms + MAPPER_WRITE_MS),
+        "control_dim": int(control_memory.shape[1]),
+        "control_memory_8s": control_memory,
+        "density_teacher_8s": density_teacher,
+    }
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(cache_path)
+
+
 def control_teacher_slice_batch(mapper_batch: dict[str, Any], slice_index: int) -> dict[str, Any]:
     if not 0 <= int(slice_index) < 4:
         raise ValueError(f"slice_index must be in 0..3, got {slice_index}")
@@ -339,9 +484,6 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         close_label_mask[batch_index, :length] = sample["close_label_mask"].to(dtype=torch.bool)
 
     batch = {
-        "mel_context": torch.stack([sample["mel_context"].to(dtype=torch.float32) for sample in samples]),
-        "timing_context": torch.stack([sample["timing_context"].to(dtype=torch.float32) for sample in samples]),
-        "context_padding_mask": torch.stack([sample["context_padding_mask"].to(dtype=torch.bool) for sample in samples]),
         "difficulty": torch.stack([sample["difficulty"].to(dtype=torch.float32) for sample in samples]),
         "normalized_difficulty": torch.stack(
             [sample.get("normalized_difficulty", sample["difficulty"]).to(dtype=torch.float32) for sample in samples],
@@ -353,10 +495,6 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         "teacher_open_age_ms": teacher_open_age_ms,
         "close_labels": close_labels,
         "close_label_mask": close_label_mask,
-        "density_target_8s": torch.stack([sample["density_target_8s"].to(dtype=torch.float32) for sample in samples]),
-        "density_confidence_8s": torch.stack(
-            [sample["density_confidence_8s"].to(dtype=torch.float32) for sample in samples],
-        ),
         "write_start_ms": torch.stack([sample["write_start_ms"].to(dtype=torch.long) for sample in samples]).reshape(
             batch_size,
         ),
@@ -365,7 +503,42 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         ),
         "metadata": [sample.get("metadata", {}) for sample in samples],
     }
-    if all("full_mel" in sample and "full_dense_timing_v2" in sample and "frame_count" in sample for sample in samples):
+
+    has_control_teacher_cache = [
+        "control_memory_8s" in sample or "density_teacher_8s" in sample
+        for sample in samples
+    ]
+    if any(has_control_teacher_cache):
+        if not all("control_memory_8s" in sample and "density_teacher_8s" in sample for sample in samples):
+            raise ValueError(
+                "partial mapper v1 control teacher cache batch is not supported; "
+                "precompute all entries or disable the cache"
+            )
+        batch["control_memory_8s"] = torch.stack(
+            [sample["control_memory_8s"].to(dtype=torch.float32) for sample in samples]
+        )
+        batch["density_teacher_8s"] = torch.stack(
+            [sample["density_teacher_8s"].to(dtype=torch.float32) for sample in samples]
+        )
+
+    if all("density_target_8s" in sample and "density_confidence_8s" in sample for sample in samples):
+        batch["density_target_8s"] = torch.stack(
+            [sample["density_target_8s"].to(dtype=torch.float32) for sample in samples]
+        )
+        batch["density_confidence_8s"] = torch.stack(
+            [sample["density_confidence_8s"].to(dtype=torch.float32) for sample in samples],
+        )
+
+    has_control_inputs = all(
+        "full_mel" in sample and "full_dense_timing_v2" in sample and "frame_count" in sample
+        for sample in samples
+    )
+    if has_control_inputs and not all(has_control_teacher_cache):
+        batch["mel_context"] = torch.stack([sample["mel_context"].to(dtype=torch.float32) for sample in samples])
+        batch["timing_context"] = torch.stack([sample["timing_context"].to(dtype=torch.float32) for sample in samples])
+        batch["context_padding_mask"] = torch.stack(
+            [sample["context_padding_mask"].to(dtype=torch.bool) for sample in samples]
+        )
         frame_counts = [int(sample["frame_count"].item()) for sample in samples]
         max_frame_count = max(frame_counts)
         full_mel = torch.zeros((batch_size, max_frame_count, 160), dtype=torch.float32)

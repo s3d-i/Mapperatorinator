@@ -10,13 +10,19 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from train.stage_2.data.control_windows import DEFAULT_MAX_CACHED_MAPS
-from train.stage_2.data.mapper_v1_windows import MapperV1WindowDataset, collate_mapper_v1_windows
+from train.stage_2.data.mapper_v1_windows import (
+    MapperV1WindowDataset,
+    collate_mapper_v1_windows,
+    control_teacher_cache_path,
+    save_control_teacher_cache_entry,
+)
 from train.stage_2.model_control_demo_global import ControlDemoGlobalEncoder, ControlDemoGlobalEncoderConfig
 from train.stage_2.model_mapper_v1 import MapperV1Config, MapperV1Model, MapperV1ModelOutput, MapperV1Vocab
 from train.stage_2.model_mapper_v1.loss import adapter_bias_regularization, token_cross_entropy
+from train.stage_2.model_mapper_v1.model import compute_control_teacher_8s
 from train.stage_2.training.control import (
     CHECKPOINT_SCHEMA_VERSION,
     DEFAULT_FINAL_TRAIN_EVAL_SIZE,
@@ -64,6 +70,10 @@ RUN_CONFIG_KEYS = {
     "final_train_eval_size",
     "num_workers",
     "max_cached_maps",
+    "control_teacher_cache_dir",
+    "precompute_control_teacher_cache",
+    "require_control_teacher_cache",
+    "control_teacher_cache_overwrite",
     "synthetic_smoke",
     "model",
     "control_model",
@@ -131,6 +141,24 @@ class MapperV1LossOutput:
     metric_numerators: dict[str, float]
     metric_denominators: dict[str, float]
     model_output: MapperV1ModelOutput
+
+
+@dataclass(frozen=True)
+class MapperV1ControlTeacherCachePrecomputeResult:
+    cache_dir: Path
+    total_entries: int
+    computed_entries: int
+    skipped_entries: int
+    elapsed_s: float
+
+    def to_report(self) -> dict[str, Any]:
+        return {
+            "cache_dir": self.cache_dir.as_posix(),
+            "total_entries": self.total_entries,
+            "computed_entries": self.computed_entries,
+            "skipped_entries": self.skipped_entries,
+            "elapsed_s": self.elapsed_s,
+        }
 
 
 def load_run_config(config_path: str | Path) -> dict[str, Any]:
@@ -252,6 +280,10 @@ def run_mapper_v1_phase_b_training(
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     num_workers: int = 0,
     max_cached_maps: int | None = None,
+    control_teacher_cache_dir: Path | None = None,
+    precompute_control_teacher_cache: bool = False,
+    require_control_teacher_cache: bool = False,
+    control_teacher_cache_overwrite: bool = False,
     model_config_overrides: Mapping[str, Any] | None = None,
     control_model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
@@ -272,6 +304,11 @@ def run_mapper_v1_phase_b_training(
         dataset_kwargs["control_v3_timeseries_path"] = control_v3_timeseries_path
     effective_max_cached_maps = DEFAULT_MAX_CACHED_MAPS if max_cached_maps is None else max_cached_maps
     dataset_kwargs["max_cached_maps"] = effective_max_cached_maps
+    if control_teacher_cache_dir is not None:
+        dataset_kwargs["control_teacher_cache_dir"] = control_teacher_cache_dir
+        dataset_kwargs["require_control_teacher_cache"] = (
+            bool(require_control_teacher_cache) and not bool(precompute_control_teacher_cache)
+        )
     train_source = MapperV1WindowDataset(**dataset_kwargs)
     if len(train_source) == 0:
         raise ValueError("MapperV1WindowDataset produced no training windows")
@@ -292,6 +329,43 @@ def run_mapper_v1_phase_b_training(
         raise ValueError("training split is empty")
     if len(eval_dataset) == 0:
         eval_dataset = train_dataset
+
+    cache_precompute_reports: list[dict[str, Any]] = []
+    if precompute_control_teacher_cache:
+        if control_teacher_cache_dir is None:
+            raise ValueError("precompute_control_teacher_cache requires control_teacher_cache_dir")
+        precompute_device = select_torch_device(device_name)
+        precompute_encoder = ControlDemoGlobalEncoder(control_model_config).to(precompute_device)
+        if init_from_control_checkpoint is not None:
+            initialize_global_control_demo_from_control_checkpoint(
+                precompute_encoder,
+                init_from_control_checkpoint,
+            )
+        precompute_result = precompute_phase_b_control_teacher_cache(
+            train_source,
+            cache_dir=control_teacher_cache_dir,
+            control_encoder=precompute_encoder,
+            batch_size=batch_size,
+            device=precompute_device,
+            num_workers=num_workers,
+            overwrite=control_teacher_cache_overwrite,
+        )
+        cache_precompute_reports.append({"split": "source", **precompute_result.to_report()})
+        if eval_index_path is not None and isinstance(eval_dataset, MapperV1WindowDataset):
+            eval_precompute_result = precompute_phase_b_control_teacher_cache(
+                eval_dataset,
+                cache_dir=control_teacher_cache_dir,
+                control_encoder=precompute_encoder,
+                batch_size=batch_size,
+                device=precompute_device,
+                num_workers=num_workers,
+                overwrite=control_teacher_cache_overwrite,
+            )
+            cache_precompute_reports.append({"split": "eval", **eval_precompute_result.to_report()})
+        if require_control_teacher_cache:
+            train_source.require_control_teacher_cache = True
+            if isinstance(eval_dataset, MapperV1WindowDataset):
+                eval_dataset.require_control_teacher_cache = True
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -352,8 +426,121 @@ def run_mapper_v1_phase_b_training(
             "filter_report": asdict(train_source.filter_report),
             "max_cached_maps": int(getattr(train_source.control_dataset, "max_cached_maps", effective_max_cached_maps)),
             "num_workers": num_workers,
+            "control_teacher_cache_dir": (
+                control_teacher_cache_dir.as_posix() if control_teacher_cache_dir is not None else None
+            ),
+            "precompute_control_teacher_cache": bool(precompute_control_teacher_cache),
+            "require_control_teacher_cache": bool(require_control_teacher_cache),
+            "control_teacher_cache_overwrite": bool(control_teacher_cache_overwrite),
+            "control_teacher_cache_precompute": cache_precompute_reports,
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
+    )
+
+
+def precompute_phase_b_control_teacher_cache(
+    dataset: MapperV1WindowDataset,
+    *,
+    cache_dir: Path,
+    control_encoder: ControlDemoGlobalEncoder,
+    batch_size: int = 4,
+    device: torch.device,
+    num_workers: int = 0,
+    overwrite: bool = False,
+) -> MapperV1ControlTeacherCachePrecomputeResult:
+    if not isinstance(dataset, MapperV1WindowDataset):
+        raise TypeError("precompute_phase_b_control_teacher_cache requires a MapperV1WindowDataset")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = [
+        control_teacher_cache_path(cache_dir, mapper_record.control_record)
+        for mapper_record in dataset.records
+    ]
+    missing_indices = [
+        index
+        for index, path in enumerate(paths)
+        if overwrite or not path.exists()
+    ]
+    skipped_entries = len(paths) - len(missing_indices)
+    start_time = time.monotonic()
+    print(
+        f"mapper_v1_control_teacher_cache_precompute start total={len(paths)} "
+        f"missing={len(missing_indices)} cache_dir={cache_dir.as_posix()}",
+        flush=True,
+    )
+    if not missing_indices:
+        elapsed_s = time.monotonic() - start_time
+        print(
+            f"mapper_v1_control_teacher_cache_precompute done computed=0 skipped={skipped_entries} "
+            f"elapsed_s={elapsed_s:.1f}",
+            flush=True,
+        )
+        dataset.control_teacher_cache_dir = cache_dir
+        return MapperV1ControlTeacherCachePrecomputeResult(
+            cache_dir=cache_dir,
+            total_entries=len(paths),
+            computed_entries=0,
+            skipped_entries=skipped_entries,
+            elapsed_s=elapsed_s,
+        )
+
+    original_require_cache = dataset.require_control_teacher_cache
+    dataset.control_teacher_cache_dir = None
+    dataset.require_control_teacher_cache = False
+    computed_entries = 0
+    try:
+        loader = DataLoader(
+            Subset(dataset, missing_indices),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_mapper_v1_windows,
+        )
+        control_encoder.to(device)
+        control_encoder.eval()
+        offset = 0
+        for raw_batch in loader:
+            current_batch_size = int(raw_batch["target_tokens"].shape[0])
+            batch_indices = missing_indices[offset : offset + current_batch_size]
+            offset += current_batch_size
+            batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
+            with torch.no_grad():
+                control_memory_8s, density_teacher_8s = compute_control_teacher_8s(control_encoder, batch)
+            control_memory_8s = control_memory_8s.detach().cpu()
+            density_teacher_8s = density_teacher_8s.detach().cpu()
+            for batch_index, record_index in enumerate(batch_indices):
+                record = dataset.records[record_index].control_record
+                save_control_teacher_cache_entry(
+                    paths[record_index],
+                    record=record,
+                    control_memory_8s=control_memory_8s[batch_index],
+                    density_teacher_8s=density_teacher_8s[batch_index],
+                )
+                computed_entries += 1
+            if computed_entries == len(batch_indices) or computed_entries % max(batch_size * 25, 1) == 0:
+                print(
+                    f"mapper_v1_control_teacher_cache_precompute progress "
+                    f"computed={computed_entries}/{len(missing_indices)}",
+                    flush=True,
+                )
+    finally:
+        dataset.control_teacher_cache_dir = cache_dir
+        dataset.require_control_teacher_cache = original_require_cache
+
+    elapsed_s = time.monotonic() - start_time
+    print(
+        f"mapper_v1_control_teacher_cache_precompute done computed={computed_entries} "
+        f"skipped={skipped_entries} elapsed_s={elapsed_s:.1f}",
+        flush=True,
+    )
+    return MapperV1ControlTeacherCachePrecomputeResult(
+        cache_dir=cache_dir,
+        total_entries=len(paths),
+        computed_entries=computed_entries,
+        skipped_entries=skipped_entries,
+        elapsed_s=elapsed_s,
     )
 
 
@@ -927,6 +1114,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--num-workers", type=int, default=config_defaults.get("num_workers", 0))
     parser.add_argument("--max-cached-maps", type=int, default=config_defaults.get("max_cached_maps"))
+    parser.add_argument("--control-teacher-cache-dir", default=config_defaults.get("control_teacher_cache_dir"))
+    parser.add_argument(
+        "--precompute-control-teacher-cache",
+        action="store_true",
+        default=bool(config_defaults.get("precompute_control_teacher_cache", False)),
+    )
+    parser.add_argument(
+        "--require-control-teacher-cache",
+        action="store_true",
+        default=bool(config_defaults.get("require_control_teacher_cache", False)),
+    )
+    parser.add_argument(
+        "--control-teacher-cache-overwrite",
+        action="store_true",
+        default=bool(config_defaults.get("control_teacher_cache_overwrite", False)),
+    )
     parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
     args = parser.parse_args(argv)
 
@@ -973,6 +1176,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             final_train_eval_size=args.final_train_eval_size,
             num_workers=args.num_workers,
             max_cached_maps=args.max_cached_maps,
+            control_teacher_cache_dir=(
+                Path(args.control_teacher_cache_dir)
+                if args.control_teacher_cache_dir is not None
+                else None
+            ),
+            precompute_control_teacher_cache=args.precompute_control_teacher_cache,
+            require_control_teacher_cache=args.require_control_teacher_cache,
+            control_teacher_cache_overwrite=args.control_teacher_cache_overwrite,
             model_config_overrides=model_defaults,
             control_model_config_overrides=control_model_defaults,
             loss_config_overrides=loss_defaults,
