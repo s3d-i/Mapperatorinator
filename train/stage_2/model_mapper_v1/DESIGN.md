@@ -1,9 +1,10 @@
 ---
-pinned_commit: 174da51756075740411333c501a7cd8140157f03
-status: frozen
+pinned_commit: 2d96e6390c82cd65c7eb1eb6530be9b090e4dc72
+status: implementation-ready draft
 date: 2026-05-08
 owner: s3d-i
 module: train/stage_2/model_mapper_v1
+design_revision: v1.1
 depends_on:
   control_encoder: train/stage_2/model_control_demo_global
   control_config: train/stage_2/training/configs/stage2_control_demo_global_mps.yaml
@@ -13,152 +14,177 @@ time_shift_contract: canonical_relative_ts_v1
 ln_contract: carry_ln_state_v1
 ---
 
-# Stage 2 Mapper V1 Design Spec
+# Mapper V1.1 Design
 
-This document freezes the Stage 2 Mapper v1 contract for implementation.
+## 0. Status
 
-## Goal
+This document defines the implementation contract for
+`train/stage_2/model_mapper_v1`.
 
-Stage 2 Mapper v1 maps:
+Status: implementation-ready draft, not frozen until the following are
+implemented and audited:
+
+1. differentiable density auxiliary loss;
+2. context-aware LN close adapter;
+3. write-end dead-end grammar guard;
+4. density and LN-close evaluation metrics.
+
+The mapper is a control-conditioned autoregressive event generator for
+osu!mania 4K. It maps:
+
+- 8s audio, timing, and difficulty context;
+- frozen control memory;
+- density-level supervision;
+- local long-note state;
+
+to a legal sequence of chart event tokens.
+
+The mapper is not a chart oracle. Hard grammar remains the final authority for
+legality.
+
+## 1. Core Decisions
+
+### 1.1 Window Policy
+
+The mapper writes one independent 8s window.
+
+Definitions:
 
 ```text
-audio + dense timing + difficulty + coarse control memory
-```
-
-to a playable osu!mania 4K event token sequence.
-
-The model is not a complete chart oracle. It is a coarse
-control-conditioned autoregressive event generator:
-
-```text
-ControlDemoGlobalEncoder:
-  audio / timing / difficulty -> coarse density + control hidden
-MapperDecoder:
-  control hidden -> legal event token sequence
-Grammar:
-  hard legality, especially long-note open/close correctness
-```
-
-## Generation Unit
-
-Mapper v1 generates one independent 8 second write window at a time.
-
-```text
-[write_start_ms, write_end_ms)
+write_start_ms
 write_end_ms = write_start_ms + 8000
+valid chart event times are in [write_start_ms, write_end_ms)
 ```
 
-Each window decodes independently:
+The model does not carry LN state across windows in V1.
+
+Training samples with cross-window LNs are excluded unless a future version
+implements carry-in and carry-out.
+
+This exclusion must be audited:
 
 ```text
-BOS ... EOS
+num_total_windows
+num_mapper_eligible_windows
+num_dropped_cross_window_ln_windows
+drop_rate
+drop_rate_by_difficulty
+drop_rate_by_song
 ```
 
-The v1 demo fast path defines:
+If the cross-window drop rate is high, reported mapper quality is biased and
+the model is not production-valid.
+
+### 1.2 Grammar Policy
+
+The decoder may be wrong.
+
+The adapter may be wrong.
+
+Sampling may be noisy.
+
+The grammar must still make illegal output impossible.
+
+Final logits are:
 
 ```text
-EOS valid iff open_mask == 0
+logits_final =
+    logits_base
+  + logits_state_prior_adapter
+  + logits_ln_close_adapter
+  + hard_grammar_mask
 ```
 
-Therefore every long note opened inside an 8 second window must close before
-EOS. V1 does not support cross-window long-note carry-out.
+Invalid tokens receive `-inf`.
 
-A later proper version may add:
+No post-hoc repair is allowed in V1.
+
+### 1.3 Control Model Policy
+
+The existing control model is reused as a frozen conditioner.
+
+The mapper does not train the control encoder in V1.
+
+The control encoder provides:
 
 ```text
-WINDOW_EOS allows open_mask != 0
-SONG_EOS requires open_mask == 0
+control_memory
+density_teacher
 ```
 
-That complexity is explicitly out of scope for v1.
-
-## Input Contract
-
-Each mapper sample corresponds to one 8 second write window.
+The training dataset also provides:
 
 ```text
-full_mel: FloatTensor[B, T_full, 160]
-full_dense_timing_v2: FloatTensor[B, T_full, 4]
-padding_mask: BoolTensor[B, T_full]
-frame_count: LongTensor[B]
-normalized_difficulty: FloatTensor[B]
-mapper_write_start_ms: LongTensor[B]
-mapper_write_start_frame: LongTensor[B]
+density_target
+density_confidence
 ```
 
-Frozen geometry:
+Do not collapse these names.
+
+`density_target` is the supervised target.
+
+`density_teacher` is the frozen control model prediction.
+
+## 2. Inputs
+
+### 2.1 Mapper Batch
+
+Each mapper batch item contains:
 
 ```text
-frame_hop_ms = 20
-mapper_window_frames = 400
-mapper_window_ms = 8000
+mel_context              [B, context_frames, mel_dim]
+timing_context           [B, context_frames, timing_dim]
+difficulty               [B, difficulty_dim]
+context_padding_mask     [B, context_frames]
+target_tokens            [B, seq_len]
+target_token_mask        [B, seq_len]
+teacher_states:
+    current_ms           [B, seq_len]
+    open_mask            [B, seq_len, 4]
+    open_age_ms          [B, seq_len, 4]
+density_target_8s        [B, 400, 1]
+density_confidence_8s    [B, 400, 1]
 ```
 
-## Control Encoder Reuse
+The 400 density frames correspond to 20ms frames across 8s.
 
-Mapper v1 reuses the trained `ControlDemoGlobalEncoder` from:
+### 2.2 Control Encoder Output
+
+The frozen control encoder runs on the same audio, timing, and difficulty
+context.
+
+It returns:
 
 ```text
-train/stage_2/model_control_demo_global
+control_memory_context   [B, context_frames, D]
+density_teacher_2s       [B, 100, 1] per 2s target slice
 ```
 
-with training config:
+For an 8s mapper window, concatenate four aligned 2s slices:
 
 ```text
-train/stage_2/training/configs/stage2_control_demo_global_mps.yaml
+control_memory_8s        [B, 400, D]
+density_teacher_8s       [B, 400, 1]
 ```
 
-The control encoder 2 second target output is:
+If the control encoder internally emits a larger memory than 400 frames, the
+mapper consumes only the aligned 8s write span.
+
+### 2.3 Naming
+
+Use these names consistently:
 
 ```text
-density_pred: [B, 100, 1]
-control_memory: [B, 600, D]
+density_target_8s      ground-truth control_v3 density_level
+density_confidence_8s  ground-truth control_v3 density_confidence
+density_teacher_8s     frozen control model value prediction
 ```
 
-Because the mapper window is 8 seconds, control memory is built by concatenating
-four 2 second target slices:
+Never call `density_teacher_8s` the target.
 
-```python
-control_memory_8s = concat([
-    control_out_0.control_memory[:, target_offset : target_offset + 100],
-    control_out_1.control_memory[:, target_offset : target_offset + 100],
-    control_out_2.control_memory[:, target_offset : target_offset + 100],
-    control_out_3.control_memory[:, target_offset : target_offset + 100],
-], dim=1)
-```
+## 3. Token Vocabulary
 
-The resulting mapper control inputs are:
-
-```text
-control_memory_8s: [B, 400, D]
-density_pred_8s: [B, 400, 1]
-```
-
-The four target starts are:
-
-```text
-write_start_ms + 0
-write_start_ms + 2000
-write_start_ms + 4000
-write_start_ms + 6000
-```
-
-V1 defaults to freezing `ControlDemoGlobalEncoder` and training only the
-mapper decoder plus adapters. Fine-tuning the final control encoder layers is
-deferred.
-
-## Token Vocabulary
-
-### TokenType
-
-```python
-class TokenType(Enum):
-    SPECIAL = 0
-    TIME_SHIFT = 1
-    EVENT = 2
-```
-
-### SPECIAL Tokens
+### 3.1 Special Tokens
 
 ```text
 PAD
@@ -166,718 +192,1389 @@ BOS
 EOS
 ```
 
-There is no `UNK`. Data that cannot be encoded must fail audit directly.
+No `UNK`.
 
-## EVENT Token Contract
+`PAD` is used only for batching.
 
-An `EVENT` token represents the 4-lane action tuple occurring at one timestamp.
+### 3.2 EVENT Tokens
 
-Each lane action is:
+Each `EVENT` token represents one simultaneous 4-lane action tuple.
 
-```python
-class LaneAction(Enum):
-    NONE = 0
-    TAP = 1
-    HOLD_START = 2
-    HOLD_END = 3
-```
-
-Event token metadata:
-
-```python
-@dataclass(frozen=True)
-class EventTokenSpec:
-    token_id: int
-    lane_actions: tuple[LaneAction, LaneAction, LaneAction, LaneAction]
-```
-
-The theoretical lane-action space is:
+Per-lane action set:
 
 ```text
-4 ** 4 = 256
+NONE
+TAP
+HOLD_START
+HOLD_END
 ```
 
-`EVENT(NONE, NONE, NONE, NONE)` is a no-op and is not generatable in v1. It may
-exist in metadata, but grammar must always mark it invalid.
-
-The actual event vocabulary is 255 non-empty lane-action tuples.
-
-Event semantics:
+There are:
 
 ```text
-EVENT occurs at current_ms
-EVENT does not advance current_ms
+4^4 = 256 raw tuples
 ```
 
-A chord is a first-class token. Same-time lane actions are not emitted as
-multiple lane tokens.
+The all-`NONE` tuple is not a generatable `EVENT`.
 
-## TIME_SHIFT Token Contract
-
-### Semantics
-
-`TS_k` advances the current decode time cursor forward by `k` milliseconds:
+Therefore:
 
 ```text
-current_ms += k
+255 non-empty EVENT tokens
 ```
 
-`TS_k` is relative to the current cursor, not absolute relative to the window
-start.
+An `EVENT` occurs at `current_ms`.
 
-Initial decode time:
+An `EVENT` does not advance time.
+
+Chords are first-class `EVENT` tokens.
+
+### 3.3 TIME_SHIFT Tokens
+
+A `TIME_SHIFT` token advances the cursor by a relative amount.
+
+Recommended vocabulary:
 
 ```text
-current_ms = write_start_ms
+TS_10
+TS_20
+TS_30
+...
+TS_90
+TS_100
+TS_200
+...
+TS_900
+TS_1000
+TS_2000
+TS_3000
+TS_4000
 ```
 
-`EVENT` tokens occur at the current `current_ms`.
+All target event timestamps must be aligned to 10ms.
 
-### TIME_SHIFT_VOCAB_V1
+Every positive delta must have exactly one canonical encoding.
 
-Frozen time-shift values:
+Use greedy largest-first encoding.
+
+Example:
 
 ```text
-TS_10,  TS_20,  ..., TS_90
-TS_100, TS_200, ..., TS_900
-TS_1000, TS_2000, TS_3000, TS_4000
+delta = 3270ms
+=> TS_3000 TS_200 TS_70
 ```
 
-```python
-TIME_SHIFT_VALUES_MS = (
-    10, 20, 30, 40, 50, 60, 70, 80, 90,
-    100, 200, 300, 400, 500, 600, 700, 800, 900,
-    1000, 2000, 3000, 4000,
-)
+### 3.4 Approximate Vocabulary Size
+
+```text
+3 special tokens
+255 EVENT tokens
+22 TIME_SHIFT tokens
+= 280 tokens
 ```
 
-There are 22 time-shift tokens. The largest token is `TS_4000`.
+Exact size depends on the final time-shift vocabulary.
 
-An empty 8 second window is:
+## 4. Canonical Tokenizer
+
+### 4.1 Target Construction
+
+Given all hit objects inside the 8s write window:
+
+1. sort by timestamp;
+2. group all lane actions with the same timestamp;
+3. emit canonical `TIME_SHIFT` sequence from previous timestamp to current
+   timestamp;
+4. emit exactly one `EVENT` token for the grouped actions;
+5. after the last event, emit `TIME_SHIFT` sequence to `write_end_ms`;
+6. emit `EOS`.
+
+The target sequence always starts with `BOS`.
+
+### 4.2 Empty Window
+
+An empty 8s window is encoded as:
 
 ```text
 BOS TS_4000 TS_4000 EOS
 ```
 
-### Canonical Encoding
+### 4.3 LN State Update During Tokenization
 
-All timestamp deltas must be 10ms aligned:
+The tokenizer must simulate LN state.
 
-```text
-delta_ms > 0
-delta_ms % 10 == 0
-delta_ms <= 8000
-```
-
-Encoding uses greedy largest-first decomposition:
-
-```python
-TS_VALUES_DESC = (
-    4000, 3000, 2000, 1000,
-    900, 800, 700, 600, 500, 400, 300, 200, 100,
-    90, 80, 70, 60, 50, 40, 30, 20, 10,
-)
-
-def encode_ts(delta_ms: int) -> list[int]:
-    assert delta_ms > 0
-    assert delta_ms % 10 == 0
-    assert delta_ms <= 8000
-    out = []
-    remaining = delta_ms
-    for k in TS_VALUES_DESC:
-        while remaining >= k:
-            out.append(k)
-            remaining -= k
-    assert remaining == 0
-    return out
-```
-
-Examples:
+State:
 
 ```text
-8000 -> TS_4000 TS_4000
-7990 -> TS_4000 TS_3000 TS_900 TS_90
-5000 -> TS_4000 TS_1000
-3760 -> TS_3000 TS_700 TS_60
-1250 -> TS_1000 TS_200 TS_50
-120  -> TS_100 TS_20
-10   -> TS_10
+open_mask[4]      bool
+open_age_ms[4]    int
 ```
 
-Each delta has exactly one legal encoding.
+Rules:
 
-## CarryLNState Contract
+- `TAP` requires lane closed before event and remains closed after event.
+- `HOLD_START` requires lane closed before event and opens lane after event.
+- `HOLD_END` requires lane open before event and closes lane after event.
+- `NONE` leaves lane state unchanged.
+- `TIME_SHIFT` increments `open_age_ms` for open lanes only.
+- `EOS` requires all lanes closed.
 
-```python
-@dataclass(frozen=True)
-class CarryLNState:
-    open_mask: int  # 0..15
-    open_age_ms_by_lane: tuple[int, int, int, int]
-```
+Samples that require carry-in or carry-out LN state are excluded in V1.
 
-Meaning:
+## 5. Hard Grammar
+
+The hard grammar consumes:
 
 ```text
-open_mask bit lane:
-  0 = lane closed
-  1 = lane open
-open_age_ms_by_lane[lane]:
-  closed -> 0
-  open   -> current_ms - hold_start_ms
+previous token position
+current_ms
+open_mask
+open_age_ms
+write_start_ms
+write_end_ms
 ```
 
-Decode state:
+and returns a boolean valid-token mask.
 
-```python
-@dataclass(frozen=True)
-class DecodeState:
-    current_ms: int
-    carry: CarryLNState
-```
+### 5.1 Special Token Rules
 
-V1 window initial state:
-
-```python
-CarryLNState(
-    open_mask=0,
-    open_age_ms_by_lane=(0, 0, 0, 0),
-)
-```
-
-## State Update Rules
-
-### TIME_SHIFT Update
+`PAD`:
 
 ```text
-current_ms += k
-for lane in open lanes:
-    open_age_ms_by_lane[lane] += k
+never valid during generation
 ```
 
-### EVENT Update
-
-`EVENT` is applied atomically across all 4 lanes:
+`BOS`:
 
 ```text
-for lane, action in enumerate(event.lane_actions):
-    if action == NONE:
-        continue
-    if action == TAP:
-        require lane closed
-        state unchanged
-    if action == HOLD_START:
-        require lane closed
-        open lane
-        age[lane] = 0
-    if action == HOLD_END:
-        require lane open
-        close lane
-        age[lane] = 0
+valid only at position 0
+invalid after position 0
 ```
 
-`EVENT` does not advance time.
-
-## Grammar Contract
-
-The hard grammar mask is the final legality authority.
-
-Logit order:
+`EOS`:
 
 ```text
-logits = base_logits
-logits = logits + dynamic_state_logits_adapter(dynamic_state_t)
-logits = logits + hard_grammar_mask(decode_state_t)
+valid iff:
+    position > 0
+    current_ms == write_end_ms
+    open_mask == 0
 ```
 
-The hard grammar mask is applied last. Invalid tokens must receive `-inf` or an
-equivalent large negative value.
-
-### SPECIAL Grammar
-
-```text
-PAD:
-  never valid during generation
-BOS:
-  only first token
-EOS:
-  valid iff open_mask == 0
-```
-
-V1 makes EOS invalid before every open long note has been closed.
-
-### TIME_SHIFT Grammar
+### 5.2 TIME_SHIFT Rules
 
 `TS_k` is valid iff:
 
 ```text
-k > 0
 current_ms + k <= write_end_ms
 ```
 
-If:
+Additional dead-end guard:
 
 ```text
-current_ms == write_end_ms
+if open_mask != 0:
+    current_ms + k must be < write_end_ms
 ```
 
-then:
+Rationale:
 
-```text
-TIME_SHIFT invalid
-EVENT invalid
-EOS valid iff open_mask == 0
-```
+If an LN is open, allowing the cursor to move exactly to `write_end_ms` creates
+a dead state because `EVENT` is no longer valid and `EOS` requires no open
+lanes.
 
-### EVENT Grammar
+### 5.3 EVENT Rules
 
-`EVENT` is valid iff:
+An `EVENT` token is valid iff:
 
 ```text
 current_ms < write_end_ms
-event tuple is not all NONE
-lane actions obey open_mask
 ```
 
-Per-lane legality:
+and the action tuple is non-empty.
+
+For each lane:
+
+If lane is closed:
 
 ```text
-if lane closed:
-  valid:
+valid actions:
     NONE
     TAP
     HOLD_START
-  invalid:
+invalid:
     HOLD_END
-if lane open:
-  valid:
+```
+
+If lane is open:
+
+```text
+valid actions:
     NONE
     HOLD_END
-  invalid:
+invalid:
     TAP
     HOLD_START
 ```
 
-Pseudocode:
+### 5.4 Optional Min-LN Guard
 
-```python
-def is_event_valid(actions, open_mask, current_ms, write_end_ms):
-    if current_ms >= write_end_ms:
-        return False
-    has_action = False
-    for lane, action in enumerate(actions):
-        lane_open = bool(open_mask & (1 << lane))
-        if action != LaneAction.NONE:
-            has_action = True
-        if lane_open:
-            if action in (LaneAction.TAP, LaneAction.HOLD_START):
-                return False
-        else:
-            if action == LaneAction.HOLD_END:
-                return False
-    return has_action
-```
+V1 may disable this.
 
-## Mapper Decoder Architecture
+If enabled:
 
 ```text
-prev_tokens
-  -> token embedding
-  -> positional embedding / rotary / learned causal position
-  -> causal Transformer decoder
-       self-attention over prefix
-       cross-attention to control_memory_8s
-  -> base logits over vocab
+HOLD_START invalid when remaining window time < min_ln_duration_ms
 ```
 
-Recommended v1 config:
+This reduces impossible short LNs near the end of a window.
+
+Recommended default:
 
 ```text
-d_model: 384
-decoder_layers: 4
-heads: 8
-ffn_dim: 1536
-dropout: 0.1
-max_seq_len: audit-derived, likely 512 or 768 initially
-cross_attention_memory: control_memory_8s
+min_ln_duration_ms = 60
 ```
 
-Decoder input:
+This is a style guard, not a legality guard.
+
+## 6. Model Architecture
+
+### 6.1 Frozen Control Encoder
+
+Use the existing `ControlDemoGlobalEncoder`.
+
+Freeze all parameters:
 
 ```text
-prev_token_ids: LongTensor[B, L]
-control_memory_8s: FloatTensor[B, 400, D]
-control_memory_padding_mask: BoolTensor[B, 400]
+requires_grad = False
+eval mode
 ```
 
-Decoder output:
+Mapper receives:
 
 ```text
-base_logits: FloatTensor[B, L, vocab_size]
+control_memory_8s
+density_teacher_8s
 ```
 
-## DynamicStateLogitsAdapter
+No gradient flows into the control encoder.
 
-### Purpose
+### 6.2 Mapper Decoder
 
-The dynamic adapter provides a soft bias based on the current long-note state.
-It must not become another decoder.
-
-It may only output structured lane/action bias:
+Recommended baseline:
 
 ```text
-lane_action_bias: [B, 4 lanes, 4 actions]
+d_model       = 384
+num_layers    = 4
+num_heads     = 8
+ffn_dim       = 1536
+dropout       = 0.1
+max_seq_len   = audit_p99_seq_len + safety_margin
 ```
 
-The lane/action bias is projected to event-token logits through fixed vocab
-metadata.
+The decoder is causal.
 
-### Input
+It attends to:
 
-At every teacher-forced or decode step:
+- previous target tokens;
+- `control_memory_8s`;
+- difficulty embedding;
+- timing position embedding.
+
+Output:
 
 ```text
-open_mask_t: LongTensor[B]
-open_age_ms_by_lane_t: LongTensor[B, 4]
+base_logits [B, seq_len, vocab_size]
+decoder_hidden [B, seq_len, d_model]
 ```
 
-Derived features:
+### 6.3 Control Projection
+
+If `control_memory_8s` dimension differs from decoder `d_model`, use:
 
 ```text
-open bits [B, 4]
-age norm [B, 4]
-age bucket [B, 4]
-lane id [4]
+control_proj = Linear(control_dim, d_model)
 ```
 
-### Architecture
+Do not use a deep MLP unless required by audit.
+
+### 6.4 State Feature Encoding
+
+At each decode step, construct per-lane state features:
 
 ```text
-open_mask + open_age
-  -> DynamicStateEncoder
-  -> low-rank bottleneck
-  -> lane_action_bias[4, 4]
-  -> fixed projection to EVENT vocab
+open_bit
+age_ms
+age_norm = min(age_ms / age_cap_ms, 1.0)
+age_bucket
+lane_id_embedding
+remaining_ms
+remaining_norm
 ```
 
-Recommended configuration:
+Recommended:
 
 ```text
-d_state: 64
-rank: 8
-age_buckets_ms:
-  [0, 40, 80, 120, 200, 400, 800, 1600, 3200, 6400]
-init:
-  final projection zero-initialized
-  adapter scale near zero
+age_cap_ms = 4000
+num_age_buckets = 32
 ```
 
-Pseudocode:
+## 7. Dynamic Adapters
 
-```python
-lane_h = (
-    lane_embedding[lane]
-    + open_embedding[open_bit]
-    + age_bucket_embedding[age_bucket]
-    + scalar_proj([open_bit, age_norm])
-)
-lane_h = LayerNorm(lane_h)
-raw = Linear(rank, 4)(
-    GELU(
-        Linear(d_state, rank)(lane_h)
+The V1.1 adapter is split into two constrained parts:
+
+```text
+StatePriorAdapter
+LNCloseAdapter
+```
+
+Both adapters output structured biases.
+
+Neither adapter may output arbitrary full-vocabulary logits.
+
+Hard grammar remains final.
+
+## 8. StatePriorAdapter
+
+### 8.1 Purpose
+
+The `StatePriorAdapter` learns soft priors such as:
+
+- long-open LN is more likely to close;
+- just-open LN is unlikely to close;
+- certain lanes may have different empirical priors;
+- closed lanes may prefer `TAP` vs `HOLD_START` under specific local state.
+
+It does not decide musical timing by itself.
+
+### 8.2 Inputs
+
+```text
+open_mask              [B, T, 4]
+open_age_ms            [B, T, 4]
+lane_id                [4]
+remaining_ms           [B, T]
+```
+
+### 8.3 Output
+
+```text
+lane_action_bias       [B, T, 4, 4]
+```
+
+The four action channels are:
+
+```text
+NONE
+TAP
+HOLD_START
+HOLD_END
+```
+
+### 8.4 Projection to EVENT Tokens
+
+For each `EVENT` token `v` with lane actions `a_l`:
+
+```text
+event_bias[v] = sum_l lane_action_bias[l, a_l]
+```
+
+For non-`EVENT` tokens:
+
+```text
+state_prior_bias = 0
+```
+
+### 8.5 Initialization
+
+Initialize near zero:
+
+```text
+final_weight std = 1e-3
+final_bias = 0
+adapter_scale initial = 0.05
+```
+
+Do not initialize the whole adapter to exact zero if that blocks useful early
+hidden-layer learning.
+
+Bound the final projected bias:
+
+```text
+bias = max_bias * tanh(raw_bias / max_bias)
+max_bias = 3.0
+```
+
+## 9. LNCloseAdapter
+
+### 9.1 Problem
+
+LN close timing is not only a legality problem.
+
+It is a timing decision.
+
+A state-only adapter can learn duration priors, but it cannot know that the
+current audio and control context indicates release now.
+
+Therefore the LN close adapter must be context-aware.
+
+### 9.2 Inputs
+
+At each decode step:
+
+```text
+decoder_hidden_t          [B, T, d_model]
+local_control_t           [B, T, d_model]
+local_density_teacher_t   [B, T, 1]
+open_mask_t               [B, T, 4]
+open_age_ms_t             [B, T, 4]
+remaining_ms_t            [B, T, 1]
+lane_id_embedding         [4, lane_dim]
+```
+
+`local_control_t` is gathered from `control_memory_8s` by:
+
+```text
+frame_idx = floor((current_ms - write_start_ms) / 20)
+```
+
+Clamp only for safety. Invalid current times should be caught earlier.
+
+Optionally pool local control over a small neighborhood:
+
+```text
+frames [f - 2, f - 1, f, f + 1, f + 2]
+```
+
+### 9.3 Output
+
+The head predicts lane-level close hazards:
+
+```text
+close_logit [B, T, 4]
+```
+
+Only open lanes are meaningful.
+
+Closed lanes are masked out for close loss.
+
+### 9.4 Projection to Logits
+
+For each `EVENT` token:
+
+```text
+for lane l:
+    if lane is open and token action is HOLD_END:
+        add +close_bias[l]
+    if lane is open and token action is NONE:
+        add +keep_bias[l]
+```
+
+Recommended:
+
+```text
+close_bias[l] = close_scale * tanh(close_logit[l])
+keep_bias[l]  = -0.25 * close_bias[l]
+```
+
+This softly prefers closing when hazard is high but does not force closure.
+
+### 9.5 EVENT-vs-TIME_SHIFT Gate
+
+A close adapter that only boosts `EVENT` tokens may still lose to
+`TIME_SHIFT` logits.
+
+Therefore add a constrained scalar skip penalty when an open-lane close hazard
+is high:
+
+```text
+any_close_hazard = max_l sigmoid(close_logit[l]) over open lanes
+time_shift_bias = -skip_scale * any_close_hazard
+```
+
+Apply this only to `TIME_SHIFT` tokens and only when `open_mask != 0`.
+
+Recommended:
+
+```text
+skip_scale <= 1.5
+```
+
+This is not arbitrary full-vocabulary control. It only affects the competition
+between "close now" and "move time forward while an LN is open".
+
+### 9.6 Initialization
+
+Start conservative:
+
+```text
+close_scale initial = 0.05
+skip_scale initial = 0.0
+```
+
+Ramp `skip_scale` after the close auxiliary loss starts improving.
+
+Do not let the adapter close all LNs early.
+
+## 10. Density Auxiliary Loss
+
+### 10.1 Goal
+
+Use existing `density_level` supervision to teach the mapper whether its
+probability distribution places the right amount of note onset mass over time.
+
+This loss must be differentiable.
+
+Do not compute it from sampled tokens.
+
+Do not compute it from gold tokens except for calibration and metrics.
+
+### 10.2 Targets
+
+Training target:
+
+```text
+density_target_8s [B, 400, 1]
+```
+
+Weight:
+
+```text
+density_confidence_8s [B, 400, 1]
+```
+
+Optional weak teacher:
+
+```text
+density_teacher_8s [B, 400, 1]
+```
+
+Priority order:
+
+1. `density_target_8s`;
+2. `density_teacher_8s` only as fallback or weak consistency.
+
+### 10.3 Expected Onset Mass
+
+Use grammar-masked logits under teacher forcing:
+
+```text
+p_t = softmax(logits_final_t)
+```
+
+For each `EVENT` token `v`, define:
+
+```text
+onset_weight(v) =
+    number of lanes where action is TAP or HOLD_START
+```
+
+Default:
+
+```text
+HOLD_END contributes 0
+NONE contributes 0
+```
+
+Reason:
+
+`density_level` should model note onset density. LN release behavior is
+supervised separately by LN close loss.
+
+Then:
+
+```text
+expected_onset_mass_t =
+    sum_EVENT_v p_t[v] * onset_weight(v)
+```
+
+Ignore `PAD` positions.
+
+### 10.4 Scatter to 20ms Density Frames
+
+For each decode step:
+
+```text
+frame_idx_t = floor((current_ms_t - write_start_ms) / 20)
+```
+
+Scatter-add:
+
+```text
+raw_mass[f] += expected_onset_mass_t
+```
+
+Only scatter when:
+
+```text
+0 <= frame_idx_t < 400
+```
+
+### 10.5 Smoothing and Calibration
+
+The raw expected mass will not automatically be on the same scale as
+`density_level`.
+
+Use one of two approaches.
+
+Preferred approach:
+
+```text
+reuse the same density feature transform as control_v3,
+implemented differentiably
+```
+
+Fallback approach:
+
+1. compute raw onset mass from gold tokens over the training set;
+2. smooth it with a fixed kernel over 20ms frames;
+3. fit a monotonic scalar calibration from smoothed mass to `density_level`;
+4. freeze that calibration for mapper training.
+
+Recommended smoothing kernel:
+
+```text
+triangular or Gaussian
+radius = 5 frames
+frame step = 20ms
+```
+
+Example calibrated prediction:
+
+```text
+density_pred_from_mapper =
+    soft_clip(a * smooth(raw_expected_mass) + b)
+```
+
+where:
+
+```text
+soft_clip(x) = sigmoid(x)
+```
+
+or another fixed monotonic bounded mapping.
+
+The calibration parameters must be logged.
+
+### 10.6 Loss
+
+Primary density auxiliary:
+
+```text
+L_density_target =
+    weighted_smooth_l1(
+        density_pred_from_mapper,
+        density_target_8s,
+        weight = density_confidence_8s
     )
-)
-lane_action_bias = tanh(raw) * softplus(scale_logit)
 ```
 
-### Projection to Flat Vocab
-
-For `EVENT` tokens:
-
-```python
-event_bias[token] = sum(
-    lane_action_bias[:, lane, action_of_token_lane]
-    for lane in range(4)
-)
-```
-
-For non-event tokens:
+Add a window-level count consistency term:
 
 ```text
-PAD/BOS/EOS/TIME_SHIFT bias = 0
+L_density_window =
+    smooth_l1(
+        mean_f density_pred_from_mapper[f],
+        mean_f density_target_8s[f]
+    )
 ```
 
-Final flat bias:
-
-```python
-flat_bias[:, event_token_ids] = event_bias
-```
-
-This design is:
-
-- low-rank;
-- action-aware;
-- structured;
-- unable to directly rewrite arbitrary vocab logits;
-- unable to bypass hard grammar.
-
-## Training Tokenization
-
-### Window Tokenization
-
-Given an 8 second window:
+Total density loss:
 
 ```text
-write_start_ms
-write_end_ms = write_start_ms + 8000
+L_density =
+    L_density_target
+  + 0.25 * L_density_window
 ```
 
-Initialize:
-
-```python
-current_ms = write_start_ms
-state = CarryLNState(0, (0, 0, 0, 0))
-tokens = [BOS]
-```
-
-Convert beatmap hit objects to timestamp groups:
-
-```python
-dict[int, tuple[LaneAction, LaneAction, LaneAction, LaneAction]]
-```
-
-For each timestamp `t`:
+Optional weak teacher consistency:
 
 ```text
-delta = t - current_ms
-emit canonical TS tokens for delta
-emit EVENT(tuple lane actions)
-update current_ms
-update CarryLNState
+L_density_teacher =
+    smooth_l1(
+        density_pred_from_mapper,
+        stopgrad(density_teacher_8s)
+    )
 ```
 
-Finally:
+Use only when ground-truth density target is unavailable or as a tiny
+regularizer:
 
 ```text
-require state.open_mask == 0
-emit EOS
+lambda_density_teacher <= 0.02
 ```
 
-If the window contains a cross-boundary long note that cannot be closed before
-EOS, drop the sample for v1 and record an audit counter.
+### 10.7 Loss Schedule
 
-### Required Audits
+Do not start with a large density loss.
 
-The mapper dataset builder must output:
+Recommended schedule:
 
 ```text
-window_count_total
-window_count_kept
-window_count_dropped_cross_window_ln
-invalid_event_tuple_count
-invalid_ts_delta_count
-max_tokens_per_window
-mean_tokens_per_window
-p95_tokens_per_window
-p99_tokens_per_window
-event_vocab_coverage
-ts_vocab_distribution
-open_mask_nonzero_before_eos_count
+steps 0 - warmup_steps:
+    lambda_density = 0
+after warmup:
+    linearly ramp to lambda_density_max
+lambda_density_max = 0.05
 ```
 
-Any nonzero `open_mask_nonzero_before_eos_count` is a hard fail.
+If token CE remains stable and density metrics improve, allow:
 
-## Training Forward Pass
+```text
+lambda_density_max = 0.10
+```
 
-Teacher forcing:
+Cap density gradient norm so it does not dominate token CE:
 
-```python
-control_memory_8s, density_pred_8s = build_control_memory_8s(...)
-gold_tokens = batch["mapper_tokens"]
-gold_dynamic_states = batch["dynamic_state_trace"]
-base_logits = mapper_decoder(
-    prev_tokens=gold_tokens[:, :-1],
-    control_memory=control_memory_8s,
-)
-dynamic_bias = dynamic_state_logits_adapter(
-    open_mask=gold_dynamic_states.open_mask[:, :-1],
-    open_age_ms_by_lane=gold_dynamic_states.open_age[:, :-1],
-)
-grammar_mask = hard_grammar_mask_batch(
-    decode_states=gold_decode_states[:, :-1],
-)
-logits = base_logits + dynamic_bias + grammar_mask
-target = gold_tokens[:, 1:]
+```text
+density_grad_norm <= 0.3 * token_ce_grad_norm
+```
+
+### 10.8 Density Metrics
+
+Report:
+
+```text
+density_frame_mae
+density_frame_smooth_l1
+density_window_mean_error
+density_pearson_corr
+density_spearman_corr
+expected_onset_count_error
+generated_onset_count_error
+```
+
+Report both teacher-forced and generated metrics.
+
+## 11. LN Close Auxiliary Loss
+
+### 11.1 Goal
+
+Train the `LNCloseAdapter` to decide when each open lane should close.
+
+This is a lane-level hazard prediction problem.
+
+### 11.2 Labels
+
+For each teacher-forced decode step `t` and lane `l`:
+
+Mask:
+
+```text
+close_mask[t,l] = open_mask[t,l]
+```
+
+Positive label:
+
+```text
+y_close[t,l] = 1
+iff
+    gold next token is EVENT
+    and gold EVENT action for lane l is HOLD_END
+```
+
+Negative label:
+
+```text
+y_close[t,l] = 0
+iff
+    lane l is open
+    and the gold next token does not close lane l
+```
+
+This includes `TIME_SHIFT` steps while the lane remains open.
+
+Closed lanes are ignored.
+
+### 11.3 Loss
+
+Use class-balanced BCE or focal BCE.
+
+Recommended:
+
+```text
+pos_weight = num_negative_open_lane_steps / num_positive_close_steps
+```
+
+Clamped:
+
+```text
+1 <= pos_weight <= 20
 ```
 
 Loss:
 
 ```text
-L_token = cross_entropy(logits, target, ignore_index=PAD)
+L_ln_close =
+    focal_bce_with_logits(
+        close_logit,
+        y_close,
+        mask = close_mask,
+        pos_weight = pos_weight,
+        gamma = 1.5
+    )
 ```
 
-Optional auxiliary density loss:
+If focal BCE is unstable, use weighted BCE first.
+
+### 11.4 Optional Duration Ranking Loss
+
+For each LN instance, compare close hazard before and at the gold close step.
+
+Let:
 
 ```text
-tokens -> reconstructed event density
-compare against density_level target or frozen density_pred_8s
+h_before = max close_logit over open steps before gold close
+h_close  = close_logit at gold close step
 ```
 
-V1 default:
+Then:
 
 ```text
-L_total = L_token
+L_duration_rank =
+    max(0, margin - h_close + h_before)
 ```
 
-V1.1 may add:
+Recommended:
 
 ```text
-L_total = L_token + 0.1 * L_density_aux
+margin = 0.5
+lambda_duration_rank <= 0.05
 ```
 
-Reason: first make grammar and token modeling work, then add auxiliary control
-pressure. The first version must not mix failure modes.
+This is optional. Do not enable until BCE or focal loss works.
 
-## Inference
+### 11.5 Loss Schedule
+
+Recommended:
+
+```text
+lambda_ln_close initial = 0.05
+lambda_ln_close max     = 0.20
+```
+
+Ramp over the first few thousand steps.
+
+Cap close-head gradient norm:
+
+```text
+ln_close_grad_norm <= 0.5 * token_ce_grad_norm
+```
+
+### 11.6 LN Close Metrics
+
+Report teacher-forced metrics:
+
+```text
+open_lane_close_precision
+open_lane_close_recall
+open_lane_close_f1
+close_auc
+early_close_rate
+late_close_rate
+close_timing_mae_ms
+ln_duration_mae_ms
+premature_close_rate
+missed_close_before_eos_rate
+```
+
+Report generated metrics:
+
+```text
+generated_ln_duration_distribution
+generated_premature_close_rate
+generated_dead_end_rate
+forced_end_pressure_rate
+```
+
+## 12. Total Training Loss
+
+### 12.1 Main Loss
+
+Token cross entropy is primary:
+
+```text
+L_token =
+    cross_entropy(
+        logits_final[:, :-1],
+        target_tokens[:, 1:],
+        ignore_index = PAD
+    )
+```
+
+### 12.2 Total Loss
+
+```text
+L_total =
+    L_token
+  + lambda_density * L_density
+  + lambda_ln_close * L_ln_close
+  + lambda_density_teacher * L_density_teacher
+  + lambda_adapter_reg * L_adapter_reg
+```
+
+Recommended:
+
+```text
+lambda_density_max        = 0.05
+lambda_ln_close_max       = 0.20
+lambda_density_teacher    = 0.00 by default
+lambda_adapter_reg        = 1e-5
+```
+
+`L_adapter_reg` penalizes excessive adapter bias magnitude:
+
+```text
+L_adapter_reg =
+    mean(square(state_prior_bias))
+  + mean(square(ln_close_bias))
+```
+
+### 12.3 Training Phases
+
+Phase A: audit and calibration
+
+- build token vocabulary;
+- tokenize mapper windows;
+- audit legality;
+- compute density calibration from gold tokens;
+- estimate LN close class imbalance.
+
+Phase B: stable teacher-forced training
+
+- train decoder;
+- train `StatePriorAdapter`;
+- train `LNCloseAdapter`;
+- keep density loss off during warmup.
+
+Phase C: density ramp
+
+- enable density auxiliary;
+- ramp `lambda_density`;
+- monitor token CE regression.
+
+Phase D: rollout evaluation
+
+- grammar-constrained generation;
+- no training from rollout by default;
+- measure generated density and LN close quality.
+
+Phase E: optional scheduled-sampling style fine-tuning
+
+- short generated prefixes only;
+- 1s to 2s rollout fragments;
+- grammar always active;
+- apply LN close supervision where generated state overlaps gold LN state.
+
+Do not enable Phase E until the teacher-forced model is stable.
+
+## 13. Forward Pass
+
+### 13.1 Pseudocode
 
 ```python
-state = CarryLNState(0, (0, 0, 0, 0))
-current_ms = write_start_ms
+def forward(batch):
+    with torch.no_grad():
+        control_out = control_encoder(
+            mel=batch.mel_context,
+            timing=batch.timing_context,
+            difficulty=batch.difficulty,
+            padding_mask=batch.context_padding_mask,
+        )
+
+    control_memory_8s = slice_or_concat_control_memory(control_out.control_memory)
+    density_teacher_8s = slice_or_concat_density_teacher(control_out.value_pred)
+
+    decoder_hidden, base_logits = decoder(
+        tokens=batch.target_tokens[:, :-1],
+        control_memory=control_memory_8s,
+        difficulty=batch.difficulty,
+    )
+
+    state_prior_bias = state_prior_adapter(
+        open_mask=batch.teacher_open_mask[:, :-1],
+        open_age_ms=batch.teacher_open_age_ms[:, :-1],
+        remaining_ms=batch.teacher_remaining_ms[:, :-1],
+    )
+
+    close_logits, ln_close_bias, time_shift_bias = ln_close_adapter(
+        decoder_hidden=decoder_hidden,
+        control_memory_8s=control_memory_8s,
+        density_teacher_8s=density_teacher_8s,
+        current_ms=batch.teacher_current_ms[:, :-1],
+        open_mask=batch.teacher_open_mask[:, :-1],
+        open_age_ms=batch.teacher_open_age_ms[:, :-1],
+        remaining_ms=batch.teacher_remaining_ms[:, :-1],
+    )
+
+    grammar_mask = build_grammar_mask(
+        current_ms=batch.teacher_current_ms[:, :-1],
+        open_mask=batch.teacher_open_mask[:, :-1],
+        open_age_ms=batch.teacher_open_age_ms[:, :-1],
+        write_start_ms=batch.write_start_ms,
+        write_end_ms=batch.write_end_ms,
+    )
+
+    logits_final = (
+        base_logits
+        + state_prior_bias
+        + ln_close_bias
+        + time_shift_bias
+        + grammar_mask
+    )
+
+    L_token = token_ce(
+        logits_final,
+        batch.target_tokens[:, 1:],
+    )
+
+    L_density = density_aux_loss(
+        logits_final=logits_final,
+        current_ms=batch.teacher_current_ms[:, :-1],
+        target=batch.density_target_8s,
+        confidence=batch.density_confidence_8s,
+    )
+
+    L_ln_close = ln_close_aux_loss(
+        close_logits=close_logits,
+        labels=batch.close_labels[:, :-1],
+        mask=batch.close_label_mask[:, :-1],
+    )
+
+    L_total = (
+        L_token
+        + lambda_density * L_density
+        + lambda_ln_close * L_ln_close
+        + lambda_adapter_reg * adapter_reg()
+    )
+
+    return {
+        "loss": L_total,
+        "loss_token": L_token,
+        "loss_density": L_density,
+        "loss_ln_close": L_ln_close,
+    }
+```
+
+## 14. Inference
+
+### 14.1 Generation Loop
+
+Initialize:
+
+```text
 tokens = [BOS]
-for step in range(max_decode_steps):
-    base_logits = decoder(tokens, control_memory_8s)
-    dynamic_bias = dynamic_state_logits_adapter(state)
-    grammar_mask = hard_grammar_mask(state, current_ms)
-    logits = base_logits[:, -1] + dynamic_bias + grammar_mask
-    token = sample_or_greedy(logits)
-    tokens.append(token)
-    if token == EOS:
-        assert state.open_mask == 0
-        break
-    current_ms, state = apply_token(token, current_ms, state)
+current_ms = write_start_ms
+open_mask = 0
+open_age_ms = 0
 ```
 
-Sampling policy v1:
+Loop:
+
+1. run decoder on prefix;
+2. compute adapter biases;
+3. compute grammar mask;
+4. apply final logits;
+5. sample or argmax;
+6. update token list;
+7. update `current_ms` and LN state;
+8. stop only on `EOS`.
+
+### 14.2 Sampling
+
+Recommended default:
 
 ```text
-greedy or temperature <= 1.0
-top_p after grammar mask
-never repair illegal token after sampling; illegal tokens must be impossible
+temperature = 1.0
+top_p = 0.95
 ```
 
-## File Layout
+Apply top-p after grammar mask.
+
+Never sample invalid tokens.
+
+### 14.3 Dead-End Handling
+
+Dead-end should be impossible if grammar is correct.
+
+If no legal token exists:
 
 ```text
-train/stage_2/events/schema.py
-  TokenType
-  LaneAction
-  CarryLNState
-  DecodeState
-  EventTokenSpec
-  MapperWindowRecord
-train/stage_2/events/vocab.py
-  build_mapper_event_vocab_v1()
-  token metadata tensors
-  TIME_SHIFT_VALUES_MS
-train/stage_2/events/quantization.py
-  quantize_10ms_half_up()
-  encode_ts_canonical()
-  decode_ts_token()
-train/stage_2/events/carryLN.py
-  update_state_for_token()
-  build_dynamic_state_trace()
-  validate_carry_trace()
-train/stage_2/events/grammar.py
-  hard_grammar_mask()
-  validate_token_sequence()
-train/stage_2/events/tokenize.py
-  beatmap_window_to_tokens()
-  events_to_lane_action_groups()
-train/stage_2/events/stitch.py
-  stitch_8s_windows()
-  validate_song_events()
-train/stage_2/model_mapper_v1/model.py
-  Stage2MapperV1
-  MapperARDecoder
-  DynamicStateEncoder
-  DynamicStateLogitsAdapter
-train/stage_2/training/mapper_v1.py
-  dataset
-  collate
-  training loop
-  eval
-  reports
+raise RuntimeError
+log full state
+count as grammar bug
 ```
 
-## Frozen Constants
+Do not silently repair.
 
-```python
-MAPPER_WINDOW_MS = 8000
-MAPPER_WINDOW_FRAMES = 400
-FRAME_HOP_MS = 20
-TS_QUANTUM_MS = 10
-TIME_SHIFT_VALUES_MS = (
-    10, 20, 30, 40, 50, 60, 70, 80, 90,
-    100, 200, 300, 400, 500, 600, 700, 800, 900,
-    1000, 2000, 3000, 4000,
-)
-LANE_COUNT = 4
-LANE_ACTIONS = (
-    NONE,
-    TAP,
-    HOLD_START,
-    HOLD_END,
-)
-SPECIAL_TOKENS = (
-    PAD,
-    BOS,
-    EOS,
-)
-```
+### 14.4 Maximum Length
 
-Approximate vocabulary size:
+Use audit-derived max length:
 
 ```text
-3 special
-22 time shift
-255 event
-= 280 tokens
+max_seq_len = p99_train_seq_len + margin
 ```
 
-## Non-Goals for V1
-
-V1 explicitly does not handle:
-
-- cross-window long-note carry-out;
-- `WINDOW_EOS` vs `SONG_EOS` distinction;
-- full-song single-pass autoregressive decoding;
-- direct absolute timestamp tokens;
-- grid-frame token generation;
-- unstructured vocab-wide dynamic adapter;
-- same-lane compound exotic events;
-- learned time-shift aliasing.
-
-These are deferred until the demo mapper reliably produces legal 8 second
-windows.
-
-## Final Frozen Summary
-
-Stage 2 Mapper v1 freezes an 8 second window autoregressive event generator.
-It reuses `ControlDemoGlobalEncoder` as a frozen audio, dense-timing, and
-difficulty control planner. Four 2 second control outputs are concatenated into
-8 second control memory.
-
-The decoder generates:
+If exceeded during generation:
 
 ```text
-SPECIAL: PAD/BOS/EOS
-TIME_SHIFT: canonical relative TS_k
-EVENT: 4-lane action tuple
+raise generation failure
 ```
 
-`TIME_SHIFT` is relative to the current decode cursor. `EVENT` occurs at the
-current cursor and does not advance time. `EOS` is valid only when
-`open_mask == 0`.
+Do not force `EOS` if `open_mask != 0`.
 
-Long-note state is explicitly tracked by `CarryLNState`.
-`DynamicStateLogitsAdapter` only produces low-rank lane/action bias. The hard
-grammar mask is applied last and is the sole legality authority.
+## 15. Audits
+
+### 15.1 Tokenizer Audits
+
+Report:
+
+```text
+num_windows
+num_eligible_windows
+num_dropped_cross_window_ln
+drop_rate_cross_window_ln
+max_seq_len
+mean_seq_len
+p95_seq_len
+p99_seq_len
+event_vocab_coverage
+time_shift_vocab_distribution
+invalid_time_delta_count
+noncanonical_time_shift_count
+open_mask_nonzero_before_eos_count
+```
+
+Hard fail if:
+
+```text
+open_mask_nonzero_before_eos_count > 0
+invalid_event_count > 0
+noncanonical_time_shift_count > 0
+```
+
+### 15.2 Grammar Audits
+
+Randomly replay tokenized targets through grammar.
+
+Hard fail if any gold token is invalid.
+
+Also test adversarial states:
+
+```text
+open LN at write_end
+TIME_SHIFT to write_end while open
+EOS while open
+HOLD_END on closed lane
+HOLD_START on open lane
+TAP on open lane
+all-NONE EVENT
+```
+
+### 15.3 Density Audits
+
+Before training:
+
+```text
+gold_mass_to_density_mae
+gold_mass_to_density_corr
+density_target_missing_rate
+density_confidence_distribution
+```
+
+During training:
+
+```text
+teacher_forced_density_mae
+teacher_forced_density_corr
+generated_density_mae
+generated_density_corr
+```
+
+### 15.4 LN Close Audits
+
+Before training:
+
+```text
+num_open_lane_steps
+num_close_positive_steps
+close_positive_rate
+pos_weight
+ln_duration_distribution
+```
+
+During training:
+
+```text
+close_precision
+close_recall
+close_f1
+close_auc
+early_close_ms
+late_close_ms
+duration_mae_ms
+```
+
+### 15.5 Adapter Audits
+
+Report:
+
+```text
+state_prior_bias_mean
+state_prior_bias_std
+state_prior_bias_max_abs
+ln_close_bias_mean
+ln_close_bias_std
+ln_close_bias_max_abs
+time_shift_bias_mean_when_open
+time_shift_bias_max_abs
+```
+
+If adapter bias saturates early, reduce adapter scale or increase
+regularization.
+
+## 16. Failure Modes and Mitigations
+
+### 16.1 Event Spam From Density Loss
+
+Symptom:
+
+```text
+density improves but token CE/generation quality worsens
+too many TAP/HOLD_START events
+```
+
+Mitigation:
+
+- lower `lambda_density`;
+- improve density calibration;
+- exclude `HOLD_END` from `onset_weight`;
+- add generated onset-count metric.
+
+### 16.2 Early LN Closure
+
+Symptom:
+
+```text
+LN close recall high but duration too short
+premature_close_rate high
+```
+
+Mitigation:
+
+- lower `close_scale`;
+- delay `skip_scale` ramp;
+- increase negative weight for keep-open states;
+- add duration ranking loss only after BCE stabilizes.
+
+### 16.3 Late LN Closure
+
+Symptom:
+
+```text
+missed_close_before_eos_rate high
+close recall low
+```
+
+Mitigation:
+
+- increase `lambda_ln_close`;
+- increase `pos_weight`;
+- allow skip penalty to suppress `TIME_SHIFT` near close;
+- check whether `local_control_t` is aligned correctly.
+
+### 16.4 Adapter Ignored
+
+Symptom:
+
+```text
+close auxiliary improves but generated close timing unchanged
+adapter bias near zero
+```
+
+Mitigation:
+
+- increase `adapter_scale` slowly;
+- verify adapter bias is added before grammar and top-p;
+- verify gradients reach adapter;
+- check whether base logits overpower bounded bias.
+
+### 16.5 Adapter Dominates Decoder
+
+Symptom:
+
+```text
+adapter bias saturates
+generation becomes formulaic
+token CE worsens
+```
+
+Mitigation:
+
+- reduce `max_bias`;
+- increase adapter regularization;
+- lower `lambda_ln_close`;
+- delay `skip_scale`.
+
+## 17. Non-Goals for V1.1
+
+The following are explicitly out of scope:
+
+- cross-window LN carry-in and carry-out;
+- multi-difficulty joint mapper;
+- full-chart global structure planning;
+- post-hoc repair;
+- unconstrained adapter full-vocab logits;
+- training the control encoder jointly with mapper.
+
+Future versions may add these only after V1.1 metrics are stable.
+
+## 18. Minimal Acceptance Criteria
+
+A V1.1 mapper run is acceptable only if all are true:
+
+1. tokenizer gold replay has zero grammar violations;
+2. generation has zero invalid tokens;
+3. generation has zero grammar dead-ends;
+4. density auxiliary improves density MAE/correlation without increasing token
+   CE materially;
+5. LN close auxiliary improves close F1 and generated LN duration MAE;
+6. adapter bias does not saturate;
+7. cross-window LN drop rate is reported;
+8. density target and teacher naming is consistent in code and logs.
+
+Recommended minimum report:
+
+```text
+token_ce
+generated_validity_rate
+generated_dead_end_rate
+density_frame_mae
+density_window_error
+density_corr
+close_precision
+close_recall
+close_f1
+ln_duration_mae_ms
+premature_close_rate
+late_close_rate
+adapter_bias_stats
+cross_window_ln_drop_rate
+```
+
+## 19. Final Design Principle
+
+The mapper should be powerful enough to learn musical mapping, but not powerful
+enough to bypass the chart grammar.
+
+The density auxiliary should shape how much note onset mass appears over time.
+
+The LN close adapter should shape when open lanes close.
+
+The token decoder should still decide the final musical event.
+
+The grammar should decide what is legal.
+
+The most important implementation change is this: density loss and LN close
+loss must be computed from teacher-forced model distributions and lane-level
+close hazards, not from reconstructed gold tokens alone. Otherwise the design
+looks clean on paper but the two signals that matter will not actually train
+the mapper.
