@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Sequence
 
@@ -14,7 +15,7 @@ from .density_calibration import (
     smooth_density_mass,
 )
 from .grammar import valid_token_mask
-from .replay import initial_replay_state, replay_tokens
+from .replay import ReplayError, initial_replay_state, replay_tokens, transition_replay_state
 from .tokenizer import MAPPER_DENSITY_FRAMES, TokenizedMapperWindow
 from .vocab import MapperV1Vocab
 
@@ -32,6 +33,7 @@ class TokenizerAuditReport:
     open_mask_nonzero_before_eos_count: int
     invalid_time_delta_count: int
     noncanonical_time_shift_count: int
+    invalid_event_count: int
     time_shift_vocab_distribution: dict[str, int]
 
     def to_dict(self) -> dict[str, object]:
@@ -61,11 +63,38 @@ class LNCloseImbalanceReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class PhaseAAuditGateDecision:
+    status: str
+    tokenizer_status: str
+    grammar_status: str
+    failure_reasons: list[str]
+    open_mask_nonzero_before_eos_count: int
+    invalid_time_delta_count: int
+    invalid_event_count: int
+    noncanonical_time_shift_count: int
+    grammar_violation_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 def audit_tokenized_windows(
     windows: Sequence[TokenizedMapperWindow],
     *,
     vocab: MapperV1Vocab,
+    filter_report: object,
 ) -> TokenizerAuditReport:
+    filter_payload = _filter_report_payload(filter_report)
+    num_total_windows = _filter_report_int(filter_payload, "num_total_windows")
+    num_eligible_windows = _filter_report_int(filter_payload, "num_mapper_eligible_windows")
+    num_dropped_cross_window_ln_windows = _filter_report_int(filter_payload, "num_dropped_cross_window_ln_windows")
+    if num_eligible_windows != len(windows):
+        raise ValueError(
+            "filter_report num_mapper_eligible_windows must match audited windows: "
+            f"{num_eligible_windows} != {len(windows)}",
+        )
+
     lengths = [window.seq_len for window in windows]
     event_ids = {
         token_id
@@ -74,27 +103,26 @@ def audit_tokenized_windows(
         if vocab.is_event_token(int(token_id))
     }
     ts_counter: Counter[str] = Counter()
-    open_before_eos = 0
+    tokenizer_counts = _TokenizerTokenCounts()
     for window in windows:
         for token_id in window.target_ids:
             if vocab.is_time_shift_token(int(token_id)):
                 ts_counter[vocab.token_name(int(token_id))] += 1
-        eos_index = window.target_ids.index(vocab.eos_id)
-        if bool(window.teacher_open_mask[eos_index].any().item()):
-            open_before_eos += 1
+        tokenizer_counts += _audit_token_sequence(window, vocab=vocab)
 
     return TokenizerAuditReport(
-        num_windows=len(windows),
-        num_eligible_windows=len(windows),
-        num_dropped_cross_window_ln_windows=0,
+        num_windows=num_total_windows,
+        num_eligible_windows=num_eligible_windows,
+        num_dropped_cross_window_ln_windows=num_dropped_cross_window_ln_windows,
         max_seq_len=max(lengths, default=0),
         mean_seq_len=float(sum(lengths) / len(lengths)) if lengths else 0.0,
         p95_seq_len=_percentile_int(lengths, 0.95),
         p99_seq_len=_percentile_int(lengths, 0.99),
         event_vocab_coverage=len(event_ids),
-        open_mask_nonzero_before_eos_count=open_before_eos,
-        invalid_time_delta_count=0,
-        noncanonical_time_shift_count=0,
+        open_mask_nonzero_before_eos_count=tokenizer_counts.open_mask_nonzero_before_eos_count,
+        invalid_time_delta_count=tokenizer_counts.invalid_time_delta_count,
+        noncanonical_time_shift_count=tokenizer_counts.noncanonical_time_shift_count,
+        invalid_event_count=tokenizer_counts.invalid_event_count,
         time_shift_vocab_distribution=dict(sorted(ts_counter.items())),
     )
 
@@ -209,13 +237,14 @@ def build_phase_a_report(
     *,
     windows: Sequence[TokenizedMapperWindow],
     vocab: MapperV1Vocab,
-    filter_report: object | None = None,
+    filter_report: object,
     density_prediction: torch.Tensor | None = None,
     density_target: torch.Tensor | None = None,
     density_confidence: torch.Tensor | None = None,
     calibration: object | None = None,
 ) -> dict[str, object]:
-    tokenizer = audit_tokenized_windows(windows, vocab=vocab).to_dict()
+    filter_payload = _filter_report_payload(filter_report)
+    tokenizer = audit_tokenized_windows(windows, vocab=vocab, filter_report=filter_payload).to_dict()
     grammar = audit_grammar_replay(windows, vocab=vocab).to_dict()
     ln_close = audit_ln_close_imbalance(windows, vocab=vocab).to_dict()
     density: dict[str, object] = {
@@ -253,13 +282,15 @@ def build_phase_a_report(
         density["gold_mass_to_density_corr"] = gold_metrics["density_pearson_corr"]
 
     calibration_payload = resolved_calibration.to_dict() if hasattr(resolved_calibration, "to_dict") else {}
+    gate_decision = build_phase_a_gate_decision(tokenizer=tokenizer, grammar=grammar).to_dict()
     report = {
-        "window_filter": _filter_report_payload(filter_report, eligible_default=len(windows)),
+        "window_filter": filter_payload,
         "tokenizer": tokenizer,
         "grammar": grammar,
         "density": density,
         "ln_close": ln_close,
         "density_calibration": calibration_payload,
+        "gate_decision": gate_decision,
     }
     return report
 
@@ -310,6 +341,125 @@ def _percentile_int(values: Sequence[int], percentile: float) -> int:
     return int(sorted_values[index])
 
 
+def build_phase_a_gate_decision(
+    *,
+    tokenizer: TokenizerAuditReport | Mapping[str, object],
+    grammar: GrammarAuditReport | Mapping[str, object],
+) -> PhaseAAuditGateDecision:
+    tokenizer_payload = tokenizer.to_dict() if isinstance(tokenizer, TokenizerAuditReport) else tokenizer
+    grammar_payload = grammar.to_dict() if isinstance(grammar, GrammarAuditReport) else grammar
+    open_mask_count = _report_int(tokenizer_payload, "open_mask_nonzero_before_eos_count")
+    invalid_time_delta_count = _report_int(tokenizer_payload, "invalid_time_delta_count")
+    invalid_event_count = _report_int(tokenizer_payload, "invalid_event_count")
+    noncanonical_time_shift_count = _report_int(tokenizer_payload, "noncanonical_time_shift_count")
+    grammar_violation_count = _report_int(grammar_payload, "violation_count")
+
+    tokenizer_failures: list[str] = []
+    if open_mask_count > 0:
+        tokenizer_failures.append("open_mask_nonzero_before_eos_count > 0")
+    if invalid_time_delta_count > 0:
+        tokenizer_failures.append("invalid_time_delta_count > 0")
+    if invalid_event_count > 0:
+        tokenizer_failures.append("invalid_event_count > 0")
+    if noncanonical_time_shift_count > 0:
+        tokenizer_failures.append("noncanonical_time_shift_count > 0")
+
+    grammar_failures = ["grammar violation_count > 0"] if grammar_violation_count > 0 else []
+    failure_reasons = tokenizer_failures + grammar_failures
+    return PhaseAAuditGateDecision(
+        status="PASS" if not failure_reasons else "FAIL",
+        tokenizer_status="PASS" if not tokenizer_failures else "FAIL",
+        grammar_status="PASS" if not grammar_failures else "FAIL",
+        failure_reasons=failure_reasons,
+        open_mask_nonzero_before_eos_count=open_mask_count,
+        invalid_time_delta_count=invalid_time_delta_count,
+        invalid_event_count=invalid_event_count,
+        noncanonical_time_shift_count=noncanonical_time_shift_count,
+        grammar_violation_count=grammar_violation_count,
+    )
+
+
+@dataclass
+class _TokenizerTokenCounts:
+    open_mask_nonzero_before_eos_count: int = 0
+    invalid_time_delta_count: int = 0
+    noncanonical_time_shift_count: int = 0
+    invalid_event_count: int = 0
+
+    def __iadd__(self, other: "_TokenizerTokenCounts") -> "_TokenizerTokenCounts":
+        self.open_mask_nonzero_before_eos_count += other.open_mask_nonzero_before_eos_count
+        self.invalid_time_delta_count += other.invalid_time_delta_count
+        self.noncanonical_time_shift_count += other.noncanonical_time_shift_count
+        self.invalid_event_count += other.invalid_event_count
+        return self
+
+
+def _audit_token_sequence(window: TokenizedMapperWindow, *, vocab: MapperV1Vocab) -> _TokenizerTokenCounts:
+    counts = _TokenizerTokenCounts()
+    state = initial_replay_state(window.write_start_ms)
+    time_shift_run: list[int] = []
+
+    def flush_time_shift_run() -> None:
+        nonlocal time_shift_run
+        if not time_shift_run:
+            return
+        total_delta_ms = sum(time_shift_run)
+        try:
+            canonical = vocab.decompose_time_shift_delta(total_delta_ms)
+        except ValueError:
+            counts.noncanonical_time_shift_count += 1
+        else:
+            if time_shift_run != canonical:
+                counts.noncanonical_time_shift_count += 1
+        time_shift_run = []
+
+    for position, raw_token_id in enumerate(window.target_ids):
+        token_id = int(raw_token_id)
+        is_time_shift = vocab.is_time_shift_token(token_id)
+        if is_time_shift:
+            time_shift_run.append(vocab.time_shift_value(token_id))
+        else:
+            flush_time_shift_run()
+
+        mask = valid_token_mask(
+            position=state.position,
+            current_ms=state.current_ms,
+            open_mask=state.open_mask,
+            write_start_ms=window.write_start_ms,
+            write_end_ms=window.write_end_ms,
+            vocab=vocab,
+        )
+        is_known_token = 0 <= token_id < vocab.size
+        is_valid = is_known_token and bool(mask[token_id].item())
+        if not is_valid:
+            if is_time_shift:
+                counts.invalid_time_delta_count += 1
+            elif vocab.is_event_token(token_id) or not _is_special_token(token_id, vocab=vocab):
+                counts.invalid_event_count += 1
+
+        if token_id == vocab.eos_id and any(state.open_mask):
+            counts.open_mask_nonzero_before_eos_count += 1
+
+        try:
+            state = transition_replay_state(
+                state,
+                token_id,
+                position=position,
+                vocab=vocab,
+                write_start_ms=window.write_start_ms,
+                write_end_ms=window.write_end_ms,
+            )
+        except ReplayError:
+            continue
+
+    flush_time_shift_run()
+    return counts
+
+
+def _is_special_token(token_id: int, *, vocab: MapperV1Vocab) -> bool:
+    return token_id in {vocab.pad_id, vocab.bos_id, vocab.eos_id}
+
+
 def _ln_durations_ms(window: TokenizedMapperWindow, *, vocab: MapperV1Vocab) -> list[int]:
     open_start_by_lane: dict[int, int] = {}
     durations: list[int] = []
@@ -337,21 +487,31 @@ def _duration_distribution(durations_ms: Sequence[int]) -> dict[str, float]:
     }
 
 
-def _filter_report_payload(filter_report: object | None, *, eligible_default: int) -> dict[str, object]:
+def _filter_report_payload(filter_report: object | None) -> dict[str, object]:
     if filter_report is None:
-        return {
-            "num_total_windows": eligible_default,
-            "num_mapper_eligible_windows": eligible_default,
-            "num_dropped_short_windows": 0,
-            "num_dropped_cross_window_ln_windows": 0,
-            "drop_rate": 0.0,
-            "short_drop_rate": 0.0,
-            "cross_window_ln_drop_rate": 0.0,
-            "drop_rate_by_difficulty": {},
-            "drop_rate_by_song": {},
-        }
+        raise ValueError(
+            "filter_report is required for Phase A mapper audits; post-filtered windows cannot reconstruct "
+            "cross-window LN exclusion counts or drop rates.",
+        )
     if hasattr(filter_report, "to_dict"):
         return filter_report.to_dict()  # type: ignore[no-any-return]
     if hasattr(filter_report, "__dataclass_fields__"):
         return asdict(filter_report)
+    if isinstance(filter_report, Mapping):
+        return dict(filter_report)
     return dict(filter_report)  # type: ignore[arg-type]
+
+
+def _filter_report_int(filter_payload: Mapping[str, object], key: str) -> int:
+    return _report_int(filter_payload, key, report_name="filter_report")
+
+
+def _report_int(report_payload: Mapping[str, object], key: str, *, report_name: str = "audit report") -> int:
+    try:
+        value = report_payload[key]
+    except KeyError as exc:
+        raise ValueError(f"{report_name} is missing required field {key!r}") from exc
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{report_name} field {key!r} must be an integer-compatible value, got {value!r}") from exc
