@@ -1,34 +1,39 @@
 ---
-pinned_commit: 3e957269fcd64dbb511b5dc354d22b808ec44ee7
+pinned_commit: d163244db1deb8be4b9886e5281581cadc1488e7
 status: implementation-ready draft
 date: 2026-05-08
 owner: s3d-i
 module: train/stage_2/model_mapper_v1
-design_revision: v1.2
+design_revision: v1.0
 depends_on:
   control_encoder: train/stage_2/model_control_demo_global
   control_config: train/stage_2/training/configs/stage2_control_demo_global_mps.yaml
-window_contract: 8s mapper write window
+window_contract: 8s mapper write window with explicit LN carry-in/carry-out
 token_contract: mapper_event_vocab_v1
 time_shift_contract: canonical_relative_ts_v1
 ln_contract: carry_ln_state_v1
 ---
 
-# Mapper V1.2 Design
+# Mapper V1.0 Design
 
 ## 0. Status
 
-This document defines the implementation contract for
+This document defines the first implementation contract for
 `train/stage_2/model_mapper_v1`.
 
-Status: implementation-ready draft, not frozen until the following are
-implemented and audited:
+`LNCarryState` is part of V1.0. It is not a later revision and not an optional
+future extension.
 
-1. differentiable density auxiliary loss;
-2. context-aware LN close adapter;
-3. mandatory grammar-constrained short rollout recovery training;
-4. write-end dead-end grammar guard;
-5. density, LN-close, and teacher-forcing mismatch evaluation metrics.
+V1.0 is not complete until the following are implemented and audited:
+
+1. canonical mapper tokenizer;
+2. `LNCarryState` construction, replay, batching, and audit;
+3. carry-aware hard grammar with chart-level BOS/EOS and window stop rules;
+4. differentiable density auxiliary loss;
+5. context-aware LN close adapter;
+6. grammar-constrained rollout evaluation;
+7. short rollout recovery training;
+8. density, LN-close, and teacher-forcing mismatch evaluation metrics.
 
 The mapper is a control-conditioned autoregressive event generator for
 osu!mania 4K. It maps:
@@ -36,20 +41,18 @@ osu!mania 4K. It maps:
 - 8s audio, timing, and difficulty context;
 - frozen control memory;
 - density-level supervision;
-- local long-note state;
+- explicit long-note carry-in state;
+- local autoregressive chart state;
 
-to a legal sequence of chart event tokens.
+to a legal chart token fragment plus explicit long-note carry-out state.
 
-The mapper is not a chart oracle. Hard grammar remains the final authority for
-legality.
+Hard grammar remains the final authority for legality.
 
 ## 1. Core Decisions
 
 ### 1.1 Window Policy
 
-The mapper writes one independent 8s window.
-
-Definitions:
+The mapper writes one 8s chart window.
 
 ```text
 write_start_ms
@@ -57,30 +60,45 @@ write_end_ms = write_start_ms + 8000
 valid chart event times are in [write_start_ms, write_end_ms)
 ```
 
-The model does not carry LN state across windows in V1.
+Mapper windows are not independent with respect to long notes.
 
-Training samples with cross-window LNs are excluded unless a future version
-implements carry-in and carry-out.
-
-This exclusion must be audited:
+Every window has:
 
 ```text
-num_total_windows
-num_mapper_eligible_windows
-num_dropped_cross_window_ln_windows
-drop_rate
-drop_rate_by_difficulty
-drop_rate_by_song
+ln_carry_in:  LNCarryState at write_start_ms
+ln_carry_out: LNCarryState at write_end_ms
 ```
 
-If the cross-window drop rate is high, reported mapper quality is biased and
-the model is not production-valid.
+The tokenizer, grammar, target fragment states, inference loop, metrics, and
+recovery training must all use the same carry-state contract.
 
-### 1.2 Grammar Policy
+Do not exclude a training window merely because an LN crosses the window
+boundary. Cross-window LNs are normal V1.0 data.
+
+A window may be excluded only if its carry state cannot be reconstructed
+unambiguously from the source chart.
+
+### 1.2 Why Carry Is Required in V1.0
+
+Without carry state, the design contradicts itself:
+
+```text
+frontmatter: ln_contract = carry_ln_state_v1
+body:        model does not carry LN state across windows
+tokenizer:   samples with carry-in/carry-out are excluded
+inference:   open_mask starts at zero
+```
+
+V1.0 removes that contradiction.
+
+The model must be able to start a write window with one or more lanes already
+open and must be able to end a write window with one or more lanes still open.
+
+### 1.3 Grammar Policy
 
 The decoder may be wrong.
 
-The adapter may be wrong.
+The adapters may be wrong.
 
 Sampling may be noisy.
 
@@ -98,13 +116,13 @@ logits_final =
 
 Invalid tokens receive `-inf`.
 
-No post-hoc repair is allowed in V1.
+No post-hoc repair is allowed in V1.0.
 
-### 1.3 Control Model Policy
+### 1.4 Control Model Policy
 
-The existing control model is reused as a frozen conditioner.
+The existing `ControlDemoGlobalEncoder` is reused as a frozen conditioner.
 
-The mapper does not train the control encoder in V1.
+The mapper does not train the control encoder in V1.0.
 
 The control encoder provides:
 
@@ -126,107 +144,227 @@ Do not collapse these names.
 
 `density_teacher` is the frozen control model prediction.
 
-## 2. Inputs
+## 2. LNCarryState and Inputs
 
-### 2.1 Mapper Batch
+### 2.1 LNCarryState Contract
+
+`LNCarryState` is the authoritative per-window boundary state for long notes.
+
+```python
+@dataclass(frozen=True)
+class LNCarryState:
+    current_ms: int
+    open_mask: tuple[bool, bool, bool, bool]
+    open_start_ms: tuple[int | None, int | None, int | None, int | None]
+    open_age_ms: tuple[int, int, int, int]
+```
+
+Derived rule:
+
+```text
+open_age_ms[l] =
+    current_ms - open_start_ms[l]   if open_mask[l]
+    0                               otherwise
+```
+
+`open_age_ms` may be stored for batching convenience, but `open_start_ms` is
+the source of truth when reconstructing state from a full chart.
+
+At `write_start_ms`:
+
+```text
+ln_carry_in.current_ms = write_start_ms
+ln_carry_in.open_mask[l] = true
+    iff lane l has an LN that started before write_start_ms
+    and ends after write_start_ms
+```
+
+At `write_end_ms`:
+
+```text
+ln_carry_out.current_ms = write_end_ms
+ln_carry_out.open_mask[l] = true
+    iff lane l has an LN that started before write_end_ms
+    and ends after write_end_ms
+```
+
+Boundary equality rules:
+
+- LN ending exactly at `write_start_ms` is not open in `ln_carry_in`, and
+  `HOLD_END` is not emitted in this window.
+- LN starting exactly at `write_start_ms` is not open in `ln_carry_in`, and
+  `HOLD_START` is emitted at `current_ms = write_start_ms`.
+- LN ending exactly at `write_end_ms` is not open in `ln_carry_out`.
+- LN starting exactly at `write_end_ms` belongs to the next window and is not
+  emitted in this window.
+
+Default V1.0 convention:
+
+```text
+valid event interval = [write_start_ms, write_end_ms)
+carry_out represents all notes still open at write_end_ms
+```
+
+For boundary carry states, every open lane must have started before the
+boundary. For every lane:
+
+```text
+open_mask[l] == false  => open_start_ms[l] is None
+open_mask[l] == false  => open_age_ms[l] == 0
+open_mask[l] == true   => open_start_ms[l] < current_ms
+open_mask[l] == true   => open_age_ms[l] > 0
+```
+
+During replay inside the write window, a just-consumed `HOLD_START` may have
+`open_start_ms[l] == current_ms` and `open_age_ms[l] == 0` until the next
+`TIME_SHIFT`.
+
+At all times:
+
+```text
+current_ms is 10ms-aligned
+write_start_ms <= current_ms <= write_end_ms
+```
+
+For generation, the replay state starts from `ln_carry_in`. Do not initialize
+generated windows with `open_mask = 0` unless `ln_carry_in.open_mask == 0`.
+
+### 2.2 Mapper Batch
 
 Each mapper batch item contains:
 
 ```text
-mel_context              [B, context_frames, mel_dim]
-timing_context           [B, context_frames, timing_dim]
-difficulty               [B, difficulty_dim]
-context_padding_mask     [B, context_frames]
-target_tokens            [B, seq_len]
-target_token_mask        [B, seq_len]
-teacher_states:
-    current_ms           [B, seq_len]
-    open_mask            [B, seq_len, 4]
-    open_age_ms          [B, seq_len, 4]
-density_target_8s        [B, 400, 1]
-density_confidence_8s    [B, 400, 1]
+context_mel                 [B, context_frames, mel_dim]
+context_dense_timing_v2     [B, context_frames, timing_dim]
+normalized_difficulty       [B]
+context_padding_mask        [B, context_frames]
+full_mel                    [B, full_frames, mel_dim]
+full_dense_timing_v2        [B, full_frames, timing_dim]
+padding_mask                [B, full_frames]
+frame_count                 [B]
+target_start_frame          [B]
+write_start_ms              [B]
+write_end_ms                [B]
+is_full_chart_start         [B]
+is_full_chart_end           [B]
+ln_carry_in:
+    open_mask               [B, 4]
+    open_start_ms           [B, 4]
+    open_age_ms             [B, 4]
+ln_carry_out:
+    open_mask               [B, 4]
+    open_start_ms           [B, 4]
+    open_age_ms             [B, 4]
+decoder_input_tokens        [B, seq_len]
+target_fragment_tokens      [B, seq_len]
+target_fragment_mask        [B, seq_len]
+target_fragment_states:
+    current_ms              [B, seq_len]
+    open_mask               [B, seq_len, 4]
+    open_start_ms           [B, seq_len, 4]
+    open_age_ms             [B, seq_len, 4]
+density_target_8s           [B, 400, 1]
+density_confidence_8s       [B, 400, 1]
 ```
 
-The 400 density frames correspond to 20ms frames across 8s.
+The 400 density frames are 20ms frames over the 8s mapper write span.
 
-### 2.2 Control Encoder Output
+### 2.3 Control Encoder Output
 
-The frozen control encoder runs on the same audio, timing, and difficulty
-context.
+The frozen control encoder operates on the stage-2 control context.
 
-It returns:
+It provides:
 
 ```text
-control_memory_context   [B, context_frames, D]
-density_teacher_2s       [B, 100, 1] per 2s target slice
+control_memory_context
+density_teacher_2s
 ```
 
-For an 8s mapper window, concatenate four aligned 2s slices:
+The mapper consumes an aligned 8s span:
 
 ```text
-control_memory_8s        [B, 400, D]
-density_teacher_8s       [B, 400, 1]
+control_memory_8s       [B, 400, D]
+density_teacher_8s      [B, 400, 1]
 ```
 
-If the control encoder internally emits a larger memory than 400 frames, the
-mapper consumes only the aligned 8s write span.
+Because the current control window target is 100 frames at 20ms per frame, an
+8s mapper window is formed from four aligned 2s control slices.
 
-### 2.3 Naming
+### 2.4 Naming
 
 Use these names consistently:
 
 ```text
-density_target_8s      ground-truth control_v3 density_level
-density_confidence_8s  ground-truth control_v3 density_confidence
-density_teacher_8s     frozen control model value prediction
+density_target_8s       ground-truth control_v3 density target
+density_confidence_8s   ground-truth control_v3 confidence
+density_teacher_8s      frozen control model value prediction
+ln_carry_in             boundary LN state before mapper generation starts
+ln_carry_out            expected boundary LN state after mapper window ends
+target_fragment_tokens  tokens emitted inside the 8s write window
+target_fragment_state   replay state before consuming a predicted fragment token
 ```
 
 Never call `density_teacher_8s` the target.
 
-### 2.4 Teacher Replay State Alignment
+### 2.5 Target Fragment Replay State Alignment
 
-Teacher states are part of the training contract, not incidental metadata.
+Target fragment states are part of the training contract, not incidental
+metadata.
 
-For decoder input position `i`:
+For a window fragment, training examples are defined per predicted target
+token. For prediction position `i`:
 
 ```text
-input token       = target_tokens[i]
-prediction target = target_tokens[i + 1]
-teacher_state[i]  = replay_state_after_consuming(target_tokens[0 : i + 1])
+decoder_input_token[i] = previous token context for target_fragment_tokens[i]
+prediction_target[i]   = target_fragment_tokens[i]
+state_input[i]         = replay_state before consuming prediction_target[i]
 ```
 
 Therefore the forward pass uses:
 
 ```text
-decoder_input = target_tokens[:, :-1]
-loss_target   = target_tokens[:, 1:]
-state_input   = teacher_state[:, :-1]
+decoder_input = decoder_input_tokens
+loss_target   = target_fragment_tokens
+state_input   = target_fragment_states
 ```
 
-For `i = 0`:
+For `i = 0`, `state_input[0]` must be:
+
+```text
+current_ms      = write_start_ms
+open_mask       = ln_carry_in.open_mask
+open_start_ms   = ln_carry_in.open_start_ms
+open_age_ms     = ln_carry_in.open_age_ms
+```
+
+`decoder_input_token[0]` is one of:
+
+- the final left-context token before the write window;
+- `BOS`, only if this is the full-chart start;
+- an input-only decode anchor, if no left-context token is supplied.
+
+The input-only decode anchor is not a chart token, not a target token, and not
+generatable. It exists only to give the decoder an input position when no
+left-context token is available.
+
+The old per-window rule is invalid for V1.0:
 
 ```text
 target_tokens[0] must be BOS
-teacher_state[0]:
-    current_ms  = write_start_ms
-    open_mask   = 0
-    open_age_ms = 0
 ```
 
-This off-by-one convention is mandatory. If `teacher_state[i]` is instead the
-state before consuming `target_tokens[i]` or after consuming
-`target_tokens[i + 1]`, the grammar mask, density scatter frame, and LN close
-labels are all shifted and invalid.
+This convention is mandatory. If `state_input[i]` is instead the state after
+consuming `prediction_target[i]`, the grammar mask, density scatter frame, and
+LN close labels are all shifted and invalid.
 
 Generated-prefix recovery training uses the same replay convention:
 
 ```text
-generated_state[j] =
-    replay_state_after_consuming(generated_prefix[0 : j + 1])
+generated_state[j] = replay_state before consuming generated token j
 ```
 
-Recovery CE may only compare generated states and teacher states that follow
-this same convention.
+Recovery CE may only compare generated states and target fragment states that
+follow this same convention.
 
 ## 3. Token Vocabulary
 
@@ -241,6 +379,27 @@ EOS
 No `UNK`.
 
 `PAD` is used only for batching.
+
+`BOS` is valid only at full-chart start.
+
+`EOS` is valid only at full-chart end.
+
+Neither `BOS` nor `EOS` is emitted merely because an 8s mapper write window
+starts or ends.
+
+For windowed mapper training, the first predicted token in a window is
+conditioned by:
+
+```text
+ln_carry_in
+write_start_ms
+optional left-context tokens
+optional input-only decode anchor
+```
+
+The decode anchor, if used, is not a chart token, not a target token, and not
+generatable. It exists only to give the decoder an input position when no
+left-context token is available.
 
 ### 3.2 EVENT Tokens
 
@@ -321,51 +480,119 @@ delta = 3270ms
 
 Exact size depends on the final time-shift vocabulary.
 
+The input-only decode anchor is outside this chart token vocabulary.
+
 ## 4. Canonical Tokenizer
 
-### 4.1 Target Construction
+### 4.1 Full-Chart Token Stream
 
-Given all hit objects inside the 8s write window:
+Canonical tokenization is defined first at full-chart level.
 
-1. sort by timestamp;
-2. group all lane actions with the same timestamp;
-3. emit canonical `TIME_SHIFT` sequence from previous timestamp to current
-   timestamp;
-4. emit exactly one `EVENT` token for the grouped actions;
-5. after the last event, emit `TIME_SHIFT` sequence to `write_end_ms`;
-6. emit `EOS`.
+Given all chart hit objects:
 
-The target sequence always starts with `BOS`.
+1. start with `BOS`;
+2. sort all events by timestamp;
+3. group all lane actions with the same timestamp;
+4. emit canonical `TIME_SHIFT` tokens from the previous timestamp to the
+   current timestamp;
+5. emit exactly one `EVENT` token for each grouped timestamp;
+6. after the final chart event, emit `EOS`.
 
-### 4.2 Empty Window
+`BOS` and `EOS` are chart-level tokens, not window-level tokens.
 
-An empty 8s window is encoded as:
+### 4.2 8s Mapper Window Target Fragment
+
+For an 8s mapper write window:
+
+```text
+write_start_ms
+write_end_ms = write_start_ms + 8000
+
+the dataset builder constructs:
+
+ln_carry_in  = LNCarryState at write_start_ms
+ln_carry_out = LNCarryState at write_end_ms
+target_fragment_tokens
+target_fragment_states
+```
+
+The target fragment contains the tokens needed to advance the local decode
+cursor from `write_start_ms` to `write_end_ms` and emit all chart events in:
+
+```text
+[write_start_ms, write_end_ms)
+```
+
+The fragment does not automatically include `BOS`.
+
+The fragment does not automatically include `EOS`.
+
+If the current AR time-shift-token decoder requires the cursor to reach the
+window boundary, the target fragment may end with `TIME_SHIFT` tokens that
+advance to `write_end_ms`.
+
+Those boundary `TIME_SHIFT` tokens are cursor-advance tokens, not `EOS`.
+
+### 4.3 Empty Window
+
+For the current fixed-8s AR decoder, an empty window with no events is:
+
+```text
+TS_4000 TS_4000
+```
+
+not:
 
 ```text
 BOS TS_4000 TS_4000 EOS
 ```
 
-### 4.3 LN State Update During Tokenization
+If the window has an LN carried through the whole span, the same token fragment
+is valid:
+
+```text
+TS_4000 TS_4000
+```
+
+The legality condition is:
+
+```text
+initial state = ln_carry_in
+state after TS_4000 TS_4000 = ln_carry_out
+```
+
+If a future event-only decoder does not require explicit cursor advancement to
+the boundary, empty windows may have zero emitted chart tokens, but that is a
+different decoder contract.
+
+### 4.4 LN State Update During Tokenization
 
 The tokenizer must simulate LN state.
 
 State:
 
 ```text
-open_mask[4]      bool
-open_age_ms[4]    int
+current_ms
+open_mask[4]
+open_start_ms[4]
+open_age_ms[4]
 ```
 
 Rules:
 
 - `TAP` requires lane closed before event and remains closed after event.
-- `HOLD_START` requires lane closed before event and opens lane after event.
+- `HOLD_START` requires lane closed before event, opens lane after event, sets
+  `open_start_ms = current_ms`, and has `open_age_ms = 0` immediately after
+  start.
 - `HOLD_END` requires lane open before event and closes lane after event.
 - `NONE` leaves lane state unchanged.
-- `TIME_SHIFT` increments `open_age_ms` for open lanes only.
-- `EOS` requires all lanes closed.
+- `TIME_SHIFT(k)` advances `current_ms += k` and recomputes `open_age_ms` from
+  `open_start_ms` for open lanes.
+- Window completion is valid only at `current_ms == write_end_ms` and only
+  when current LN state equals `ln_carry_out`.
+- `BOS` and `EOS` are not emitted for ordinary 8s window completion.
 
-Samples that require carry-in or carry-out LN state are excluded in V1.
+Cross-window LNs are not dropped.
 
 ## 5. Hard Grammar
 
@@ -375,9 +602,13 @@ The hard grammar consumes:
 previous token position
 current_ms
 open_mask
+open_start_ms
 open_age_ms
 write_start_ms
 write_end_ms
+ln_carry_in
+ln_carry_out
+full_chart_boundary_flags
 ```
 
 and returns a boolean valid-token mask.
@@ -393,18 +624,28 @@ never valid during generation
 `BOS`:
 
 ```text
-valid only at position 0
-invalid after position 0
+valid only at full-chart position 0
+invalid inside ordinary 8s write windows
+requires is_full_chart_start == true
 ```
 
 `EOS`:
 
 ```text
-valid iff:
-    position > 0
-    current_ms == write_end_ms
-    open_mask == 0
+valid only for full-chart termination
+invalid for ordinary 8s write-window termination
+requires is_full_chart_end == true
 ```
+
+For ordinary 8s mapper windows, stopping is external:
+
+```text
+window_done iff:
+    current_ms == write_end_ms
+    current LN state equals ln_carry_out
+```
+
+The grammar must not require or emit `EOS` at every 8s boundary.
 
 ### 5.2 TIME_SHIFT Rules
 
@@ -414,18 +655,19 @@ valid iff:
 current_ms + k <= write_end_ms
 ```
 
-Additional dead-end guard:
+Additional carry-aware dead-end guard:
 
 ```text
-if open_mask != 0:
-    current_ms + k must be < write_end_ms
+if current_ms + k == write_end_ms:
+    state_after_shift must equal ln_carry_out
 ```
 
-Rationale:
+This allows a window to end with an open LN only when that open LN is exactly
+the expected carry-out state. It rejects states that would reach the boundary
+with the wrong open lanes, wrong open starts, or wrong open ages.
 
-If an LN is open, allowing the cursor to move exactly to `write_end_ms` creates
-a dead state because `EVENT` is no longer valid and `EOS` requires no open
-lanes.
+When this condition is satisfied, the 8s window is complete. No `EOS` token is
+required or emitted.
 
 ### 5.3 EVENT Rules
 
@@ -461,25 +703,23 @@ invalid:
     HOLD_START
 ```
 
-### 5.4 Optional Min-LN Guard
+### 5.4 Carry-Out Compatibility Guard
 
-V1 may disable this.
+Near the end of the window, grammar should optionally prune actions that make
+the required carry-out impossible.
 
-If enabled:
-
-```text
-HOLD_START invalid when remaining window time < min_ln_duration_ms
-```
-
-This reduces impossible short LNs near the end of a window.
-
-Recommended default:
+Hard legality examples:
 
 ```text
-min_ln_duration_ms = 60
+If ln_carry_out.open_mask[l] == true:
+    lane l must be open at write_end_ms
+    closing it before write_end_ms is valid only if it can reopen before boundary
+If ln_carry_out.open_mask[l] == false:
+    lane l must be closed at write_end_ms
+    starting a new hold too late to close before boundary is invalid
 ```
 
-This is a style guard, not a legality guard.
+This guard is legal-state pruning, not style modeling.
 
 ## 6. Model Architecture
 
@@ -524,6 +764,7 @@ It attends to:
 - `control_memory_8s`;
 - difficulty embedding;
 - timing position embedding.
+- `LNCarryState` embedding.
 
 Output:
 
@@ -554,6 +795,10 @@ age_bucket
 lane_id_embedding
 remaining_ms
 remaining_norm
+carry_in_open_bit
+carry_out_open_bit
+carry_out_required_close_bit
+carry_out_required_open_bit
 ```
 
 Recommended:
@@ -565,7 +810,7 @@ num_age_buckets = 32
 
 ## 7. Dynamic Adapters
 
-The V1.2 adapter is split into two constrained parts:
+V1.0 uses two constrained adapters:
 
 ```text
 StatePriorAdapter
@@ -586,7 +831,8 @@ The `StatePriorAdapter` learns soft priors such as:
 
 - long-open LN is more likely to close;
 - just-open LN is unlikely to close;
-- certain lanes may have different empirical priors;
+- carry-out requires a lane to remain open;
+- carry-out requires a lane to close before the boundary;
 - closed lanes may prefer `TAP` vs `HOLD_START` under specific local state.
 
 It does not decide musical timing by itself.
@@ -595,9 +841,12 @@ It does not decide musical timing by itself.
 
 ```text
 open_mask              [B, T, 4]
+open_start_ms          [B, T, 4]
 open_age_ms            [B, T, 4]
 lane_id                [4]
 remaining_ms           [B, T]
+ln_carry_in            LNCarryState
+ln_carry_out           LNCarryState
 ```
 
 ### 8.3 Output
@@ -676,8 +925,10 @@ decoder_hidden_t          [B, T, d_model]
 local_control_t           [B, T, d_model]
 local_density_teacher_t   [B, T, 1]
 open_mask_t               [B, T, 4]
+open_start_ms_t           [B, T, 4]
 open_age_ms_t             [B, T, 4]
 remaining_ms_t            [B, T, 1]
+ln_carry_out_t            carry-out compatibility features
 lane_id_embedding         [4, lane_dim]
 ```
 
@@ -1034,8 +1285,8 @@ Positive label:
 ```text
 y_close[t,l] = 1
 iff
-    gold next token is EVENT
-    and gold EVENT action for lane l is HOLD_END
+    prediction target token is EVENT
+    and target EVENT action for lane l is HOLD_END
 ```
 
 Negative label:
@@ -1044,12 +1295,15 @@ Negative label:
 y_close[t,l] = 0
 iff
     lane l is open
-    and the gold next token does not close lane l
+    and the prediction target token does not close lane l
 ```
 
 This includes `TIME_SHIFT` steps while the lane remains open.
 
 Closed lanes are ignored.
+
+Carry-through lanes that remain open to `ln_carry_out` are valid negatives
+until the window ends.
 
 ### 11.3 Loss
 
@@ -1140,7 +1394,7 @@ late_close_rate
 close_timing_mae_ms
 ln_duration_mae_ms
 premature_close_rate
-missed_close_before_eos_rate
+missed_close_before_boundary_rate
 ```
 
 Report generated metrics:
@@ -1148,8 +1402,9 @@ Report generated metrics:
 ```text
 generated_ln_duration_distribution
 generated_premature_close_rate
+generated_late_close_rate
 generated_dead_end_rate
-forced_end_pressure_rate
+generated_carry_out_match_rate
 ```
 
 ## 12. Total Training Loss
@@ -1161,8 +1416,8 @@ Token cross entropy is primary:
 ```text
 L_token =
     cross_entropy(
-        logits_final[:, :-1],
-        target_tokens[:, 1:],
+        logits_final,
+        target_fragment_tokens,
         ignore_index = PAD
     )
 ```
@@ -1199,7 +1454,7 @@ L_adapter_reg =
 
 ### 12.3 Short Rollout Recovery Loss
 
-V1.2 includes a mandatory narrow teacher-forcing mismatch mitigation.
+V1.0 includes a mandatory narrow teacher-forcing mismatch mitigation.
 
 The main learner remains teacher-forced CE. Recovery CE is an auxiliary loss
 computed only on short generated prefixes whose replayed state can be strictly
@@ -1208,7 +1463,7 @@ matched to a gold replay state.
 Recommended contract:
 
 ```text
-enabled: true for V1.2
+enabled: true for V1.0
 start_after: teacher_forced_token_ce_stable
 rollout_source: current model
 gradient_through_sampling: false
@@ -1225,6 +1480,7 @@ Strict state match:
 ```text
 generated_current_ms == gold_current_ms_at_some_prefix
 generated_open_mask == gold_open_mask_at_that_prefix
+generated_open_start_ms == gold_open_start_ms_at_that_prefix
 generated_open_age_ms == gold_open_age_ms_at_that_prefix
     or abs age error <= 10ms for open lanes
 ```
@@ -1235,7 +1491,7 @@ Only matched states create training examples:
 L_recovery_ce =
     CE(
         model(generated_prefix),
-        gold_next_token_at_matched_state
+        gold_target_token_at_matched_state
     )
 ```
 
@@ -1254,20 +1510,24 @@ Do not implement naive scheduled sampling as:
 
 ```text
 randomly replace a gold previous token with a sampled token
-still predict the original gold next token
+still predict the original gold fragment target
 ```
 
 That creates false labels whenever the generated token changes `current_ms`,
-`open_mask`, `open_age_ms`, or the legal-token set. V1.2 recovery training
-trains only when generated state can be mapped back to a gold replay state.
+`open_mask`, `open_start_ms`, `open_age_ms`, or the legal-token set. V1.0
+recovery training trains only when generated state can be mapped back to a
+gold replay state.
 
 ### 12.4 Training Phases
 
-Phase A: audit and calibration
+Phase A: data and carry audit
 
 - build token vocabulary;
-- tokenize mapper windows;
-- audit legality;
+- reconstruct `LNCarryState` for every mapper window;
+- build mapper target fragments without per-window `BOS`/`EOS`;
+- replay target fragments from `ln_carry_in`;
+- verify replay terminal state equals `ln_carry_out`;
+- audit boundary cases and grammar legality;
 - compute density calibration from gold tokens;
 - estimate LN close class imbalance.
 
@@ -1277,6 +1537,7 @@ Phase B: stable teacher-forced training
 - train `StatePriorAdapter`;
 - train `LNCloseAdapter`;
 - keep density loss off during warmup.
+- use carry-aware hard grammar in every forward pass.
 
 Phase C: density ramp
 
@@ -1287,75 +1548,98 @@ Phase C: density ramp
 Phase D: rollout evaluation
 
 - grammar-constrained generation;
+- initialize generation from `ln_carry_in`;
+- stop externally when the window is done against `ln_carry_out`;
 - compute generated metrics, not only teacher-forced metrics;
 - compute prefix state divergence:
   `generated_current_ms_drift`, `generated_open_mask_mismatch`,
-  `generated_open_age_error`, and `generated_prefix_match_rate`;
+  `generated_open_start_mismatch`, `generated_open_age_error`, and
+  `generated_prefix_match_rate`;
 - use generated metrics during checkpoint selection.
 
 Phase E: mandatory short rollout recovery training
 
 - sample windows or gold anchor prefixes;
 - run the current mapper for a short grammar-constrained rollout;
-- replay generated prefix states using the Section 2.4 convention;
+- replay generated prefix states using the Section 2.5 convention;
 - match generated states to gold replay states using strict state matching;
 - train next-token CE only on matched states;
 - skip unmatched states and log the mismatch reason;
 - grammar always active;
 - keep recovery loss low weight so it cannot replace teacher-forced CE.
 
-Enable Phase E after the teacher-forced model is stable. A V1.2 run is not
+Enable Phase E after the teacher-forced model is stable. A V1.0 run is not
 complete until Phase E has run and mismatch metrics are reported.
 
 ## 13. Forward Pass
 
 ### 13.1 Pseudocode
 
-The teacher state tensors in this pseudocode follow the Section 2.4
-off-by-one contract. Do not shift state tensors independently from
-`target_tokens`.
+The target fragment state tensors in this pseudocode follow the Section 2.5
+fragment contract. Do not derive window targets by inserting per-window
+`BOS`/`EOS` and shifting `target_fragment_tokens`.
 
 ```python
 def forward(batch):
     with torch.no_grad():
         control_out = control_encoder(
-            mel=batch.mel_context,
-            timing=batch.timing_context,
-            difficulty=batch.difficulty,
-            padding_mask=batch.context_padding_mask,
+            context_mel=batch.context_mel,
+            context_dense_timing_v2=batch.context_dense_timing_v2,
+            normalized_difficulty=batch.normalized_difficulty,
+            context_padding_mask=batch.context_padding_mask,
+            full_mel=batch.full_mel,
+            full_dense_timing_v2=batch.full_dense_timing_v2,
+            padding_mask=batch.padding_mask,
+            frame_count=batch.frame_count,
+            target_start_frame=batch.target_start_frame,
         )
 
-    control_memory_8s = slice_or_concat_control_memory(control_out.control_memory)
-    density_teacher_8s = slice_or_concat_density_teacher(control_out.value_pred)
+    control_memory_8s = build_aligned_control_memory_8s(control_out.control_memory)
+    density_teacher_8s = build_aligned_density_teacher_8s(control_out.value_pred)
 
     decoder_hidden, base_logits = decoder(
-        tokens=batch.target_tokens[:, :-1],
+        tokens=batch.decoder_input_tokens,
         control_memory=control_memory_8s,
-        difficulty=batch.difficulty,
+        difficulty=batch.normalized_difficulty,
+        ln_carry_in=batch.ln_carry_in,
+        ln_carry_out=batch.ln_carry_out,
     )
 
+    state = batch.target_fragment_states
+
     state_prior_bias = state_prior_adapter(
-        open_mask=batch.teacher_open_mask[:, :-1],
-        open_age_ms=batch.teacher_open_age_ms[:, :-1],
-        remaining_ms=batch.teacher_remaining_ms[:, :-1],
+        open_mask=state.open_mask,
+        open_start_ms=state.open_start_ms,
+        open_age_ms=state.open_age_ms,
+        remaining_ms=batch.write_end_ms[:, None] - state.current_ms,
+        ln_carry_in=batch.ln_carry_in,
+        ln_carry_out=batch.ln_carry_out,
     )
 
     close_logits, ln_close_bias, time_shift_bias = ln_close_adapter(
         decoder_hidden=decoder_hidden,
         control_memory_8s=control_memory_8s,
         density_teacher_8s=density_teacher_8s,
-        current_ms=batch.teacher_current_ms[:, :-1],
-        open_mask=batch.teacher_open_mask[:, :-1],
-        open_age_ms=batch.teacher_open_age_ms[:, :-1],
-        remaining_ms=batch.teacher_remaining_ms[:, :-1],
+        current_ms=state.current_ms,
+        open_mask=state.open_mask,
+        open_start_ms=state.open_start_ms,
+        open_age_ms=state.open_age_ms,
+        remaining_ms=batch.write_end_ms[:, None] - state.current_ms,
+        ln_carry_out=batch.ln_carry_out,
     )
 
     grammar_mask = build_grammar_mask(
-        current_ms=batch.teacher_current_ms[:, :-1],
-        open_mask=batch.teacher_open_mask[:, :-1],
-        open_age_ms=batch.teacher_open_age_ms[:, :-1],
+        position=batch.positions,
+        current_ms=state.current_ms,
+        open_mask=state.open_mask,
+        open_start_ms=state.open_start_ms,
+        open_age_ms=state.open_age_ms,
         write_start_ms=batch.write_start_ms,
         write_end_ms=batch.write_end_ms,
+        ln_carry_in=batch.ln_carry_in,
+        ln_carry_out=batch.ln_carry_out,
+        is_full_chart_start=batch.is_full_chart_start,
+        is_full_chart_end=batch.is_full_chart_end,
     )
 
     logits_final = (
@@ -1368,20 +1652,21 @@ def forward(batch):
 
     L_token = token_ce(
         logits_final,
-        batch.target_tokens[:, 1:],
+        batch.target_fragment_tokens,
+        ignore_index=PAD,
     )
 
     L_density = density_aux_loss(
         logits_final=logits_final,
-        current_ms=batch.teacher_current_ms[:, :-1],
+        current_ms=state.current_ms,
         target=batch.density_target_8s,
         confidence=batch.density_confidence_8s,
     )
 
     L_ln_close = ln_close_aux_loss(
         close_logits=close_logits,
-        labels=batch.close_labels[:, :-1],
-        mask=batch.close_label_mask[:, :-1],
+        labels=batch.close_labels,
+        mask=batch.close_label_mask,
     )
 
     L_total = (
@@ -1417,7 +1702,7 @@ def recovery_step(batch):
     generated_states = replay_states(generated_prefixes)
     matches = strict_match_to_gold_replay(
         generated_states=generated_states,
-        gold_states=batch.teacher_states,
+        gold_states=batch.target_fragment_states,
         age_tolerance_ms=10,
     )
 
@@ -1438,34 +1723,48 @@ def recovery_step(batch):
     return token_ce(logits_final, matched_targets)
 ```
 
-`gold_anchor_prefixes` may be BOS-only prefixes or sampled gold prefixes from
-the same window. Once generation starts, all generated states must be replayed
-from actual generated tokens; do not keep using gold states after a generated
-token is consumed.
+`gold_anchor_prefixes` may start from left-context tokens, from `BOS` only at
+full-chart start, or from an input-only decode anchor. Once generation starts,
+all generated states must be replayed from actual generated tokens; do not keep
+using gold states after a generated token is consumed.
 
 ## 14. Inference
 
-### 14.1 Generation Loop
+### 14.1 Window Generation Loop
 
 Initialize:
 
 ```text
-tokens = [BOS]
+prefix_tokens = left-context tokens, if available
 current_ms = write_start_ms
-open_mask = 0
-open_age_ms = 0
+open_mask = ln_carry_in.open_mask
+open_start_ms = ln_carry_in.open_start_ms
+open_age_ms = ln_carry_in.open_age_ms
 ```
+
+If no left-context token is available, use an input-only decode anchor. Do not
+append `BOS` unless this window begins at full-chart start.
+
+Never initialize with all lanes closed unless `ln_carry_in` is all closed.
 
 Loop:
 
-1. run decoder on prefix;
-2. compute adapter biases;
-3. compute grammar mask;
+1. score the next token from the current prefix and replay state;
+2. apply adapter biases;
+3. apply carry-aware grammar;
 4. apply final logits;
 5. sample or argmax;
-6. update token list;
-7. update `current_ms` and LN state;
-8. stop only on `EOS`.
+6. reject `BOS` and `EOS` for ordinary window decoding;
+7. append sampled `EVENT` or `TIME_SHIFT`;
+8. update `current_ms` and LN state;
+9. stop externally when:
+
+```text
+current_ms == write_end_ms
+current LN state == ln_carry_out
+```
+
+The ordinary 8s window does not terminate by emitting `EOS`.
 
 ### 14.2 Sampling
 
@@ -1488,7 +1787,10 @@ If no legal token exists:
 
 ```text
 raise RuntimeError
-log full state
+log full carry state
+log prefix
+log current_ms
+log open_mask/open_start_ms/open_age_ms
 count as grammar bug
 ```
 
@@ -1508,19 +1810,42 @@ If exceeded during generation:
 raise generation failure
 ```
 
-Do not force `EOS` if `open_mask != 0`.
+Do not force `EOS`. Ordinary 8s windows complete through the external
+`window_done` condition, not by emitting a special token.
 
 ## 15. Audits
 
-### 15.1 Tokenizer Audits
+### 15.1 Carry Audits
 
 Report:
 
 ```text
 num_windows
-num_eligible_windows
-num_dropped_cross_window_ln
-drop_rate_cross_window_ln
+num_windows_with_carry_in
+num_windows_with_carry_out
+num_windows_with_same_lane_carry_through
+carry_in_open_lane_rate
+carry_out_open_lane_rate
+carry_reconstruction_failure_count
+carry_reconstruction_failure_examples
+terminal_state_mismatch_count
+boundary_exact_start_count
+boundary_exact_end_count
+```
+
+Hard fail if:
+
+```text
+carry_reconstruction_failure_count > 0
+terminal_state_mismatch_count > 0
+open_age_ms inconsistent with open_start_ms
+```
+
+### 15.2 Tokenizer Audits
+
+Report:
+
+```text
 max_seq_len
 mean_seq_len
 p95_seq_len
@@ -1529,36 +1854,40 @@ event_vocab_coverage
 time_shift_vocab_distribution
 invalid_time_delta_count
 noncanonical_time_shift_count
-open_mask_nonzero_before_eos_count
 ```
 
 Hard fail if:
 
 ```text
-open_mask_nonzero_before_eos_count > 0
 invalid_event_count > 0
+invalid_time_delta_count > 0
 noncanonical_time_shift_count > 0
 ```
 
-### 15.2 Grammar Audits
+### 15.3 Grammar Audits
 
-Randomly replay tokenized targets through grammar.
+Replay target fragments through grammar.
 
 Hard fail if any gold token is invalid.
 
 Also test adversarial states:
 
 ```text
-open LN at write_end
-TIME_SHIFT to write_end while open
-EOS while open
+open LN at write_start from carry_in
+open LN at write_end matching carry_out
+open LN at write_end not matching carry_out
+BOS inside ordinary 8s write window
+EOS inside ordinary 8s write window
+window_done while current_ms < write_end_ms
+window_done at write_end with wrong carry_out
 HOLD_END on closed lane
 HOLD_START on open lane
 TAP on open lane
 all-NONE EVENT
+TIME_SHIFT past write_end
 ```
 
-### 15.3 Density Audits
+### 15.4 Density Audits
 
 Before training:
 
@@ -1578,7 +1907,7 @@ generated_density_mae
 generated_density_corr
 ```
 
-### 15.4 LN Close Audits
+### 15.5 LN Close Audits
 
 Before training:
 
@@ -1602,7 +1931,7 @@ late_close_ms
 duration_mae_ms
 ```
 
-### 15.5 Adapter Audits
+### 15.6 Adapter Audits
 
 Report:
 
@@ -1620,7 +1949,7 @@ time_shift_bias_max_abs
 If adapter bias saturates early, reduce adapter scale or increase
 regularization.
 
-### 15.6 Teacher-Forcing Mismatch and Recovery Audits
+### 15.7 Teacher-Forcing Mismatch and Recovery Audits
 
 Report before and after Phase E:
 
@@ -1630,6 +1959,7 @@ generated_prefix_match_rate_500ms
 generated_prefix_match_rate_1000ms
 generated_current_ms_drift_mae
 generated_open_mask_mismatch_rate
+generated_open_start_mismatch_rate
 generated_open_age_mae_when_open_mask_matches
 recovery_ce
 recovery_batch_valid_fraction
@@ -1638,11 +1968,12 @@ generated_vs_teacher_forced_density_gap
 generated_vs_teacher_forced_ln_close_gap
 ```
 
-Minimum V1.2 gates:
+Minimum V1.0 gates:
 
 ```text
 generated_validity_rate == 1.0
 generated_dead_end_rate == 0
+generated_carry_out_match_rate == 1.0
 generated_prefix_match_rate_500ms >= 0.70 after recovery phase
 generated_open_mask_mismatch_rate does not increase after recovery phase
 generated_vs_teacher_forced_density_gap improves or stays flat
@@ -1655,7 +1986,38 @@ good teacher-forced CE with poor free generation.
 
 ## 16. Failure Modes and Mitigations
 
-### 16.1 Event Spam From Density Loss
+### 16.1 Carry-In Ignored
+
+Symptom:
+
+```text
+generation starts with open lanes in ln_carry_in
+model emits TAP or HOLD_START on already-open lane
+```
+
+Mitigation:
+
+- verify grammar uses `ln_carry_in` at ordinary window start;
+- verify `target_fragment_state[0]` equals `ln_carry_in`;
+- verify adapters receive carry features.
+
+### 16.2 Carry-Out Mismatch
+
+Symptom:
+
+```text
+generation reaches write_end_ms
+window_done is false
+open state differs from ln_carry_out
+```
+
+Mitigation:
+
+- enable carry-out compatibility guard;
+- increase generated carry-out metrics weight in checkpoint selection;
+- inspect late close and premature close rates.
+
+### 16.3 Event Spam From Density Loss
 
 Symptom:
 
@@ -1671,7 +2033,7 @@ Mitigation:
 - exclude `HOLD_END` from `onset_weight`;
 - add generated onset-count metric.
 
-### 16.2 Early LN Closure
+### 16.4 Early LN Closure
 
 Symptom:
 
@@ -1687,12 +2049,12 @@ Mitigation:
 - increase negative weight for keep-open states;
 - add duration ranking loss only after BCE stabilizes.
 
-### 16.3 Late LN Closure
+### 16.5 Late LN Closure
 
 Symptom:
 
 ```text
-missed_close_before_eos_rate high
+missed_close_before_boundary_rate high
 close recall low
 ```
 
@@ -1703,7 +2065,7 @@ Mitigation:
 - allow skip penalty to suppress `TIME_SHIFT` near close;
 - check whether `local_control_t` is aligned correctly.
 
-### 16.4 Adapter Ignored
+### 16.6 Adapter Ignored
 
 Symptom:
 
@@ -1719,7 +2081,7 @@ Mitigation:
 - verify gradients reach adapter;
 - check whether base logits overpower bounded bias.
 
-### 16.5 Adapter Dominates Decoder
+### 16.7 Adapter Dominates Decoder
 
 Symptom:
 
@@ -1736,7 +2098,7 @@ Mitigation:
 - lower `lambda_ln_close`;
 - delay `skip_scale`.
 
-### 16.6 Teacher-Forced CE Does Not Transfer
+### 16.8 Teacher-Forced CE Does Not Transfer
 
 Symptom:
 
@@ -1749,17 +2111,16 @@ free generation density or LN metrics are poor
 
 Mitigation:
 
-- verify the Section 2.4 replay state convention;
+- verify the Section 2.5 replay state convention;
 - inspect mismatch reason logs from Phase D and Phase E;
 - run mandatory short rollout recovery;
 - lower recovery rollout length until strict matches are common;
 - do not train CE on unmatched generated states.
 
-## 17. Non-Goals for V1.2
+## 17. Non-Goals for V1.0
 
 The following are explicitly out of scope:
 
-- cross-window LN carry-in and carry-out;
 - multi-difficulty joint mapper;
 - full-chart global structure planning;
 - post-hoc repair;
@@ -1770,26 +2131,36 @@ The following are explicitly out of scope:
   expert relabeling of unmatched generated states;
 - training the control encoder jointly with mapper.
 
-Future versions may add these only after V1.2 metrics are stable.
+Cross-window LN carry is not out of scope. It is mandatory V1.0 behavior.
 
 ## 18. Minimal Acceptance Criteria
 
-A V1.2 mapper run is acceptable only if all are true:
+A V1.0 mapper run is acceptable only if all are true:
 
-1. tokenizer gold replay has zero grammar violations;
-2. generation has zero invalid tokens;
-3. generation has zero grammar dead-ends;
-4. teacher-forced token CE is stable;
-5. generated metrics are reported and used for checkpoint selection;
-6. density auxiliary improves generated density metrics or is disabled;
-7. LN close auxiliary improves generated LN duration metrics or is weakened;
-8. adapter bias does not saturate;
-9. cross-window LN drop rate is reported and judged acceptable;
-10. short rollout recovery phase runs successfully;
-11. recovery training does not regress token CE by more than 3-5%;
-12. generated prefix match rate improves or at least does not regress;
-13. open-mask mismatch rate improves or at least does not regress;
-14. density target and density teacher naming is consistent in code and logs.
+1. `LNCarryState` is reconstructed for every mapper window;
+2. target fragment replay starts from `ln_carry_in`;
+3. target fragment replay terminal state equals `ln_carry_out`;
+4. gold replay has zero grammar violations;
+5. generation has zero invalid tokens;
+6. generation has zero grammar dead-ends;
+7. ordinary 8s generation emits no `EOS`;
+8. window termination occurs only when `current_ms == write_end_ms` and current
+   LN state equals `ln_carry_out`;
+9. `BOS` appears only at full-chart start or as non-target left context;
+10. `EOS` appears only at full-chart end;
+11. per-window `BOS` count is zero for non-initial windows;
+12. per-window `EOS` count is zero for non-final windows;
+13. teacher-forced token CE is stable;
+14. generated metrics are reported and used for checkpoint selection;
+15. density auxiliary improves generated density metrics or is disabled;
+16. LN close auxiliary improves generated LN duration/carry metrics or is
+    weakened;
+17. adapter bias does not saturate;
+18. short rollout recovery phase runs successfully;
+19. recovery training does not regress token CE by more than 3-5%;
+20. generated prefix match rate improves or at least does not regress;
+21. open-mask mismatch rate improves or at least does not regress;
+22. density target and density teacher naming is consistent in code and logs.
 
 Recommended minimum report:
 
@@ -1797,10 +2168,14 @@ Recommended minimum report:
 teacher_forced_token_ce
 generated_validity_rate
 generated_dead_end_rate
+generated_carry_out_match_rate
+non_initial_window_bos_count
+non_final_window_eos_count
 generated_prefix_match_rate_500ms
 generated_prefix_match_rate_1000ms
 generated_current_ms_drift_mae
 generated_open_mask_mismatch_rate
+generated_open_start_mismatch_rate
 generated_open_age_mae_when_open_mask_matches
 recovery_ce
 recovery_batch_valid_fraction
@@ -1817,30 +2192,37 @@ premature_close_rate
 late_close_rate
 generated_vs_teacher_forced_ln_close_gap
 adapter_bias_stats
-cross_window_ln_drop_rate
+carry_in_open_lane_rate
+carry_out_open_lane_rate
+terminal_state_mismatch_count
 ```
 
-## 19. Final Design Principle
+## 19. Summary
 
-The mapper should be powerful enough to learn musical mapping, but not powerful
-enough to bypass the chart grammar.
+V1.0 has one consistent windowing rule:
 
-The density auxiliary should shape how much note onset mass appears over time.
+```text
+LNCarryState is mandatory from V1.0.
+An 8s mapper window is not a sequence.
+An 8s mapper window is a bounded decode chunk with:
+    write_start_ms
+    write_end_ms
+    ln_carry_in
+    ln_carry_out
+    target_fragment_tokens
+BOS/EOS are chart-level tokens.
+Window completion is an external carry-aware stop condition, not an emitted EOS.
+```
 
-The LN close adapter should shape when open lanes close.
-
-The token decoder should still decide the final musical event.
-
-The grammar should decide what is legal.
-
-Teacher-forced CE is the main learner.
-
-Short grammar-constrained rollout recovery is mandatory V1.2 insurance against
+Short grammar-constrained rollout recovery is mandatory V1.0 insurance against
 state-distribution mismatch.
 
 The most important implementation constraints are:
 
 ```text
+LNCarryState exists from the first mapper version
+target_fragment_state[0] equals ln_carry_in for each window fragment
+BOS/EOS are not synthesized at ordinary 8s window boundaries
 density loss trains from grammar-masked model distributions
 LN close loss trains lane-level close hazards
 recovery CE trains only on generated states that strictly match gold replay
