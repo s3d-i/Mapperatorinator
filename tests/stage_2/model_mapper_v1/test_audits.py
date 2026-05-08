@@ -1,10 +1,16 @@
 import unittest
 
+import torch
+
 from train.stage_2.model_mapper_v1.audits import (
     audit_grammar_replay,
     audit_ln_close_imbalance,
     audit_tokenized_windows,
     build_phase_a_report,
+)
+from train.stage_2.model_mapper_v1.density_calibration import (
+    scatter_tokenized_gold_onset_mass,
+    smooth_density_mass,
 )
 from train.stage_2.model_mapper_v1.tokenizer import MapperTimepoint, encode_mapper_window
 from train.stage_2.model_mapper_v1.vocab import LaneAction, MapperV1Vocab
@@ -64,6 +70,44 @@ class MapperV1AuditTests(unittest.TestCase):
         self.assertIn("invalid_time_delta_count", report["tokenizer"])
         self.assertIn("noncanonical_time_shift_count", report["tokenizer"])
         self.assertIn("gold_mass_to_density_mae", report["density"])
+
+    def test_phase_a_report_fits_density_calibration_from_gold_tokens(self) -> None:
+        vocab = MapperV1Vocab()
+        windows = [
+            encode_mapper_window(
+                [
+                    MapperTimepoint(1000, _actions(LaneAction.TAP)),
+                    MapperTimepoint(1400, _actions(LaneAction.TAP, LaneAction.TAP)),
+                ],
+                vocab=vocab,
+                write_start_ms=0,
+                write_end_ms=8000,
+            ),
+            encode_mapper_window(
+                [
+                    MapperTimepoint(2000, _actions(LaneAction.HOLD_START)),
+                    MapperTimepoint(2400, _actions(LaneAction.HOLD_END)),
+                ],
+                vocab=vocab,
+                write_start_ms=0,
+                write_end_ms=8000,
+            ),
+        ]
+        gold_mass = torch.stack([scatter_tokenized_gold_onset_mass(window, vocab=vocab) for window in windows])
+        density_target = (0.2 + 0.7 * smooth_density_mass(gold_mass)).unsqueeze(-1)
+        density_confidence = torch.ones_like(density_target)
+
+        report = build_phase_a_report(
+            windows=windows,
+            vocab=vocab,
+            density_target=density_target,
+            density_confidence=density_confidence,
+        )
+
+        self.assertAlmostEqual(report["density_calibration"]["scale"], 0.7, places=5)
+        self.assertAlmostEqual(report["density_calibration"]["bias"], 0.2, places=5)
+        self.assertLess(report["density"]["gold_mass_to_density_mae"], 1e-6)
+        self.assertLess(report["density"]["density_frame_mae"], 1e-6)
 
 
 if __name__ == "__main__":

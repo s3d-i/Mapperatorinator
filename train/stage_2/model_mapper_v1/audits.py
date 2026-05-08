@@ -7,10 +7,15 @@ from typing import Sequence
 
 import torch
 
-from .density_calibration import density_metrics
+from .density_calibration import (
+    density_metrics,
+    fit_monotonic_affine_calibration,
+    scatter_tokenized_gold_onset_mass,
+    smooth_density_mass,
+)
 from .grammar import valid_token_mask
 from .replay import initial_replay_state, replay_tokens
-from .tokenizer import TokenizedMapperWindow
+from .tokenizer import MAPPER_DENSITY_FRAMES, TokenizedMapperWindow
 from .vocab import MapperV1Vocab
 
 
@@ -219,13 +224,35 @@ def build_phase_a_report(
         "density_target_missing_rate": math.nan,
         "density_confidence_distribution": {},
     }
-    if density_prediction is not None and density_target is not None and density_confidence is not None:
-        density_metrics_report = audit_density_prediction(density_prediction, density_target, density_confidence)
-        density.update(density_metrics_report)
-        density["gold_mass_to_density_mae"] = density_metrics_report["density_frame_mae"]
-        density["gold_mass_to_density_corr"] = density_metrics_report["density_pearson_corr"]
+    confidence_for_density = _density_confidence_or_ones(density_target, density_confidence)
+    gold_mass: torch.Tensor | None = None
+    resolved_calibration = calibration
+    if density_target is not None:
+        gold_mass = _gold_onset_mass_batch(windows, vocab=vocab)
+        _validate_density_frame_count(
+            gold_mass,
+            density_target=density_target,
+            density_confidence=confidence_for_density,
+        )
+        if resolved_calibration is None:
+            resolved_calibration = fit_monotonic_affine_calibration(
+                smooth_density_mass(gold_mass),
+                density_target,
+                confidence_for_density,
+            )
 
-    calibration_payload = calibration.to_dict() if hasattr(calibration, "to_dict") else {}
+    if density_prediction is not None and density_target is not None:
+        density_metrics_report = audit_density_prediction(density_prediction, density_target, confidence_for_density)
+        density.update(density_metrics_report)
+    if gold_mass is not None and density_target is not None and hasattr(resolved_calibration, "predict"):
+        gold_prediction = resolved_calibration.predict(gold_mass)
+        gold_metrics = density_metrics(gold_prediction, density_target, confidence_for_density)
+        if density_prediction is None:
+            density.update(audit_density_prediction(gold_prediction, density_target, confidence_for_density))
+        density["gold_mass_to_density_mae"] = gold_metrics["density_frame_mae"]
+        density["gold_mass_to_density_corr"] = gold_metrics["density_pearson_corr"]
+
+    calibration_payload = resolved_calibration.to_dict() if hasattr(resolved_calibration, "to_dict") else {}
     report = {
         "window_filter": _filter_report_payload(filter_report, eligible_default=len(windows)),
         "tokenizer": tokenizer,
@@ -235,6 +262,44 @@ def build_phase_a_report(
         "density_calibration": calibration_payload,
     }
     return report
+
+
+def _gold_onset_mass_batch(
+    windows: Sequence[TokenizedMapperWindow],
+    *,
+    vocab: MapperV1Vocab,
+) -> torch.Tensor:
+    if not windows:
+        return torch.zeros((0, MAPPER_DENSITY_FRAMES), dtype=torch.float32)
+    return torch.stack([scatter_tokenized_gold_onset_mass(window, vocab=vocab) for window in windows])
+
+
+def _density_confidence_or_ones(
+    density_target: torch.Tensor | None,
+    density_confidence: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if density_target is None:
+        return None
+    if density_confidence is not None:
+        return density_confidence
+    return torch.ones_like(density_target, dtype=torch.float32)
+
+
+def _validate_density_frame_count(
+    gold_mass: torch.Tensor,
+    *,
+    density_target: torch.Tensor,
+    density_confidence: torch.Tensor | None,
+) -> None:
+    expected = int(gold_mass.numel())
+    target_count = int(density_target.detach().numel())
+    if target_count != expected:
+        raise ValueError(f"density_target must contain {expected} gold density frames, got {target_count}")
+    if density_confidence is None:
+        return
+    confidence_count = int(density_confidence.detach().numel())
+    if confidence_count != expected:
+        raise ValueError(f"density_confidence must contain {expected} gold density frames, got {confidence_count}")
 
 
 def _percentile_int(values: Sequence[int], percentile: float) -> int:
