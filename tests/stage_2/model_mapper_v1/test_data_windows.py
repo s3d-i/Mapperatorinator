@@ -1,16 +1,20 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
+from train.stage1_oracle.osu.hitobjects import ManiaHitObject, ManiaHitObjectKind
+from train.stage_2.data.control_windows import ControlWindowRecord
 from train.stage_2.data.mapper_v1_windows import (
+    MapperV1WindowDataset,
     collate_mapper_v1_windows,
     concatenate_density_teacher_8s,
     control_teacher_slice_batch,
     extract_mapper_density_8s,
 )
 from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
-from train.stage_2.model_mapper_v1.tokenizer import encode_mapper_window
+from train.stage_2.model_mapper_v1.tokenizer import encode_mapper_window, hitobjects_to_mapper_timepoints
 from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
 
 
@@ -84,6 +88,25 @@ class MapperV1DataWindowTests(unittest.TestCase):
         self.assertTrue(torch.equal(density_teacher[:, :100], torch.zeros(2, 100, 1)))
         self.assertTrue(torch.equal(density_teacher[:, 300:], torch.full((2, 100, 1), 3.0)))
 
+    def test_mapper_dataset_filters_unsupported_same_lane_compound_windows(self) -> None:
+        records = [
+            _record("compound.osu", difficulty=3.0),
+            _record("valid.osu", difficulty=4.0),
+        ]
+
+        dataset = _MapperDatasetWithUnsupportedActions(records, unsupported_paths={"compound.osu"})
+
+        self.assertEqual(len(dataset.records), 1)
+        self.assertEqual(dataset.records[0].control_record.beatmap_path, Path("valid.osu"))
+        self.assertEqual(dataset.filter_report.num_total_windows, 2)
+        self.assertEqual(dataset.filter_report.num_mapper_eligible_windows, 1)
+        self.assertEqual(dataset.filter_report.num_dropped_cross_window_ln_windows, 0)
+        self.assertEqual(dataset.filter_report.num_dropped_unsupported_action_windows, 1)
+        self.assertEqual(dataset.filter_report.drop_rate, 0.5)
+        self.assertEqual(dataset.filter_report.unsupported_action_drop_rate, 0.5)
+        self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["3.00"], 1.0)
+        self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["4.00"], 0.0)
+
 
 def _sample(tokenized) -> dict[str, torch.Tensor]:
     return {
@@ -102,6 +125,34 @@ def _sample(tokenized) -> dict[str, torch.Tensor]:
         "write_start_ms": torch.tensor(tokenized.write_start_ms, dtype=torch.long),
         "write_end_ms": torch.tensor(tokenized.write_end_ms, dtype=torch.long),
     }
+
+
+def _record(beatmap_path: str, *, difficulty: float) -> ControlWindowRecord:
+    return ControlWindowRecord(
+        beatmap_path=Path(beatmap_path),
+        audio_path=Path(f"{beatmap_path}.mp3"),
+        difficulty=difficulty,
+        frame_count=400,
+        target_start_frame=0,
+    )
+
+
+class _MapperDatasetWithUnsupportedActions(MapperV1WindowDataset):
+    def __init__(self, records: list[ControlWindowRecord], *, unsupported_paths: set[str]) -> None:
+        self.unsupported_paths = unsupported_paths
+        super().__init__(control_dataset=SimpleNamespace(records=records))
+
+    def _load_timepoints(self, beatmap_path: Path) -> tuple:
+        if beatmap_path.as_posix() in self.unsupported_paths:
+            return tuple(
+                hitobjects_to_mapper_timepoints(
+                    [
+                        ManiaHitObject(1000.0, 1000.0, 0, ManiaHitObjectKind.TAP),
+                        ManiaHitObject(1000.0, 1200.0, 0, ManiaHitObjectKind.HOLD),
+                    ],
+                ),
+            )
+        return ()
 
 
 if __name__ == "__main__":

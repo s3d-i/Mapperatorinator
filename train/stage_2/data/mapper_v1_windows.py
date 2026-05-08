@@ -23,6 +23,7 @@ from train.stage_2.model_mapper_v1.tokenizer import (
     MAPPER_WRITE_MS,
     CrossWindowLongNoteError,
     TokenizedMapperWindow,
+    UnsupportedMapperActionError,
     cross_window_ln_state_reason,
     encode_mapper_window,
     hitobjects_to_mapper_timepoints,
@@ -61,9 +62,11 @@ class MapperV1WindowFilterReport:
     num_mapper_eligible_windows: int
     num_dropped_short_windows: int
     num_dropped_cross_window_ln_windows: int
+    num_dropped_unsupported_action_windows: int
     drop_rate: float
     short_drop_rate: float
     cross_window_ln_drop_rate: float
+    unsupported_action_drop_rate: float
     drop_rate_by_difficulty: dict[str, float]
     drop_rate_by_song: dict[str, float]
 
@@ -157,11 +160,12 @@ class MapperV1WindowDataset(Dataset):
         total_windows = 0
         dropped_short = 0
         dropped_cross_window = 0
+        dropped_unsupported_action = 0
         valid_length_windows = 0
-        ln_dropped_by_difficulty: dict[str, int] = {}
+        dropped_by_difficulty: dict[str, int] = {}
         valid_by_difficulty: dict[str, int] = {}
         valid_by_song: dict[str, int] = {}
-        ln_dropped_by_song: dict[str, int] = {}
+        dropped_by_song: dict[str, int] = {}
         for index, record in enumerate(self.control_dataset.records):
             if record.target_start_frame % self.mapper_stride_frames != 0:
                 continue
@@ -178,24 +182,31 @@ class MapperV1WindowDataset(Dataset):
                 self._tokenize_record(record)
             except CrossWindowLongNoteError:
                 dropped_cross_window += 1
-                _increment_drop(ln_dropped_by_difficulty, difficulty_key)
-                _increment_drop(ln_dropped_by_song, song_key)
+                _increment_drop(dropped_by_difficulty, difficulty_key)
+                _increment_drop(dropped_by_song, song_key)
+                continue
+            except UnsupportedMapperActionError:
+                dropped_unsupported_action += 1
+                _increment_drop(dropped_by_difficulty, difficulty_key)
+                _increment_drop(dropped_by_song, song_key)
                 continue
             records.append(MapperV1WindowRecord(control_record_index=index, control_record=record))
             if progress and len(records) % 1000 == 0:
                 print(f"mapper_v1_window_dataset_progress eligible_windows={len(records)}", flush=True)
 
-        dropped = dropped_short + dropped_cross_window
+        dropped = dropped_short + dropped_cross_window + dropped_unsupported_action
         report = MapperV1WindowFilterReport(
             num_total_windows=total_windows,
             num_mapper_eligible_windows=len(records),
             num_dropped_short_windows=dropped_short,
             num_dropped_cross_window_ln_windows=dropped_cross_window,
+            num_dropped_unsupported_action_windows=dropped_unsupported_action,
             drop_rate=float(dropped / total_windows) if total_windows else 0.0,
             short_drop_rate=float(dropped_short / total_windows) if total_windows else 0.0,
             cross_window_ln_drop_rate=float(dropped_cross_window / valid_length_windows) if valid_length_windows else 0.0,
-            drop_rate_by_difficulty=_drop_rates(valid_by_difficulty, ln_dropped_by_difficulty),
-            drop_rate_by_song=_drop_rates(valid_by_song, ln_dropped_by_song),
+            unsupported_action_drop_rate=float(dropped_unsupported_action / valid_length_windows) if valid_length_windows else 0.0,
+            drop_rate_by_difficulty=_drop_rates(valid_by_difficulty, dropped_by_difficulty),
+            drop_rate_by_song=_drop_rates(valid_by_song, dropped_by_song),
         )
         return records, report
 
