@@ -1,0 +1,18 @@
+{
+  "commit": "174da51756075740411333c501a7cd8140157f03",
+  "grid_fitter_implementation_found": true,
+  "index_path": "train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies_2to6_dense_local_bpm_norm_unique_le3.parquet",
+  "maps_using_red_timing_fallback": 9242,
+  "maps_with_fitted_grid": 9242,
+  "schema_version": 1,
+  "section_count": {
+    "count": 9242,
+    "max": 261.0,
+    "mean": 1.6967106686864315,
+    "p50": 1.0,
+    "p90": 2.0,
+    "p95": 4.0,
+    "p99": 14.0
+  },
+  "source_note": "Stage 2 GridFitter implementation was found, but no existing map-level fitted-grid prediction cache was available for the oracle beatmap dataset. This audit therefore uses high-precision red timing as red_timing_fallback and records that source explicitly."
+}

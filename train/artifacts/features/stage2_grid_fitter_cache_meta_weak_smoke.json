@@ -1,0 +1,21 @@
+{
+  "commit": "174da51756075740411333c501a7cd8140157f03",
+  "grid_fitter_implementation_found": true,
+  "grid_source": "red_timing_fallback",
+  "index_path": "train/artifacts/indexes/beatmap_index_4k_no_timing_anomalies_2to6_dense_local_bpm_norm_unique_le3.parquet",
+  "maps_using_red_timing_fallback": 100,
+  "maps_using_stage2_timing_module": 0,
+  "maps_with_fitted_grid": 100,
+  "schema_version": 1,
+  "section_count": {
+    "count": 100,
+    "max": 16.0,
+    "mean": 1.2,
+    "p50": 1.0,
+    "p90": 1.0,
+    "p95": 1.0499999999999972,
+    "p99": 3.1300000000000665
+  },
+  "source_note": "This audit uses high-precision red timing as red_timing_fallback. No BeatThis/GridFitter timing module inference was run for this cache.",
+  "stage2_timing_module": null
+}
