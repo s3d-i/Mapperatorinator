@@ -246,7 +246,7 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
             )
             self.assertTrue(torch.isfinite(loss_output.total_loss))
 
-    def test_precompute_stacked_slice_order_matches_8s_cache_layout(self) -> None:
+    def test_precompute_slice_order_matches_8s_cache_layout(self) -> None:
         records = [
             ControlWindowRecord(
                 beatmap_path=Path("first.osu"),
@@ -279,6 +279,39 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
             second = dataset[1]["control_memory_8s"][:, 0]
             self.assertTrue(torch.equal(first, torch.arange(0, 400, 100, dtype=torch.float32).repeat_interleave(100)))
             self.assertTrue(torch.equal(second, torch.arange(400, 800, 100, dtype=torch.float32).repeat_interleave(100)))
+            self.assertEqual(dataset[0]["density_teacher_8s"].shape, (400, 1))
+
+    def test_precompute_does_not_stack_four_slices_into_device_batch(self) -> None:
+        records = [
+            ControlWindowRecord(
+                beatmap_path=Path("first.osu"),
+                audio_path=Path("first.mp3"),
+                difficulty=4.0,
+                frame_count=500,
+                target_start_frame=0,
+            ),
+            ControlWindowRecord(
+                beatmap_path=Path("second.osu"),
+                audio_path=Path("second.mp3"),
+                difficulty=4.0,
+                frame_count=900,
+                target_start_frame=400,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir) / "cache"
+            dataset = _TinyMapperDataset(records, cache_dir=cache_dir)
+            encoder = _TinyControlTeacherEncoder(control_dim=2)
+
+            precompute_phase_b_control_teacher_cache(
+                dataset,
+                cache_dir=cache_dir,
+                control_encoder=encoder,
+                batch_size=2,
+                device=torch.device("cpu"),
+            )
+
+            self.assertEqual(encoder.batch_sizes, [2, 2, 2, 2])
 
     def test_raw_control_precompute_skips_mapper_tokenization_filter(self) -> None:
         records = [
@@ -358,9 +391,11 @@ class _TinyControlTeacherEncoder(nn.Module):
     def __init__(self, *, control_dim: int) -> None:
         super().__init__()
         self.control_dim = int(control_dim)
+        self.batch_sizes: list[int] = []
 
     def forward(self, *, context_mel: torch.Tensor, target_start_frame: torch.Tensor | None = None, **kwargs):
         batch_size, frames = context_mel.shape[:2]
+        self.batch_sizes.append(batch_size)
         control_memory = torch.zeros(batch_size, frames, self.control_dim, dtype=context_mel.dtype, device=context_mel.device)
         if target_start_frame is not None:
             control_memory[:, :, 0] = target_start_frame.to(device=context_mel.device, dtype=context_mel.dtype).reshape(-1, 1)

@@ -18,6 +18,7 @@ from train.stage_2.data.control_windows import (
     DEFAULT_MAX_CACHED_MAPS,
     DENSE_TIMING_V2_CHANNELS,
     PACKED_MEL_CHANNELS,
+    TARGET_OFFSET_IN_CONTEXT,
     TARGET_WINDOW_LENGTH_FRAMES,
     normalize_difficulty,
 )
@@ -31,7 +32,6 @@ from train.stage_2.data.mapper_v1_windows import (
 from train.stage_2.model_control_demo_global import ControlDemoGlobalEncoder, ControlDemoGlobalEncoderConfig
 from train.stage_2.model_mapper_v1 import MapperV1Config, MapperV1Model, MapperV1ModelOutput, MapperV1Vocab
 from train.stage_2.model_mapper_v1.loss import adapter_bias_regularization, token_cross_entropy
-from train.stage_2.model_mapper_v1.model import compute_control_teacher_8s
 from train.stage_2.training.control import (
     CHECKPOINT_SCHEMA_VERSION,
     DEFAULT_FINAL_TRAIN_EVAL_SIZE,
@@ -572,6 +572,84 @@ def _release_torch_device_cache(device: torch.device) -> None:
         empty_cache()
 
 
+def _compute_control_teacher_8s_for_precompute(
+    control_encoder: ControlDemoGlobalEncoder,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from train.stage_2.data.mapper_v1_windows import control_teacher_slice_batch
+    from train.stage_2.features.control_v3_targets import VALUE_FEATURE_NAMES
+
+    control_slice_start_frames = batch.get("control_slice_start_frames")
+    if not isinstance(control_slice_start_frames, torch.Tensor) or control_slice_start_frames.ndim != 2:
+        raise ValueError("control teacher precompute requires control_slice_start_frames with shape [B,4]")
+    if int(control_slice_start_frames.shape[1]) != 4:
+        raise ValueError("control_slice_start_frames must have four aligned 2s starts")
+    batch_size = int(control_slice_start_frames.shape[0])
+
+    control_encoder.to(device)
+    control_encoder.eval()
+    control_memory_slices: list[torch.Tensor] = []
+    density_teacher_slices: list[torch.Tensor] = []
+    density_index = VALUE_FEATURE_NAMES.index("density_level")
+    for slice_index in range(4):
+        control_batch = control_teacher_slice_batch(dict(batch), slice_index)
+        with torch.no_grad():
+            output = control_encoder(
+                context_mel=control_batch["context_mel"],
+                context_dense_timing_v2=control_batch["context_dense_timing_v2"],
+                normalized_difficulty=control_batch["normalized_difficulty"].reshape(batch_size),
+                context_padding_mask=control_batch["context_padding_mask"],
+                full_mel=control_batch.get("full_mel"),
+                full_dense_timing_v2=control_batch.get("full_dense_timing_v2"),
+                padding_mask=control_batch.get("padding_mask"),
+                frame_count=control_batch.get("frame_count"),
+                target_start_frame=control_batch.get("target_start_frame"),
+            )
+            memory = getattr(output, "control_memory", None)
+            if not isinstance(memory, torch.Tensor) or memory.ndim != 3:
+                raise ValueError(f"control output {slice_index} control_memory must have shape [B,T,D]")
+            if int(memory.shape[0]) != batch_size:
+                raise ValueError(f"control output {slice_index} batch must be {batch_size}, got {memory.shape[0]}")
+            target_start = TARGET_OFFSET_IN_CONTEXT
+            target_end = target_start + TARGET_WINDOW_LENGTH_FRAMES
+            if int(memory.shape[1]) < target_end:
+                raise ValueError(
+                    f"control output {slice_index} memory is too short for target slice: "
+                    f"{memory.shape[1]} < {target_end}"
+                )
+            control_memory_slices.append(
+                memory[:, target_start:target_end].detach().to(device="cpu", dtype=torch.float32).contiguous()
+            )
+
+            value_pred = getattr(output, "value_pred", None)
+            if (
+                not isinstance(value_pred, torch.Tensor)
+                or value_pred.ndim != 3
+                or int(value_pred.shape[0]) != batch_size
+                or int(value_pred.shape[1]) != TARGET_WINDOW_LENGTH_FRAMES
+            ):
+                raise ValueError(f"control output {slice_index} value_pred must have shape [B,100,C]")
+            if int(value_pred.shape[2]) == 1:
+                density = value_pred
+            elif int(value_pred.shape[2]) == len(VALUE_FEATURE_NAMES):
+                density = value_pred[:, :, density_index : density_index + 1]
+            else:
+                raise ValueError(
+                    f"control output {slice_index} value_pred channel count must be 1 or {len(VALUE_FEATURE_NAMES)}, "
+                    f"got {value_pred.shape[2]}"
+                )
+            density_teacher_slices.append(density.detach().to(device="cpu", dtype=torch.float32).contiguous())
+        del control_batch, output, memory, value_pred, density
+        _release_torch_device_cache(device)
+
+    return (
+        torch.cat(control_memory_slices, dim=1).contiguous(),
+        torch.cat(density_teacher_slices, dim=1).contiguous(),
+    )
+
+
 def precompute_mapper_v1_phase_b_control_teacher_cache(
     *,
     dataset_root: Path = Path("mania-dataset"),
@@ -622,6 +700,9 @@ def precompute_mapper_v1_phase_b_control_teacher_cache(
                 precompute_encoder,
                 init_from_control_checkpoint,
             )
+        precompute_encoder.eval()
+        for parameter in precompute_encoder.parameters():
+            parameter.requires_grad_(False)
         source_control_dataset = ControlWindowDataset(**dataset_kwargs)
         source_result = precompute_phase_b_control_teacher_cache_from_control_dataset(
             source_control_dataset,
@@ -751,33 +832,43 @@ def _precompute_phase_b_control_teacher_cache_for_indexed_records(
     control_encoder.eval()
     offset = 0
     for raw_batch in loader:
-        current_batch_size = int(raw_batch["control_slice_start_frames"].shape[0])
-        batch_indices = missing_indices[offset : offset + current_batch_size]
-        offset += current_batch_size
-        batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
-        with torch.no_grad():
-            control_memory_8s, density_teacher_8s = compute_control_teacher_8s(
+        batch: dict[str, Any] | None = None
+        control_memory_8s: torch.Tensor | None = None
+        density_teacher_8s: torch.Tensor | None = None
+        try:
+            current_batch_size = int(raw_batch["control_slice_start_frames"].shape[0])
+            batch_indices = missing_indices[offset : offset + current_batch_size]
+            offset += current_batch_size
+            batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
+            control_memory_8s, density_teacher_8s = _compute_control_teacher_8s_for_precompute(
                 control_encoder,
                 batch,
-                stack_slices=True,
+                device=device,
             )
-        control_memory_8s = control_memory_8s.detach().cpu()
-        density_teacher_8s = density_teacher_8s.detach().cpu()
-        for batch_index, record_index in enumerate(batch_indices):
-            record = indexed_records[record_index][1]
-            save_control_teacher_cache_entry(
-                paths[record_index],
-                record=record,
-                control_memory_8s=control_memory_8s[batch_index],
-                density_teacher_8s=density_teacher_8s[batch_index],
-            )
-            computed_entries += 1
-        if computed_entries == len(batch_indices) or computed_entries % max(batch_size * 25, 1) == 0:
-            print(
-                f"mapper_v1_control_teacher_cache_precompute progress source={source_label} "
-                f"computed={computed_entries}/{len(missing_indices)}",
-                flush=True,
-            )
+            for batch_index, record_index in enumerate(batch_indices):
+                record = indexed_records[record_index][1]
+                save_control_teacher_cache_entry(
+                    paths[record_index],
+                    record=record,
+                    control_memory_8s=control_memory_8s[batch_index],
+                    density_teacher_8s=density_teacher_8s[batch_index],
+                )
+                computed_entries += 1
+            if computed_entries == len(batch_indices) or computed_entries % max(batch_size * 25, 1) == 0:
+                print(
+                    f"mapper_v1_control_teacher_cache_precompute progress source={source_label} "
+                    f"computed={computed_entries}/{len(missing_indices)}",
+                    flush=True,
+                )
+        finally:
+            del raw_batch
+            if batch is not None:
+                del batch
+            if control_memory_8s is not None:
+                del control_memory_8s
+            if density_teacher_8s is not None:
+                del density_teacher_8s
+            _release_torch_device_cache(device)
 
     elapsed_s = time.monotonic() - start_time
     print(
