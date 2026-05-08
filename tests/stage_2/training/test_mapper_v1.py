@@ -3,14 +3,21 @@ import unittest
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
 from train.stage_2.data.control_windows import ControlWindowRecord, normalize_difficulty
-from train.stage_2.data.mapper_v1_windows import MapperV1WindowDataset, collate_mapper_v1_windows
+from train.stage_2.data.mapper_v1_windows import (
+    MapperV1WindowDataset,
+    collate_mapper_v1_windows,
+    control_teacher_cache_path,
+    load_control_teacher_cache_entry,
+)
 from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES
 from train.stage_2.model_mapper_v1 import MapperV1Config, MapperV1Model
+from train.stage_2.training import mapper_v1 as mapper_v1_training
 from train.stage_2.training.mapper_v1 import (
     MapperV1PhaseBLossConfig,
     _collate_synthetic_mapper_samples,
@@ -18,6 +25,7 @@ from train.stage_2.training.mapper_v1 import (
     _synthetic_mapper_samples,
     load_run_config,
     precompute_phase_b_control_teacher_cache,
+    precompute_phase_b_control_teacher_cache_from_control_dataset,
 )
 
 
@@ -162,6 +170,36 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown model config keys"):
                 load_run_config(path)
 
+    def test_cache_only_cli_runs_precompute_without_training(self) -> None:
+        precompute_result = SimpleNamespace(
+            reports=[
+                {
+                    "split": "source",
+                    "total_entries": 1,
+                    "computed_entries": 1,
+                    "skipped_entries": 0,
+                    "elapsed_s": 0.0,
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                mapper_v1_training,
+                "precompute_mapper_v1_phase_b_control_teacher_cache",
+                return_value=precompute_result,
+            ) as precompute:
+                with patch.object(mapper_v1_training, "run_mapper_v1_phase_b_training") as train:
+                    mapper_v1_training.main(
+                        [
+                            "--precompute-control-teacher-cache-only",
+                            "--control-teacher-cache-dir",
+                            str(Path(temp_dir) / "cache"),
+                        ]
+                    )
+
+        precompute.assert_called_once()
+        train.assert_not_called()
+
     def test_precomputed_control_teacher_cache_feeds_phase_b_loss_without_full_inputs(self) -> None:
         record = ControlWindowRecord(
             beatmap_path=Path("cached.osu"),
@@ -207,6 +245,84 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                 loss_config=MapperV1PhaseBLossConfig(),
             )
             self.assertTrue(torch.isfinite(loss_output.total_loss))
+
+    def test_precompute_stacked_slice_order_matches_8s_cache_layout(self) -> None:
+        records = [
+            ControlWindowRecord(
+                beatmap_path=Path("first.osu"),
+                audio_path=Path("first.mp3"),
+                difficulty=4.0,
+                frame_count=500,
+                target_start_frame=0,
+            ),
+            ControlWindowRecord(
+                beatmap_path=Path("second.osu"),
+                audio_path=Path("second.mp3"),
+                difficulty=4.0,
+                frame_count=900,
+                target_start_frame=400,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir) / "cache"
+            dataset = _TinyMapperDataset(records, cache_dir=cache_dir)
+            result = precompute_phase_b_control_teacher_cache(
+                dataset,
+                cache_dir=cache_dir,
+                control_encoder=_TinyControlTeacherEncoder(control_dim=2),
+                batch_size=2,
+                device=torch.device("cpu"),
+            )
+
+            self.assertEqual(result.computed_entries, 2)
+            first = dataset[0]["control_memory_8s"][:, 0]
+            second = dataset[1]["control_memory_8s"][:, 0]
+            self.assertTrue(torch.equal(first, torch.arange(0, 400, 100, dtype=torch.float32).repeat_interleave(100)))
+            self.assertTrue(torch.equal(second, torch.arange(400, 800, 100, dtype=torch.float32).repeat_interleave(100)))
+
+    def test_raw_control_precompute_skips_mapper_tokenization_filter(self) -> None:
+        records = [
+            ControlWindowRecord(
+                beatmap_path=Path("raw.osu"),
+                audio_path=Path("raw.mp3"),
+                difficulty=4.0,
+                frame_count=500,
+                target_start_frame=0,
+            ),
+            ControlWindowRecord(
+                beatmap_path=Path("stride_skip.osu"),
+                audio_path=Path("stride_skip.mp3"),
+                difficulty=4.0,
+                frame_count=500,
+                target_start_frame=100,
+            ),
+            ControlWindowRecord(
+                beatmap_path=Path("short_skip.osu"),
+                audio_path=Path("short_skip.mp3"),
+                difficulty=4.0,
+                frame_count=500,
+                target_start_frame=400,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir) / "cache"
+            result = precompute_phase_b_control_teacher_cache_from_control_dataset(
+                _TinyControlDataset(records),
+                cache_dir=cache_dir,
+                control_encoder=_TinyControlTeacherEncoder(control_dim=2),
+                batch_size=2,
+                device=torch.device("cpu"),
+            )
+
+            self.assertEqual(result.total_entries, 1)
+            self.assertEqual(result.computed_entries, 1)
+            entry = load_control_teacher_cache_entry(
+                control_teacher_cache_path(cache_dir, records[0]),
+                record=records[0],
+            )
+            self.assertEqual(tuple(entry["control_memory_8s"].shape), (400, 2))
+            self.assertFalse(control_teacher_cache_path(cache_dir, records[1]).exists())
+            self.assertFalse(control_teacher_cache_path(cache_dir, records[2]).exists())
 
 
 class _TinyControlDataset:

@@ -392,15 +392,41 @@ def concatenate_control_memory_8s(control_outputs: Sequence[Any]) -> torch.Tenso
     return torch.cat(slices, dim=1).contiguous()
 
 
-def compute_control_teacher_8s(control_encoder: nn.Module, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+def compute_control_teacher_8s(
+    control_encoder: nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    stack_slices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     from train.stage_2.data.mapper_v1_windows import (
         concatenate_density_teacher_8s,
+        control_teacher_stacked_slices_batch,
         control_teacher_slice_batch,
     )
 
+    control_encoder.eval()
+    if stack_slices:
+        control_slice_start_frames = _require_tensor(batch, "control_slice_start_frames", ndim=2)
+        if int(control_slice_start_frames.shape[1]) != 4:
+            raise ValueError("control_slice_start_frames must have four aligned 2s starts")
+        batch_size = int(control_slice_start_frames.shape[0])
+        with torch.no_grad():
+            control_batch = control_teacher_stacked_slices_batch(dict(batch))
+            output = control_encoder(
+                context_mel=control_batch["context_mel"],
+                context_dense_timing_v2=control_batch["context_dense_timing_v2"],
+                normalized_difficulty=control_batch["normalized_difficulty"].reshape(batch_size * 4),
+                context_padding_mask=control_batch["context_padding_mask"],
+                full_mel=control_batch.get("full_mel"),
+                full_dense_timing_v2=control_batch.get("full_dense_timing_v2"),
+                padding_mask=control_batch.get("padding_mask"),
+                frame_count=control_batch.get("frame_count"),
+                target_start_frame=control_batch.get("target_start_frame"),
+            )
+        return _stacked_control_teacher_output_8s(output, batch_size=batch_size)
+
     target_tokens = _require_tensor(batch, "target_tokens", ndim=2)
     batch_size = int(target_tokens.shape[0])
-    control_encoder.eval()
     outputs = []
     with torch.no_grad():
         for slice_index in range(4):
@@ -419,6 +445,42 @@ def compute_control_teacher_8s(control_encoder: nn.Module, batch: Mapping[str, t
                 )
             )
     return concatenate_control_memory_8s(outputs), concatenate_density_teacher_8s(outputs)
+
+
+def _stacked_control_teacher_output_8s(output: Any, *, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    memory = getattr(output, "control_memory", None)
+    if not isinstance(memory, torch.Tensor) or memory.ndim != 3:
+        raise ValueError("stacked control output control_memory must have shape [B*4,T,D]")
+    expected_batch = int(batch_size) * 4
+    if int(memory.shape[0]) != expected_batch:
+        raise ValueError(f"stacked control output batch must be {expected_batch}, got {memory.shape[0]}")
+    start = TARGET_OFFSET_IN_CONTEXT
+    end = start + TARGET_WINDOW_LENGTH_FRAMES
+    if int(memory.shape[1]) < end:
+        raise ValueError(f"stacked control output memory is too short for target slice: {memory.shape[1]} < {end}")
+    control_memory_8s = memory[:, start:end].reshape(batch_size, 4, TARGET_WINDOW_LENGTH_FRAMES, memory.shape[-1])
+    control_memory_8s = control_memory_8s.reshape(batch_size, 4 * TARGET_WINDOW_LENGTH_FRAMES, memory.shape[-1]).contiguous()
+
+    value_pred = getattr(output, "value_pred", None)
+    if not isinstance(value_pred, torch.Tensor) or value_pred.ndim != 3 or int(value_pred.shape[1]) != TARGET_WINDOW_LENGTH_FRAMES:
+        raise ValueError("stacked control output value_pred must have shape [B*4,100,C]")
+    if int(value_pred.shape[0]) != expected_batch:
+        raise ValueError(f"stacked control output value_pred batch must be {expected_batch}, got {value_pred.shape[0]}")
+    from train.stage_2.features.control_v3_targets import VALUE_FEATURE_NAMES
+
+    density_index = VALUE_FEATURE_NAMES.index("density_level")
+    if int(value_pred.shape[2]) == 1:
+        density = value_pred
+    elif int(value_pred.shape[2]) == len(VALUE_FEATURE_NAMES):
+        density = value_pred[:, :, density_index : density_index + 1]
+    else:
+        raise ValueError(
+            f"stacked control output value_pred channel count must be 1 or {len(VALUE_FEATURE_NAMES)}, "
+            f"got {value_pred.shape[2]}",
+        )
+    density_teacher_8s = density.reshape(batch_size, 4, TARGET_WINDOW_LENGTH_FRAMES, 1)
+    density_teacher_8s = density_teacher_8s.reshape(batch_size, 4 * TARGET_WINDOW_LENGTH_FRAMES, 1).contiguous()
+    return control_memory_8s, density_teacher_8s
 
 
 def load_frozen_control_encoder_from_checkpoint(checkpoint_path: str | Path) -> ControlDemoGlobalEncoder:

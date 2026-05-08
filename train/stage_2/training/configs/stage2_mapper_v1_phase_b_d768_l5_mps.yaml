@@ -2,9 +2,8 @@ dataset_root: mania-dataset
 index_path: train/artifacts/indexes/stage2_control_windows_4k_2to6_dense_local_bpm_norm_unique_le3.parquet
 control_v3_timeseries_path: train/artifacts/features/control_v3_timeseries_4k_no_timing_anomalies_2to6.parquet
 
-output_dir: train/artifacts/runs/stage2_mapper_v1/stage2_mapper_v1_phase_b_d384_l4_b4
-run_name: stage2_mapper_v1_phase_b_d384_l4_b4
-
+output_dir: train/artifacts/runs/stage2_mapper_v1/stage2_mapper_v1_phase_b_d768_l5_b4
+run_name: stage2_mapper_v1_phase_b_d768_l5_b4
 init_from_control_checkpoint: train/artifacts/runs/stage2_control_demo/stage2_control_demo_global_d384_l3_stride16_b6/checkpoints/checkpoint_step_002000.pt
 
 max_steps: 12000
@@ -50,10 +49,10 @@ control_model:
 
 model:
   control_dim: 384
-  d_model: 384
-  heads: 8
-  layers: 4
-  ffn_dim: 1536
+  d_model: 768
+  heads: 12
+  layers: 5
+  ffn_dim: 3072
   dropout: 0.1
   max_seq_len: 512
 
@@ -61,7 +60,6 @@ model:
   state_prior_max_bias: 1.5
   close_scale: 0.05
   skip_scale: 0.0
-
 loss:
   lambda_ln_close: 0.05
   lambda_adapter_reg: 0.00001

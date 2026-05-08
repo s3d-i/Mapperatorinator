@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -209,6 +210,29 @@ class MapperV1WindowDataset(Dataset):
         valid_by_difficulty: dict[str, int] = {}
         valid_by_song: dict[str, int] = {}
         dropped_by_song: dict[str, int] = {}
+        started_at = time.monotonic()
+        source_window_count = len(self.control_dataset.records)
+        if progress:
+            print(
+                "mapper_v1_window_dataset_progress status=start "
+                f"source_windows={source_window_count} mapper_stride_frames={self.mapper_stride_frames}",
+                flush=True,
+            )
+
+        def maybe_print_progress(source_index: int) -> None:
+            if not progress or (total_windows != 1 and total_windows % 1000 != 0):
+                return
+            elapsed_s = time.monotonic() - started_at
+            print(
+                "mapper_v1_window_dataset_progress "
+                f"scanned_source_windows={source_index + 1}/{source_window_count} "
+                f"candidate_windows={total_windows} eligible_windows={len(records)} "
+                f"dropped_short={dropped_short} dropped_cross_window_ln={dropped_cross_window} "
+                f"dropped_unsupported_action={dropped_unsupported_action} "
+                f"parsed_maps={len(self._timepoints_by_beatmap)} elapsed_s={elapsed_s:.1f}",
+                flush=True,
+            )
+
         for index, record in enumerate(self.control_dataset.records):
             if record.target_start_frame % self.mapper_stride_frames != 0:
                 continue
@@ -217,6 +241,7 @@ class MapperV1WindowDataset(Dataset):
             song_key = record.beatmap_path.as_posix()
             if record.target_start_frame + MAPPER_WRITE_FRAMES > record.frame_count:
                 dropped_short += 1
+                maybe_print_progress(index)
                 continue
             valid_length_windows += 1
             valid_by_difficulty[difficulty_key] = valid_by_difficulty.get(difficulty_key, 0) + 1
@@ -227,17 +252,27 @@ class MapperV1WindowDataset(Dataset):
                 dropped_cross_window += 1
                 _increment_drop(dropped_by_difficulty, difficulty_key)
                 _increment_drop(dropped_by_song, song_key)
+                maybe_print_progress(index)
                 continue
             except UnsupportedMapperActionError:
                 dropped_unsupported_action += 1
                 _increment_drop(dropped_by_difficulty, difficulty_key)
                 _increment_drop(dropped_by_song, song_key)
+                maybe_print_progress(index)
                 continue
             records.append(MapperV1WindowRecord(control_record_index=index, control_record=record))
-            if progress and len(records) % 1000 == 0:
-                print(f"mapper_v1_window_dataset_progress eligible_windows={len(records)}", flush=True)
+            maybe_print_progress(index)
 
         dropped = dropped_short + dropped_cross_window + dropped_unsupported_action
+        if progress:
+            elapsed_s = time.monotonic() - started_at
+            print(
+                "mapper_v1_window_dataset_progress status=done "
+                f"candidate_windows={total_windows} eligible_windows={len(records)} "
+                f"dropped={dropped} parsed_maps={len(self._timepoints_by_beatmap)} "
+                f"elapsed_s={elapsed_s:.1f}",
+                flush=True,
+            )
         report = MapperV1WindowFilterReport(
             num_total_windows=total_windows,
             num_mapper_eligible_windows=len(records),
@@ -434,6 +469,28 @@ def control_teacher_slice_batch(mapper_batch: dict[str, Any], slice_index: int) 
         "padding_mask": mapper_batch["padding_mask"],
         "frame_count": mapper_batch["frame_count"],
         "target_start_frame": control_slice_start_frames[:, int(slice_index)],
+        "normalized_difficulty": normalized_difficulty,
+    }
+    return prepare_control_context_batch(control_batch)
+
+
+def control_teacher_stacked_slices_batch(mapper_batch: dict[str, Any]) -> dict[str, Any]:
+    control_slice_start_frames = mapper_batch.get("control_slice_start_frames")
+    if not isinstance(control_slice_start_frames, torch.Tensor) or control_slice_start_frames.ndim != 2:
+        raise ValueError("mapper_batch must contain control_slice_start_frames with shape [B,4]")
+    if int(control_slice_start_frames.shape[1]) != 4:
+        raise ValueError("control_slice_start_frames must have four aligned 2s starts")
+    normalized_difficulty = mapper_batch.get("normalized_difficulty")
+    if not isinstance(normalized_difficulty, torch.Tensor):
+        raise ValueError("mapper_batch must contain normalized_difficulty")
+    batch_size = int(control_slice_start_frames.shape[0])
+    normalized_difficulty = normalized_difficulty.reshape(batch_size).repeat_interleave(4)
+    control_batch = {
+        "full_mel": mapper_batch["full_mel"].repeat_interleave(4, dim=0),
+        "full_dense_timing_v2": mapper_batch["full_dense_timing_v2"].repeat_interleave(4, dim=0),
+        "padding_mask": mapper_batch["padding_mask"].repeat_interleave(4, dim=0),
+        "frame_count": mapper_batch["frame_count"].reshape(batch_size).repeat_interleave(4),
+        "target_start_frame": control_slice_start_frames.reshape(batch_size * 4),
         "normalized_difficulty": normalized_difficulty,
     }
     return prepare_control_context_batch(control_batch)

@@ -10,10 +10,19 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 
-from train.stage_2.data.control_windows import DEFAULT_MAX_CACHED_MAPS
+from train.stage_2.data.control_windows import (
+    ControlWindowDataset,
+    ControlWindowRecord,
+    DEFAULT_MAX_CACHED_MAPS,
+    DENSE_TIMING_V2_CHANNELS,
+    PACKED_MEL_CHANNELS,
+    TARGET_WINDOW_LENGTH_FRAMES,
+    normalize_difficulty,
+)
 from train.stage_2.data.mapper_v1_windows import (
+    MAPPER_WRITE_FRAMES,
     MapperV1WindowDataset,
     collate_mapper_v1_windows,
     control_teacher_cache_path,
@@ -70,8 +79,11 @@ RUN_CONFIG_KEYS = {
     "final_train_eval_size",
     "num_workers",
     "max_cached_maps",
+    "dataset_progress",
     "control_teacher_cache_dir",
     "precompute_control_teacher_cache",
+    "precompute_control_teacher_cache_only",
+    "control_teacher_precompute_batch_size",
     "require_control_teacher_cache",
     "control_teacher_cache_overwrite",
     "synthetic_smoke",
@@ -159,6 +171,13 @@ class MapperV1ControlTeacherCachePrecomputeResult:
             "skipped_entries": self.skipped_entries,
             "elapsed_s": self.elapsed_s,
         }
+
+
+@dataclass(frozen=True)
+class MapperV1ControlTeacherCachePrecomputeRunResult:
+    reports: list[dict[str, Any]]
+    source_control_dataset: ControlWindowDataset
+    eval_control_dataset: ControlWindowDataset | None
 
 
 def load_run_config(config_path: str | Path) -> dict[str, Any]:
@@ -280,8 +299,10 @@ def run_mapper_v1_phase_b_training(
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     num_workers: int = 0,
     max_cached_maps: int | None = None,
+    dataset_progress: bool | None = None,
     control_teacher_cache_dir: Path | None = None,
     precompute_control_teacher_cache: bool = False,
+    control_teacher_precompute_batch_size: int | None = None,
     require_control_teacher_cache: bool = False,
     control_teacher_cache_overwrite: bool = False,
     model_config_overrides: Mapping[str, Any] | None = None,
@@ -304,18 +325,55 @@ def run_mapper_v1_phase_b_training(
         dataset_kwargs["control_v3_timeseries_path"] = control_v3_timeseries_path
     effective_max_cached_maps = DEFAULT_MAX_CACHED_MAPS if max_cached_maps is None else max_cached_maps
     dataset_kwargs["max_cached_maps"] = effective_max_cached_maps
-    if control_teacher_cache_dir is not None:
-        dataset_kwargs["control_teacher_cache_dir"] = control_teacher_cache_dir
-        dataset_kwargs["require_control_teacher_cache"] = (
-            bool(require_control_teacher_cache) and not bool(precompute_control_teacher_cache)
+    effective_dataset_progress = bool(precompute_control_teacher_cache) if dataset_progress is None else bool(dataset_progress)
+    dataset_kwargs["progress"] = effective_dataset_progress
+
+    cache_precompute_reports: list[dict[str, Any]] = []
+    source_control_dataset: ControlWindowDataset | None = None
+    eval_control_dataset: ControlWindowDataset | None = None
+    if precompute_control_teacher_cache:
+        precompute_run = precompute_mapper_v1_phase_b_control_teacher_cache(
+            dataset_root=dataset_root,
+            index_path=index_path,
+            eval_index_path=eval_index_path,
+            control_v3_timeseries_path=control_v3_timeseries_path,
+            batch_size=batch_size,
+            seed=seed,
+            device_name=device_name,
+            init_from_control_checkpoint=init_from_control_checkpoint,
+            num_workers=num_workers,
+            max_cached_maps=max_cached_maps,
+            dataset_progress=effective_dataset_progress,
+            control_teacher_cache_dir=control_teacher_cache_dir,
+            control_teacher_precompute_batch_size=control_teacher_precompute_batch_size,
+            control_teacher_cache_overwrite=control_teacher_cache_overwrite,
+            control_model_config=control_model_config,
         )
-    train_source = MapperV1WindowDataset(**dataset_kwargs)
+        cache_precompute_reports = precompute_run.reports
+        source_control_dataset = precompute_run.source_control_dataset
+        eval_control_dataset = precompute_run.eval_control_dataset
+
+    mapper_dataset_kwargs: dict[str, Any]
+    if source_control_dataset is None:
+        mapper_dataset_kwargs = dict(dataset_kwargs)
+    else:
+        mapper_dataset_kwargs = {"control_dataset": source_control_dataset, "progress": effective_dataset_progress}
+    if control_teacher_cache_dir is not None:
+        mapper_dataset_kwargs["control_teacher_cache_dir"] = control_teacher_cache_dir
+        mapper_dataset_kwargs["require_control_teacher_cache"] = bool(require_control_teacher_cache)
+    train_source = MapperV1WindowDataset(**mapper_dataset_kwargs)
     if len(train_source) == 0:
         raise ValueError("MapperV1WindowDataset produced no training windows")
 
     if eval_index_path is not None:
-        eval_kwargs = dict(dataset_kwargs)
-        eval_kwargs["index_path"] = eval_index_path
+        if eval_control_dataset is None:
+            eval_kwargs = dict(dataset_kwargs)
+            eval_kwargs["index_path"] = eval_index_path
+        else:
+            eval_kwargs = {"control_dataset": eval_control_dataset, "progress": effective_dataset_progress}
+        if control_teacher_cache_dir is not None:
+            eval_kwargs["control_teacher_cache_dir"] = control_teacher_cache_dir
+            eval_kwargs["require_control_teacher_cache"] = bool(require_control_teacher_cache)
         eval_dataset: Dataset[Any] = MapperV1WindowDataset(**eval_kwargs)
         train_dataset: Dataset[Any] = train_source
     else:
@@ -329,43 +387,6 @@ def run_mapper_v1_phase_b_training(
         raise ValueError("training split is empty")
     if len(eval_dataset) == 0:
         eval_dataset = train_dataset
-
-    cache_precompute_reports: list[dict[str, Any]] = []
-    if precompute_control_teacher_cache:
-        if control_teacher_cache_dir is None:
-            raise ValueError("precompute_control_teacher_cache requires control_teacher_cache_dir")
-        precompute_device = select_torch_device(device_name)
-        precompute_encoder = ControlDemoGlobalEncoder(control_model_config).to(precompute_device)
-        if init_from_control_checkpoint is not None:
-            initialize_global_control_demo_from_control_checkpoint(
-                precompute_encoder,
-                init_from_control_checkpoint,
-            )
-        precompute_result = precompute_phase_b_control_teacher_cache(
-            train_source,
-            cache_dir=control_teacher_cache_dir,
-            control_encoder=precompute_encoder,
-            batch_size=batch_size,
-            device=precompute_device,
-            num_workers=num_workers,
-            overwrite=control_teacher_cache_overwrite,
-        )
-        cache_precompute_reports.append({"split": "source", **precompute_result.to_report()})
-        if eval_index_path is not None and isinstance(eval_dataset, MapperV1WindowDataset):
-            eval_precompute_result = precompute_phase_b_control_teacher_cache(
-                eval_dataset,
-                cache_dir=control_teacher_cache_dir,
-                control_encoder=precompute_encoder,
-                batch_size=batch_size,
-                device=precompute_device,
-                num_workers=num_workers,
-                overwrite=control_teacher_cache_overwrite,
-            )
-            cache_precompute_reports.append({"split": "eval", **eval_precompute_result.to_report()})
-        if require_control_teacher_cache:
-            train_source.require_control_teacher_cache = True
-            if isinstance(eval_dataset, MapperV1WindowDataset):
-                eval_dataset.require_control_teacher_cache = True
 
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -425,16 +446,375 @@ def run_mapper_v1_phase_b_training(
             "final_train_eval_window_count": len(train_eval_dataset),
             "filter_report": asdict(train_source.filter_report),
             "max_cached_maps": int(getattr(train_source.control_dataset, "max_cached_maps", effective_max_cached_maps)),
+            "dataset_progress": bool(effective_dataset_progress),
             "num_workers": num_workers,
             "control_teacher_cache_dir": (
                 control_teacher_cache_dir.as_posix() if control_teacher_cache_dir is not None else None
             ),
             "precompute_control_teacher_cache": bool(precompute_control_teacher_cache),
+            "control_teacher_precompute_batch_size": control_teacher_precompute_batch_size,
             "require_control_teacher_cache": bool(require_control_teacher_cache),
             "control_teacher_cache_overwrite": bool(control_teacher_cache_overwrite),
             "control_teacher_cache_precompute": cache_precompute_reports,
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
+    )
+
+
+class _ControlTeacherPrecomputeDataset(Dataset[Any]):
+    def __init__(
+        self,
+        control_dataset: Dataset[Any],
+        indexed_records: Sequence[tuple[int, ControlWindowRecord]],
+    ) -> None:
+        self.control_dataset = control_dataset
+        self.indexed_records = [
+            (int(control_record_index), record)
+            for control_record_index, record in indexed_records
+        ]
+
+    def __len__(self) -> int:
+        return len(self.indexed_records)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        control_record_index, record = self.indexed_records[index]
+        control_dataset = self.control_dataset
+        full_mel_loader = getattr(control_dataset, "_load_full_mel", None)
+        dense_timing_loader = getattr(control_dataset, "_load_dense_timing_v2", None)
+        if callable(full_mel_loader) and callable(dense_timing_loader):
+            full_mel = full_mel_loader(record.audio_path, expected_frame_count=record.frame_count)
+            full_dense_timing_v2 = dense_timing_loader(record.beatmap_path, frame_count=record.frame_count)
+        else:
+            base_sample = control_dataset[control_record_index]
+            full_mel = base_sample["full_mel"]
+            full_dense_timing_v2 = base_sample["full_dense_timing_v2"]
+        return {
+            "full_mel": torch.as_tensor(full_mel, dtype=torch.float32),
+            "full_dense_timing_v2": torch.as_tensor(full_dense_timing_v2, dtype=torch.float32),
+            "frame_count": torch.tensor(record.frame_count, dtype=torch.long),
+            "control_slice_start_frames": torch.tensor(
+                [
+                    record.target_start_frame + offset
+                    for offset in range(0, MAPPER_WRITE_FRAMES, TARGET_WINDOW_LENGTH_FRAMES)
+                ],
+                dtype=torch.long,
+            ),
+            "difficulty": torch.tensor(record.difficulty, dtype=torch.float32),
+            "normalized_difficulty": torch.tensor(normalize_difficulty(record.difficulty), dtype=torch.float32),
+            "metadata": {
+                "beatmap_path": record.beatmap_path.as_posix(),
+                "audio_path": record.audio_path.as_posix(),
+                "difficulty": record.difficulty,
+                "target_start_frame": record.target_start_frame,
+                "target_start_ms": record.target_start_ms,
+                "control_record_index": control_record_index,
+            },
+        }
+
+
+def _collate_mapper_v1_control_teacher_precompute(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if not samples:
+        raise ValueError("_collate_mapper_v1_control_teacher_precompute requires at least one sample")
+    batch_size = len(samples)
+    frame_counts = [int(sample["frame_count"].item()) for sample in samples]
+    max_frame_count = max(frame_counts)
+    full_mel = torch.zeros((batch_size, max_frame_count, PACKED_MEL_CHANNELS), dtype=torch.float32)
+    full_dense_timing_v2 = torch.zeros(
+        (batch_size, max_frame_count, DENSE_TIMING_V2_CHANNELS),
+        dtype=torch.float32,
+    )
+    padding_mask = torch.ones((batch_size, max_frame_count), dtype=torch.bool)
+    for batch_index, sample in enumerate(samples):
+        frame_count = frame_counts[batch_index]
+        sample_full_mel = sample["full_mel"].to(dtype=torch.float32)
+        sample_full_dense_timing_v2 = sample["full_dense_timing_v2"].to(dtype=torch.float32)
+        if tuple(sample_full_mel.shape) != (frame_count, PACKED_MEL_CHANNELS):
+            raise ValueError(
+                f"full_mel sample {batch_index} must have shape {(frame_count, PACKED_MEL_CHANNELS)}"
+            )
+        if tuple(sample_full_dense_timing_v2.shape) != (frame_count, DENSE_TIMING_V2_CHANNELS):
+            raise ValueError(
+                "full_dense_timing_v2 sample "
+                f"{batch_index} must have shape {(frame_count, DENSE_TIMING_V2_CHANNELS)}"
+            )
+        full_mel[batch_index, :frame_count] = sample_full_mel
+        full_dense_timing_v2[batch_index, :frame_count] = sample_full_dense_timing_v2
+        padding_mask[batch_index, :frame_count] = False
+    return {
+        "full_mel": full_mel,
+        "full_dense_timing_v2": full_dense_timing_v2,
+        "padding_mask": padding_mask,
+        "frame_count": torch.tensor(frame_counts, dtype=torch.long),
+        "control_slice_start_frames": torch.stack(
+            [sample["control_slice_start_frames"].to(dtype=torch.long) for sample in samples],
+        ),
+        "difficulty": torch.stack([sample["difficulty"].to(dtype=torch.float32) for sample in samples]).reshape(
+            batch_size,
+        ),
+        "normalized_difficulty": torch.stack(
+            [sample["normalized_difficulty"].to(dtype=torch.float32) for sample in samples],
+        ).reshape(batch_size),
+        "metadata": [sample.get("metadata", {}) for sample in samples],
+    }
+
+
+def _release_torch_device_cache(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+    if device.type != "mps" or not hasattr(torch, "mps"):
+        return
+    synchronize = getattr(torch.mps, "synchronize", None)
+    if synchronize is not None:
+        synchronize()
+    empty_cache = getattr(torch.mps, "empty_cache", None)
+    if empty_cache is not None:
+        empty_cache()
+
+
+def precompute_mapper_v1_phase_b_control_teacher_cache(
+    *,
+    dataset_root: Path = Path("mania-dataset"),
+    index_path: Path | None = None,
+    eval_index_path: Path | None = None,
+    control_v3_timeseries_path: Path | None = None,
+    batch_size: int = 4,
+    seed: int = 1337,
+    device_name: str = "auto",
+    init_from_control_checkpoint: Path | None = None,
+    num_workers: int = 0,
+    max_cached_maps: int | None = None,
+    dataset_progress: bool | None = None,
+    control_teacher_cache_dir: Path | None = None,
+    control_teacher_precompute_batch_size: int | None = None,
+    control_teacher_cache_overwrite: bool = False,
+    control_model_config: ControlDemoGlobalEncoderConfig | None = None,
+    control_model_config_overrides: Mapping[str, Any] | None = None,
+) -> MapperV1ControlTeacherCachePrecomputeRunResult:
+    _set_deterministic_seed(seed)
+    if control_teacher_cache_dir is None:
+        raise ValueError("control teacher cache precompute requires control_teacher_cache_dir")
+    effective_precompute_batch_size = (
+        batch_size if control_teacher_precompute_batch_size is None else int(control_teacher_precompute_batch_size)
+    )
+    if effective_precompute_batch_size <= 0:
+        raise ValueError("control_teacher_precompute_batch_size must be positive")
+
+    dataset_kwargs: dict[str, Any] = {"dataset_root": dataset_root}
+    if index_path is not None:
+        dataset_kwargs["index_path"] = index_path
+    if control_v3_timeseries_path is not None:
+        dataset_kwargs["control_v3_timeseries_path"] = control_v3_timeseries_path
+    effective_max_cached_maps = DEFAULT_MAX_CACHED_MAPS if max_cached_maps is None else max_cached_maps
+    dataset_kwargs["max_cached_maps"] = effective_max_cached_maps
+    dataset_kwargs["progress"] = True if dataset_progress is None else bool(dataset_progress)
+
+    resolved_control_model_config = (
+        ControlDemoGlobalEncoderConfig(**dict(control_model_config_overrides or {}))
+        if control_model_config is None
+        else control_model_config
+    )
+    precompute_device = select_torch_device(device_name)
+    precompute_encoder = ControlDemoGlobalEncoder(resolved_control_model_config).to(precompute_device)
+    try:
+        if init_from_control_checkpoint is not None:
+            initialize_global_control_demo_from_control_checkpoint(
+                precompute_encoder,
+                init_from_control_checkpoint,
+            )
+        source_control_dataset = ControlWindowDataset(**dataset_kwargs)
+        source_result = precompute_phase_b_control_teacher_cache_from_control_dataset(
+            source_control_dataset,
+            cache_dir=control_teacher_cache_dir,
+            control_encoder=precompute_encoder,
+            batch_size=effective_precompute_batch_size,
+            device=precompute_device,
+            num_workers=num_workers,
+            overwrite=control_teacher_cache_overwrite,
+        )
+        reports = [{"split": "source", **source_result.to_report()}]
+        eval_control_dataset: ControlWindowDataset | None = None
+        if eval_index_path is not None:
+            eval_dataset_kwargs = dict(dataset_kwargs)
+            eval_dataset_kwargs["index_path"] = eval_index_path
+            eval_control_dataset = ControlWindowDataset(**eval_dataset_kwargs)
+            eval_result = precompute_phase_b_control_teacher_cache_from_control_dataset(
+                eval_control_dataset,
+                cache_dir=control_teacher_cache_dir,
+                control_encoder=precompute_encoder,
+                batch_size=effective_precompute_batch_size,
+                device=precompute_device,
+                num_workers=num_workers,
+                overwrite=control_teacher_cache_overwrite,
+            )
+            reports.append({"split": "eval", **eval_result.to_report()})
+    finally:
+        del precompute_encoder
+        _release_torch_device_cache(precompute_device)
+
+    return MapperV1ControlTeacherCachePrecomputeRunResult(
+        reports=reports,
+        source_control_dataset=source_control_dataset,
+        eval_control_dataset=eval_control_dataset,
+    )
+
+
+def _mapper_v1_raw_control_indexed_records(
+    control_dataset: Dataset[Any],
+    *,
+    mapper_stride_frames: int = MAPPER_WRITE_FRAMES,
+) -> list[tuple[int, ControlWindowRecord]]:
+    records = getattr(control_dataset, "records", None)
+    if not isinstance(records, Sequence):
+        raise TypeError("control teacher cache precompute requires a dataset with records")
+    indexed_records: list[tuple[int, ControlWindowRecord]] = []
+    skipped_stride = 0
+    skipped_short = 0
+    for index, record in enumerate(records):
+        if not isinstance(record, ControlWindowRecord):
+            raise TypeError(f"control dataset record {index} must be a ControlWindowRecord")
+        if record.target_start_frame % mapper_stride_frames != 0:
+            skipped_stride += 1
+            continue
+        if record.target_start_frame + MAPPER_WRITE_FRAMES > record.frame_count:
+            skipped_short += 1
+            continue
+        indexed_records.append((index, record))
+    print(
+        "mapper_v1_control_teacher_cache_precompute raw_control_select "
+        f"source_windows={len(records)} selected_windows={len(indexed_records)} "
+        f"skipped_stride={skipped_stride} skipped_short={skipped_short}",
+        flush=True,
+    )
+    return indexed_records
+
+
+def _precompute_phase_b_control_teacher_cache_for_indexed_records(
+    *,
+    control_dataset: Dataset[Any],
+    indexed_records: Sequence[tuple[int, ControlWindowRecord]],
+    cache_dir: Path,
+    control_encoder: ControlDemoGlobalEncoder,
+    batch_size: int,
+    device: torch.device,
+    num_workers: int,
+    overwrite: bool,
+    source_label: str,
+) -> MapperV1ControlTeacherCachePrecomputeResult:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = [
+        control_teacher_cache_path(cache_dir, record)
+        for _, record in indexed_records
+    ]
+    missing_indices = [
+        index
+        for index, path in enumerate(paths)
+        if overwrite or not path.exists()
+    ]
+    skipped_entries = len(paths) - len(missing_indices)
+    start_time = time.monotonic()
+    print(
+        f"mapper_v1_control_teacher_cache_precompute start source={source_label} "
+        f"total={len(paths)} missing={len(missing_indices)} cache_dir={cache_dir.as_posix()}",
+        flush=True,
+    )
+    if not missing_indices:
+        elapsed_s = time.monotonic() - start_time
+        print(
+            f"mapper_v1_control_teacher_cache_precompute done source={source_label} "
+            f"computed=0 skipped={skipped_entries} elapsed_s={elapsed_s:.1f}",
+            flush=True,
+        )
+        return MapperV1ControlTeacherCachePrecomputeResult(
+            cache_dir=cache_dir,
+            total_entries=len(paths),
+            computed_entries=0,
+            skipped_entries=skipped_entries,
+            elapsed_s=elapsed_s,
+        )
+
+    computed_entries = 0
+    loader = DataLoader(
+        _ControlTeacherPrecomputeDataset(
+            control_dataset,
+            [indexed_records[index] for index in missing_indices],
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_collate_mapper_v1_control_teacher_precompute,
+    )
+    control_encoder.to(device)
+    control_encoder.eval()
+    offset = 0
+    for raw_batch in loader:
+        current_batch_size = int(raw_batch["control_slice_start_frames"].shape[0])
+        batch_indices = missing_indices[offset : offset + current_batch_size]
+        offset += current_batch_size
+        batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
+        with torch.no_grad():
+            control_memory_8s, density_teacher_8s = compute_control_teacher_8s(
+                control_encoder,
+                batch,
+                stack_slices=True,
+            )
+        control_memory_8s = control_memory_8s.detach().cpu()
+        density_teacher_8s = density_teacher_8s.detach().cpu()
+        for batch_index, record_index in enumerate(batch_indices):
+            record = indexed_records[record_index][1]
+            save_control_teacher_cache_entry(
+                paths[record_index],
+                record=record,
+                control_memory_8s=control_memory_8s[batch_index],
+                density_teacher_8s=density_teacher_8s[batch_index],
+            )
+            computed_entries += 1
+        if computed_entries == len(batch_indices) or computed_entries % max(batch_size * 25, 1) == 0:
+            print(
+                f"mapper_v1_control_teacher_cache_precompute progress source={source_label} "
+                f"computed={computed_entries}/{len(missing_indices)}",
+                flush=True,
+            )
+
+    elapsed_s = time.monotonic() - start_time
+    print(
+        f"mapper_v1_control_teacher_cache_precompute done source={source_label} "
+        f"computed={computed_entries} skipped={skipped_entries} elapsed_s={elapsed_s:.1f}",
+        flush=True,
+    )
+    return MapperV1ControlTeacherCachePrecomputeResult(
+        cache_dir=cache_dir,
+        total_entries=len(paths),
+        computed_entries=computed_entries,
+        skipped_entries=skipped_entries,
+        elapsed_s=elapsed_s,
+    )
+
+
+def precompute_phase_b_control_teacher_cache_from_control_dataset(
+    control_dataset: Dataset[Any],
+    *,
+    cache_dir: Path,
+    control_encoder: ControlDemoGlobalEncoder,
+    batch_size: int = 4,
+    device: torch.device,
+    num_workers: int = 0,
+    overwrite: bool = False,
+) -> MapperV1ControlTeacherCachePrecomputeResult:
+    indexed_records = _mapper_v1_raw_control_indexed_records(control_dataset)
+    return _precompute_phase_b_control_teacher_cache_for_indexed_records(
+        control_dataset=control_dataset,
+        indexed_records=indexed_records,
+        cache_dir=cache_dir,
+        control_encoder=control_encoder,
+        batch_size=batch_size,
+        device=device,
+        num_workers=num_workers,
+        overwrite=overwrite,
+        source_label="raw_control",
     )
 
 
@@ -450,98 +830,22 @@ def precompute_phase_b_control_teacher_cache(
 ) -> MapperV1ControlTeacherCachePrecomputeResult:
     if not isinstance(dataset, MapperV1WindowDataset):
         raise TypeError("precompute_phase_b_control_teacher_cache requires a MapperV1WindowDataset")
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    paths = [
-        control_teacher_cache_path(cache_dir, mapper_record.control_record)
-        for mapper_record in dataset.records
-    ]
-    missing_indices = [
-        index
-        for index, path in enumerate(paths)
-        if overwrite or not path.exists()
-    ]
-    skipped_entries = len(paths) - len(missing_indices)
-    start_time = time.monotonic()
-    print(
-        f"mapper_v1_control_teacher_cache_precompute start total={len(paths)} "
-        f"missing={len(missing_indices)} cache_dir={cache_dir.as_posix()}",
-        flush=True,
-    )
-    if not missing_indices:
-        elapsed_s = time.monotonic() - start_time
-        print(
-            f"mapper_v1_control_teacher_cache_precompute done computed=0 skipped={skipped_entries} "
-            f"elapsed_s={elapsed_s:.1f}",
-            flush=True,
-        )
-        dataset.control_teacher_cache_dir = cache_dir
-        return MapperV1ControlTeacherCachePrecomputeResult(
-            cache_dir=cache_dir,
-            total_entries=len(paths),
-            computed_entries=0,
-            skipped_entries=skipped_entries,
-            elapsed_s=elapsed_s,
-        )
-
-    original_require_cache = dataset.require_control_teacher_cache
-    dataset.control_teacher_cache_dir = None
-    dataset.require_control_teacher_cache = False
-    computed_entries = 0
-    try:
-        loader = DataLoader(
-            Subset(dataset, missing_indices),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=collate_mapper_v1_windows,
-        )
-        control_encoder.to(device)
-        control_encoder.eval()
-        offset = 0
-        for raw_batch in loader:
-            current_batch_size = int(raw_batch["target_tokens"].shape[0])
-            batch_indices = missing_indices[offset : offset + current_batch_size]
-            offset += current_batch_size
-            batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
-            with torch.no_grad():
-                control_memory_8s, density_teacher_8s = compute_control_teacher_8s(control_encoder, batch)
-            control_memory_8s = control_memory_8s.detach().cpu()
-            density_teacher_8s = density_teacher_8s.detach().cpu()
-            for batch_index, record_index in enumerate(batch_indices):
-                record = dataset.records[record_index].control_record
-                save_control_teacher_cache_entry(
-                    paths[record_index],
-                    record=record,
-                    control_memory_8s=control_memory_8s[batch_index],
-                    density_teacher_8s=density_teacher_8s[batch_index],
-                )
-                computed_entries += 1
-            if computed_entries == len(batch_indices) or computed_entries % max(batch_size * 25, 1) == 0:
-                print(
-                    f"mapper_v1_control_teacher_cache_precompute progress "
-                    f"computed={computed_entries}/{len(missing_indices)}",
-                    flush=True,
-                )
-    finally:
-        dataset.control_teacher_cache_dir = cache_dir
-        dataset.require_control_teacher_cache = original_require_cache
-
-    elapsed_s = time.monotonic() - start_time
-    print(
-        f"mapper_v1_control_teacher_cache_precompute done computed={computed_entries} "
-        f"skipped={skipped_entries} elapsed_s={elapsed_s:.1f}",
-        flush=True,
-    )
-    return MapperV1ControlTeacherCachePrecomputeResult(
+    result = _precompute_phase_b_control_teacher_cache_for_indexed_records(
+        control_dataset=dataset.control_dataset,
+        indexed_records=[
+            (mapper_record.control_record_index, mapper_record.control_record)
+            for mapper_record in dataset.records
+        ],
         cache_dir=cache_dir,
-        total_entries=len(paths),
-        computed_entries=computed_entries,
-        skipped_entries=skipped_entries,
-        elapsed_s=elapsed_s,
+        control_encoder=control_encoder,
+        batch_size=batch_size,
+        device=device,
+        num_workers=num_workers,
+        overwrite=overwrite,
+        source_label="mapper_filtered",
     )
+    dataset.control_teacher_cache_dir = Path(cache_dir)
+    return result
 
 
 def compute_phase_b_loss(
@@ -1114,11 +1418,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--num-workers", type=int, default=config_defaults.get("num_workers", 0))
     parser.add_argument("--max-cached-maps", type=int, default=config_defaults.get("max_cached_maps"))
+    parser.add_argument(
+        "--dataset-progress",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults.get("dataset_progress"),
+    )
     parser.add_argument("--control-teacher-cache-dir", default=config_defaults.get("control_teacher_cache_dir"))
     parser.add_argument(
         "--precompute-control-teacher-cache",
         action="store_true",
         default=bool(config_defaults.get("precompute_control_teacher_cache", False)),
+    )
+    parser.add_argument(
+        "--precompute-control-teacher-cache-only",
+        action="store_true",
+        default=bool(config_defaults.get("precompute_control_teacher_cache_only", False)),
+    )
+    parser.add_argument(
+        "--control-teacher-precompute-batch-size",
+        type=int,
+        default=config_defaults.get("control_teacher_precompute_batch_size"),
     )
     parser.add_argument(
         "--require-control-teacher-cache",
@@ -1134,6 +1453,43 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     init_from = Path(args.init_from_control_checkpoint) if args.init_from_control_checkpoint is not None else None
+    if args.precompute_control_teacher_cache_only:
+        if args.synthetic_smoke:
+            raise ValueError("precompute_control_teacher_cache_only is not supported with synthetic_smoke")
+        result = precompute_mapper_v1_phase_b_control_teacher_cache(
+            dataset_root=Path(args.dataset_root),
+            index_path=Path(args.index_path) if args.index_path is not None else None,
+            eval_index_path=Path(args.eval_index_path) if args.eval_index_path is not None else None,
+            control_v3_timeseries_path=(
+                Path(args.control_v3_timeseries_path)
+                if args.control_v3_timeseries_path is not None
+                else None
+            ),
+            batch_size=args.batch_size,
+            seed=args.seed,
+            device_name=args.device,
+            init_from_control_checkpoint=init_from,
+            num_workers=args.num_workers,
+            max_cached_maps=args.max_cached_maps,
+            dataset_progress=args.dataset_progress,
+            control_teacher_cache_dir=(
+                Path(args.control_teacher_cache_dir)
+                if args.control_teacher_cache_dir is not None
+                else None
+            ),
+            control_teacher_precompute_batch_size=args.control_teacher_precompute_batch_size,
+            control_teacher_cache_overwrite=args.control_teacher_cache_overwrite,
+            control_model_config_overrides=control_model_defaults,
+        )
+        for report in result.reports:
+            print(
+                "control_teacher_cache_report "
+                f"split={report['split']} total={report['total_entries']} "
+                f"computed={report['computed_entries']} skipped={report['skipped_entries']} "
+                f"elapsed_s={float(report['elapsed_s']):.1f}",
+            )
+        return
+
     if args.synthetic_smoke:
         result = run_synthetic_smoke(
             output_dir=Path(args.output_dir),
@@ -1176,12 +1532,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             final_train_eval_size=args.final_train_eval_size,
             num_workers=args.num_workers,
             max_cached_maps=args.max_cached_maps,
+            dataset_progress=args.dataset_progress,
             control_teacher_cache_dir=(
                 Path(args.control_teacher_cache_dir)
                 if args.control_teacher_cache_dir is not None
                 else None
             ),
             precompute_control_teacher_cache=args.precompute_control_teacher_cache,
+            control_teacher_precompute_batch_size=args.control_teacher_precompute_batch_size,
             require_control_teacher_cache=args.require_control_teacher_cache,
             control_teacher_cache_overwrite=args.control_teacher_cache_overwrite,
             model_config_overrides=model_defaults,
