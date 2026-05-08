@@ -1,10 +1,10 @@
 ---
-pinned_commit: 2d96e6390c82cd65c7eb1eb6530be9b090e4dc72
+pinned_commit: 1d238fc0778133d70a6d401abe0274fc1bdc7019
 status: implementation-ready draft
 date: 2026-05-08
 owner: s3d-i
 module: train/stage_2/model_mapper_v1
-design_revision: v1.1
+design_revision: v1.2
 depends_on:
   control_encoder: train/stage_2/model_control_demo_global
   control_config: train/stage_2/training/configs/stage2_control_demo_global_mps.yaml
@@ -14,7 +14,7 @@ time_shift_contract: canonical_relative_ts_v1
 ln_contract: carry_ln_state_v1
 ---
 
-# Mapper V1.1 Design
+# Mapper V1.2 Design
 
 ## 0. Status
 
@@ -26,8 +26,9 @@ implemented and audited:
 
 1. differentiable density auxiliary loss;
 2. context-aware LN close adapter;
-3. write-end dead-end grammar guard;
-4. density and LN-close evaluation metrics.
+3. mandatory grammar-constrained short rollout recovery training;
+4. write-end dead-end grammar guard;
+5. density, LN-close, and teacher-forcing mismatch evaluation metrics.
 
 The mapper is a control-conditioned autoregressive event generator for
 osu!mania 4K. It maps:
@@ -181,6 +182,51 @@ density_teacher_8s     frozen control model value prediction
 ```
 
 Never call `density_teacher_8s` the target.
+
+### 2.4 Teacher Replay State Alignment
+
+Teacher states are part of the training contract, not incidental metadata.
+
+For decoder input position `i`:
+
+```text
+input token       = target_tokens[i]
+prediction target = target_tokens[i + 1]
+teacher_state[i]  = replay_state_after_consuming(target_tokens[0 : i + 1])
+```
+
+Therefore the forward pass uses:
+
+```text
+decoder_input = target_tokens[:, :-1]
+loss_target   = target_tokens[:, 1:]
+state_input   = teacher_state[:, :-1]
+```
+
+For `i = 0`:
+
+```text
+target_tokens[0] must be BOS
+teacher_state[0]:
+    current_ms  = write_start_ms
+    open_mask   = 0
+    open_age_ms = 0
+```
+
+This off-by-one convention is mandatory. If `teacher_state[i]` is instead the
+state before consuming `target_tokens[i]` or after consuming
+`target_tokens[i + 1]`, the grammar mask, density scatter frame, and LN close
+labels are all shifted and invalid.
+
+Generated-prefix recovery training uses the same replay convention:
+
+```text
+generated_state[j] =
+    replay_state_after_consuming(generated_prefix[0 : j + 1])
+```
+
+Recovery CE may only compare generated states and teacher states that follow
+this same convention.
 
 ## 3. Token Vocabulary
 
@@ -519,7 +565,7 @@ num_age_buckets = 32
 
 ## 7. Dynamic Adapters
 
-The V1.1 adapter is split into two constrained parts:
+The V1.2 adapter is split into two constrained parts:
 
 ```text
 StatePriorAdapter
@@ -590,7 +636,7 @@ Initialize near zero:
 ```text
 final_weight std = 1e-3
 final_bias = 0
-adapter_scale initial = 0.05
+adapter_scale initial = 0.02 - 0.05
 ```
 
 Do not initialize the whole adapter to exact zero if that blocks useful early
@@ -600,8 +646,13 @@ Bound the final projected bias:
 
 ```text
 bias = max_bias * tanh(raw_bias / max_bias)
-max_bias = 3.0
+max_bias = 1.5 initially
 ```
+
+Increase `adapter_scale` or `max_bias` only after audits show that the adapter
+is being ignored. The first run should bias toward weak priors because this
+adapter can otherwise learn a shortcut where long-open LNs close by duration
+prior alone and overpower decoder timing.
 
 ## 9. LNCloseAdapter
 
@@ -710,7 +761,18 @@ close_scale initial = 0.05
 skip_scale initial = 0.0
 ```
 
-Ramp `skip_scale` after the close auxiliary loss starts improving.
+Keep `skip_scale = 0` for the first stable teacher-forced phase.
+
+Enable and ramp `skip_scale` only if all are true:
+
+```text
+close_auc improves
+generated_late_close_rate is high
+premature_close_rate is not high
+```
+
+The close bias may train early. The skip penalty should not train the first
+model into closing every open LN as soon as it sees an open lane.
 
 Do not let the adapter close all LNs early.
 
@@ -913,14 +975,17 @@ steps 0 - warmup_steps:
     lambda_density = 0
 after warmup:
     linearly ramp to lambda_density_max
+lambda_density_max = 0.03 initially
+```
+
+If token CE remains stable and generated density metrics improve, allow:
+
+```text
 lambda_density_max = 0.05
 ```
 
-If token CE remains stable and density metrics improve, allow:
-
-```text
-lambda_density_max = 0.10
-```
+Do not tune density by teacher-forced density alone. The density auxiliary can
+create generated event spam while still looking useful under teacher forcing.
 
 Cap density gradient norm so it does not dominate token CE:
 
@@ -1107,6 +1172,7 @@ L_total =
     L_token
   + lambda_density * L_density
   + lambda_ln_close * L_ln_close
+  + lambda_recovery_ce * L_recovery_ce
   + lambda_density_teacher * L_density_teacher
   + lambda_adapter_reg * L_adapter_reg
 ```
@@ -1114,8 +1180,9 @@ L_total =
 Recommended:
 
 ```text
-lambda_density_max        = 0.05
+lambda_density_max        = 0.03 initially, 0.05 after generated metrics improve
 lambda_ln_close_max       = 0.20
+lambda_recovery_ce        = 0.03 - 0.10 during Phase E
 lambda_density_teacher    = 0.00 by default
 lambda_adapter_reg        = 1e-5
 ```
@@ -1128,7 +1195,71 @@ L_adapter_reg =
   + mean(square(ln_close_bias))
 ```
 
-### 12.3 Training Phases
+### 12.3 Short Rollout Recovery Loss
+
+V1.2 includes a mandatory narrow teacher-forcing mismatch mitigation.
+
+The main learner remains teacher-forced CE. Recovery CE is an auxiliary loss
+computed only on short generated prefixes whose replayed state can be strictly
+matched to a gold replay state.
+
+Recommended contract:
+
+```text
+enabled: true for V1.2
+start_after: teacher_forced_token_ce_stable
+rollout_source: current model
+gradient_through_sampling: false
+rollout_length_ms: 500 - 1500
+rollout_max_tokens: 32 - 96
+generated_batch_ratio: 0.125 - 0.25
+state_match_policy: strict
+lambda_recovery_ce: 0.03 - 0.10
+grammar: always active
+```
+
+Strict state match:
+
+```text
+generated_current_ms == gold_current_ms_at_some_prefix
+generated_open_mask == gold_open_mask_at_that_prefix
+generated_open_age_ms == gold_open_age_ms_at_that_prefix
+    or abs age error <= 10ms for open lanes
+```
+
+Only matched states create training examples:
+
+```text
+L_recovery_ce =
+    CE(
+        model(generated_prefix),
+        gold_next_token_at_matched_state
+    )
+```
+
+Unmatched states:
+
+```text
+skip loss
+log mismatch reason
+continue rollout/evaluation
+```
+
+No arbitrary oracle is used for unmatched generated states. No post-hoc repair
+is used. No gradient flows through token sampling.
+
+Do not implement naive scheduled sampling as:
+
+```text
+randomly replace a gold previous token with a sampled token
+still predict the original gold next token
+```
+
+That creates false labels whenever the generated token changes `current_ms`,
+`open_mask`, `open_age_ms`, or the legal-token set. V1.2 recovery training
+trains only when generated state can be mapped back to a gold replay state.
+
+### 12.4 Training Phases
 
 Phase A: audit and calibration
 
@@ -1154,21 +1285,33 @@ Phase C: density ramp
 Phase D: rollout evaluation
 
 - grammar-constrained generation;
-- no training from rollout by default;
-- measure generated density and LN close quality.
+- compute generated metrics, not only teacher-forced metrics;
+- compute prefix state divergence:
+  `generated_current_ms_drift`, `generated_open_mask_mismatch`,
+  `generated_open_age_error`, and `generated_prefix_match_rate`;
+- use generated metrics during checkpoint selection.
 
-Phase E: optional scheduled-sampling style fine-tuning
+Phase E: mandatory short rollout recovery training
 
-- short generated prefixes only;
-- 1s to 2s rollout fragments;
+- sample windows or gold anchor prefixes;
+- run the current mapper for a short grammar-constrained rollout;
+- replay generated prefix states using the Section 2.4 convention;
+- match generated states to gold replay states using strict state matching;
+- train next-token CE only on matched states;
+- skip unmatched states and log the mismatch reason;
 - grammar always active;
-- apply LN close supervision where generated state overlaps gold LN state.
+- keep recovery loss low weight so it cannot replace teacher-forced CE.
 
-Do not enable Phase E until the teacher-forced model is stable.
+Enable Phase E after the teacher-forced model is stable. A V1.2 run is not
+complete until Phase E has run and mismatch metrics are reported.
 
 ## 13. Forward Pass
 
 ### 13.1 Pseudocode
+
+The teacher state tensors in this pseudocode follow the Section 2.4
+off-by-one contract. Do not shift state tensors independently from
+`target_tokens`.
 
 ```python
 def forward(batch):
@@ -1253,6 +1396,50 @@ def forward(batch):
         "loss_ln_close": L_ln_close,
     }
 ```
+
+### 13.2 Recovery Training Pseudocode
+
+The recovery phase reuses the same scoring path as the teacher-forced forward
+pass, but its decoder input is a generated prefix.
+
+```python
+def recovery_step(batch):
+    generated_prefixes = grammar_constrained_short_rollout(
+        model=current_model,
+        anchors=batch.gold_anchor_prefixes,
+        max_ms=rollout_length_ms,
+        max_tokens=rollout_max_tokens,
+        no_grad_sampling=True,
+    )
+
+    generated_states = replay_states(generated_prefixes)
+    matches = strict_match_to_gold_replay(
+        generated_states=generated_states,
+        gold_states=batch.teacher_states,
+        age_tolerance_ms=10,
+    )
+
+    matched_prefixes, matched_targets = build_recovery_ce_examples(
+        generated_prefixes=generated_prefixes,
+        matches=matches,
+    )
+
+    if matched_prefixes.empty:
+        log_recovery_mismatch_reasons(matches)
+        return 0
+
+    logits_final = score_prefixes_with_grammar(
+        prefixes=matched_prefixes,
+        replay_states=replay_states(matched_prefixes),
+    )
+
+    return token_ce(logits_final, matched_targets)
+```
+
+`gold_anchor_prefixes` may be BOS-only prefixes or sampled gold prefixes from
+the same window. Once generation starts, all generated states must be replayed
+from actual generated tokens; do not keep using gold states after a generated
+token is consumed.
 
 ## 14. Inference
 
@@ -1431,6 +1618,39 @@ time_shift_bias_max_abs
 If adapter bias saturates early, reduce adapter scale or increase
 regularization.
 
+### 15.6 Teacher-Forcing Mismatch and Recovery Audits
+
+Report before and after Phase E:
+
+```text
+teacher_forced_token_ce
+generated_prefix_match_rate_500ms
+generated_prefix_match_rate_1000ms
+generated_current_ms_drift_mae
+generated_open_mask_mismatch_rate
+generated_open_age_mae_when_open_mask_matches
+recovery_ce
+recovery_batch_valid_fraction
+rollout_token_edit_distance
+generated_vs_teacher_forced_density_gap
+generated_vs_teacher_forced_ln_close_gap
+```
+
+Minimum V1.2 gates:
+
+```text
+generated_validity_rate == 1.0
+generated_dead_end_rate == 0
+generated_prefix_match_rate_500ms >= 0.70 after recovery phase
+generated_open_mask_mismatch_rate does not increase after recovery phase
+generated_vs_teacher_forced_density_gap improves or stays flat
+generated_vs_teacher_forced_ln_close_gap improves or stays flat
+teacher_forced_token_ce regression <= 3-5%
+```
+
+Do not select checkpoints by teacher-forced CE alone. A common failure mode is
+good teacher-forced CE with poor free generation.
+
 ## 16. Failure Modes and Mitigations
 
 ### 16.1 Event Spam From Density Loss
@@ -1514,7 +1734,26 @@ Mitigation:
 - lower `lambda_ln_close`;
 - delay `skip_scale`.
 
-## 17. Non-Goals for V1.1
+### 16.6 Teacher-Forced CE Does Not Transfer
+
+Symptom:
+
+```text
+teacher_forced_token_ce improves
+generated_prefix_match_rate is low
+generated_open_mask_mismatch_rate is high
+free generation density or LN metrics are poor
+```
+
+Mitigation:
+
+- verify the Section 2.4 replay state convention;
+- inspect mismatch reason logs from Phase D and Phase E;
+- run mandatory short rollout recovery;
+- lower recovery rollout length until strict matches are common;
+- do not train CE on unmatched generated states.
+
+## 17. Non-Goals for V1.2
 
 The following are explicitly out of scope:
 
@@ -1523,39 +1762,58 @@ The following are explicitly out of scope:
 - full-chart global structure planning;
 - post-hoc repair;
 - unconstrained adapter full-vocab logits;
+- naive scheduled sampling that predicts original gold labels from divergent
+  generated states;
+- Professor Forcing, adversarial losses, RL-style fine-tuning, or arbitrary
+  expert relabeling of unmatched generated states;
 - training the control encoder jointly with mapper.
 
-Future versions may add these only after V1.1 metrics are stable.
+Future versions may add these only after V1.2 metrics are stable.
 
 ## 18. Minimal Acceptance Criteria
 
-A V1.1 mapper run is acceptable only if all are true:
+A V1.2 mapper run is acceptable only if all are true:
 
 1. tokenizer gold replay has zero grammar violations;
 2. generation has zero invalid tokens;
 3. generation has zero grammar dead-ends;
-4. density auxiliary improves density MAE/correlation without increasing token
-   CE materially;
-5. LN close auxiliary improves close F1 and generated LN duration MAE;
-6. adapter bias does not saturate;
-7. cross-window LN drop rate is reported;
-8. density target and teacher naming is consistent in code and logs.
+4. teacher-forced token CE is stable;
+5. generated metrics are reported and used for checkpoint selection;
+6. density auxiliary improves generated density metrics or is disabled;
+7. LN close auxiliary improves generated LN duration metrics or is weakened;
+8. adapter bias does not saturate;
+9. cross-window LN drop rate is reported and judged acceptable;
+10. short rollout recovery phase runs successfully;
+11. recovery training does not regress token CE by more than 3-5%;
+12. generated prefix match rate improves or at least does not regress;
+13. open-mask mismatch rate improves or at least does not regress;
+14. density target and density teacher naming is consistent in code and logs.
 
 Recommended minimum report:
 
 ```text
-token_ce
+teacher_forced_token_ce
 generated_validity_rate
 generated_dead_end_rate
+generated_prefix_match_rate_500ms
+generated_prefix_match_rate_1000ms
+generated_current_ms_drift_mae
+generated_open_mask_mismatch_rate
+generated_open_age_mae_when_open_mask_matches
+recovery_ce
+recovery_batch_valid_fraction
+rollout_token_edit_distance
 density_frame_mae
 density_window_error
 density_corr
+generated_vs_teacher_forced_density_gap
 close_precision
 close_recall
 close_f1
 ln_duration_mae_ms
 premature_close_rate
 late_close_rate
+generated_vs_teacher_forced_ln_close_gap
 adapter_bias_stats
 cross_window_ln_drop_rate
 ```
@@ -1573,8 +1831,19 @@ The token decoder should still decide the final musical event.
 
 The grammar should decide what is legal.
 
-The most important implementation change is this: density loss and LN close
-loss must be computed from teacher-forced model distributions and lane-level
-close hazards, not from reconstructed gold tokens alone. Otherwise the design
-looks clean on paper but the two signals that matter will not actually train
-the mapper.
+Teacher-forced CE is the main learner.
+
+Short grammar-constrained rollout recovery is mandatory V1.2 insurance against
+state-distribution mismatch.
+
+The most important implementation constraints are:
+
+```text
+density loss trains from grammar-masked model distributions
+LN close loss trains lane-level close hazards
+recovery CE trains only on generated states that strictly match gold replay
+hard grammar remains the final legality authority
+```
+
+Otherwise the design can look clean under teacher forcing while free
+generation still fails.
