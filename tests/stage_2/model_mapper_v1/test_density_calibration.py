@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from train.stage_2.model_mapper_v1.density_calibration import (
-    fit_monotonic_sigmoid_calibration,
+    fit_monotonic_affine_calibration,
     scatter_tokenized_gold_onset_mass,
     smooth_density_mass,
 )
@@ -46,21 +46,31 @@ class MapperV1DensityCalibrationTests(unittest.TestCase):
         self.assertAlmostEqual(float(smoothed.sum().item()), 3.0, places=5)
         self.assertGreater(float(smoothed[200].item()), float(smoothed[195].item()))
 
-    def test_monotonic_calibration_fit_predicts_increasing_values(self) -> None:
+    def test_monotonic_calibration_fit_predicts_raw_log1p_values_without_clamping(self) -> None:
         mass = torch.linspace(0.0, 4.0, 400)
-        target = torch.sigmoid(1.5 * mass - 2.0)
+        target = 0.25 + 0.75 * mass
 
-        calibration = fit_monotonic_sigmoid_calibration(mass, target)
+        calibration = fit_monotonic_affine_calibration(mass, target, radius=0)
         pred = calibration.predict(mass)
 
         self.assertGreaterEqual(calibration.scale, 0.0)
         self.assertLess(float(pred[10].item()), float(pred[-10].item()))
+        self.assertGreater(float(pred[-1].item()), 3.0)
+        self.assertAlmostEqual(calibration.scale, 0.75, places=5)
+        self.assertAlmostEqual(calibration.bias, 0.25, places=5)
 
-    def test_monotonic_calibration_rejects_nonfinite_targets_before_clamp(self) -> None:
+    def test_monotonic_calibration_rejects_nonfinite_targets(self) -> None:
         with self.assertRaisesRegex(ValueError, "density_target"):
-            fit_monotonic_sigmoid_calibration(
+            fit_monotonic_affine_calibration(
                 torch.arange(4, dtype=torch.float32),
                 torch.tensor([0.1, float("inf"), 0.8, 0.9]),
+            )
+
+    def test_monotonic_calibration_rejects_negative_raw_log1p_targets(self) -> None:
+        with self.assertRaisesRegex(ValueError, "raw log1p"):
+            fit_monotonic_affine_calibration(
+                torch.arange(4, dtype=torch.float32),
+                torch.tensor([0.1, -0.1, 0.8, 0.9]),
             )
 
 

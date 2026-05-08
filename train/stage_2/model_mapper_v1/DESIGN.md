@@ -1,5 +1,5 @@
 ---
-pinned_commit: 1d238fc0778133d70a6d401abe0274fc1bdc7019
+pinned_commit: 3e957269fcd64dbb511b5dc354d22b808ec44ee7
 status: implementation-ready draft
 date: 2026-05-08
 owner: s3d-i
@@ -903,16 +903,18 @@ Example calibrated prediction:
 
 ```text
 density_pred_from_mapper =
-    soft_clip(a * smooth(raw_expected_mass) + b)
+    a * smooth(raw_expected_mass) + b
 ```
 
 where:
 
 ```text
-soft_clip(x) = sigmoid(x)
+a >= 0
 ```
 
-or another fixed monotonic bounded mapping.
+The prediction remains in raw `log1p(D_med)` density units. Do not apply a
+sigmoid or `[0, 1]` clamp unless the upstream density target is explicitly
+changed and the mapper density calibration is refit.
 
 The calibration parameters must be logged.
 

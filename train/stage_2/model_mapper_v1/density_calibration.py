@@ -21,7 +21,7 @@ class DensityCalibration:
 
     def predict(self, raw_mass: torch.Tensor) -> torch.Tensor:
         smoothed = smooth_density_mass(raw_mass, radius=self.radius, kernel=self.kernel)
-        return torch.sigmoid(float(self.scale) * smoothed + float(self.bias))
+        return float(self.scale) * smoothed + float(self.bias)
 
     def to_dict(self) -> dict[str, float | int | str]:
         return asdict(self)
@@ -89,12 +89,11 @@ def smooth_density_mass(raw_mass: torch.Tensor, *, radius: int = 5, kernel: str 
     return smoothed.squeeze(0) if squeeze else smoothed
 
 
-def fit_monotonic_sigmoid_calibration(
+def fit_monotonic_affine_calibration(
     smoothed_mass: torch.Tensor,
     density_target: torch.Tensor,
     confidence: torch.Tensor | None = None,
     *,
-    eps: float = 1e-4,
     radius: int = 5,
     kernel: str = "triangular",
 ) -> DensityCalibration:
@@ -104,18 +103,19 @@ def fit_monotonic_sigmoid_calibration(
         raise ValueError("smoothed_mass must contain only finite values")
     if not torch.isfinite(target_raw).all():
         raise ValueError("density_target must contain only finite values")
-    target = target_raw.clamp(eps, 1.0 - eps)
+    if bool((target_raw < 0.0).any()):
+        raise ValueError("density_target must contain raw log1p density values, which must be non-negative")
     if confidence is None:
-        weight = torch.ones_like(target)
+        weight = torch.ones_like(target_raw)
     else:
         weight = confidence.detach().to(dtype=torch.float64).reshape(-1)
         if not torch.isfinite(weight).all():
             raise ValueError("density confidence must contain only finite values")
-    finite = torch.isfinite(x) & torch.isfinite(target) & torch.isfinite(weight) & (weight > 0)
+    finite = torch.isfinite(x) & torch.isfinite(target_raw) & torch.isfinite(weight) & (weight > 0)
     if not bool(finite.any()):
         raise ValueError("cannot fit density calibration without finite weighted samples")
     x = x[finite]
-    y = torch.logit(target[finite])
+    y = target_raw[finite]
     weight = weight[finite]
 
     sw = weight.sum()
