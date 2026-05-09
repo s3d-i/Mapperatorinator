@@ -31,7 +31,7 @@ from train.stage_2.data.mapper_v1_windows import (
 )
 from train.stage_2.model_control_demo_global import ControlDemoGlobalEncoder, ControlDemoGlobalEncoderConfig
 from train.stage_2.model_mapper_v1 import MapperV1Config, MapperV1Model, MapperV1ModelOutput, MapperV1Vocab
-from train.stage_2.model_mapper_v1.loss import adapter_bias_regularization, token_cross_entropy
+from train.stage_2.model_mapper_v1.loss import adapter_bias_regularization, density_auxiliary_loss, token_cross_entropy
 from train.stage_2.training.control import (
     CHECKPOINT_SCHEMA_VERSION,
     DEFAULT_FINAL_TRAIN_EVAL_SIZE,
@@ -99,14 +99,17 @@ LOSS_CONFIG_KEYS = {
     "lambda_density",
     "lambda_density_teacher",
     "close_pos_weight_max",
+    "density_calibration_scale",
+    "density_calibration_bias",
 }
 MAPPER_BATCH_TENSOR_KEYS = frozenset(
     (
-        "target_tokens",
-        "target_token_mask",
-        "teacher_current_ms",
-        "teacher_open_mask",
-        "teacher_open_age_ms",
+        "decoder_input_tokens",
+        "target_fragment_tokens",
+        "target_fragment_mask",
+        "target_fragment_states",
+        "ln_carry_in",
+        "ln_carry_out",
         "close_labels",
         "close_label_mask",
         "density_target_8s",
@@ -116,6 +119,8 @@ MAPPER_BATCH_TENSOR_KEYS = frozenset(
         "control_memory_padding_mask_8s",
         "write_start_ms",
         "write_end_ms",
+        "is_full_chart_start",
+        "is_full_chart_end",
         "difficulty",
         "normalized_difficulty",
         "full_mel",
@@ -134,16 +139,30 @@ class MapperV1PhaseBLossConfig:
     lambda_density: float = 0.0
     lambda_density_teacher: float = 0.0
     close_pos_weight_max: float = 20.0
+    density_calibration_scale: float = 1.0
+    density_calibration_bias: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.lambda_density != 0.0 or self.lambda_density_teacher != 0.0:
-            raise ValueError("density loss is disabled for Phase B")
+        if self.lambda_density < 0.0:
+            raise ValueError("lambda_density must be non-negative")
+        if self.lambda_density_teacher < 0.0:
+            raise ValueError("lambda_density_teacher must be non-negative")
+        if self.lambda_density_teacher != 0.0:
+            raise ValueError("density teacher loss is not implemented for mapper v1 training")
         if self.lambda_ln_close < 0.0:
             raise ValueError("lambda_ln_close must be non-negative")
         if self.lambda_adapter_reg < 0.0:
             raise ValueError("lambda_adapter_reg must be non-negative")
         if self.close_pos_weight_max < 1.0:
             raise ValueError("close_pos_weight_max must be at least 1")
+        if self.density_calibration_scale < 0.0:
+            raise ValueError("density_calibration_scale must be non-negative")
+        for name, value in (
+            ("density_calibration_scale", self.density_calibration_scale),
+            ("density_calibration_bias", self.density_calibration_bias),
+        ):
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
 
 
 @dataclass(frozen=True)
@@ -942,27 +961,24 @@ def precompute_phase_b_control_teacher_cache(
 def compute_phase_b_loss(
     model_output: MapperV1ModelOutput,
     *,
-    target_tokens: torch.Tensor,
-    target_token_mask: torch.Tensor | None = None,
+    target_fragment_tokens: torch.Tensor,
+    target_fragment_mask: torch.Tensor,
+    target_fragment_states: Mapping[str, torch.Tensor],
     close_labels: torch.Tensor,
     close_label_mask: torch.Tensor,
+    density_target_8s: torch.Tensor | None = None,
+    density_confidence_8s: torch.Tensor | None = None,
+    write_start_ms: torch.Tensor,
     vocab: MapperV1Vocab,
     loss_config: MapperV1PhaseBLossConfig = MapperV1PhaseBLossConfig(),
 ) -> MapperV1LossOutput:
-    loss_target = target_tokens[:, 1:].to(dtype=torch.long, device=model_output.logits_final.device)
+    loss_target = target_fragment_tokens.to(dtype=torch.long, device=model_output.logits_final.device)
     if tuple(loss_target.shape) != tuple(model_output.logits_final.shape[:2]):
-        raise ValueError("loss target must align with teacher-forced decoder output")
-    if target_token_mask is None:
-        target_mask = loss_target != vocab.pad_id
-        input_mask = target_tokens[:, :-1].to(device=model_output.logits_final.device, dtype=torch.long) != vocab.pad_id
-    else:
-        if tuple(target_token_mask.shape) != tuple(target_tokens.shape):
-            raise ValueError("target_token_mask must match target_tokens")
-        target_mask = target_token_mask[:, 1:].to(device=model_output.logits_final.device, dtype=torch.bool)
-        input_mask = (
-            target_token_mask[:, :-1].to(device=model_output.logits_final.device, dtype=torch.bool)
-            & target_mask
-        )
+        raise ValueError("target_fragment_tokens must align with teacher-forced decoder output")
+    if tuple(target_fragment_mask.shape) != tuple(target_fragment_tokens.shape):
+        raise ValueError("target_fragment_mask must match target_fragment_tokens")
+    target_mask = target_fragment_mask.to(device=model_output.logits_final.device, dtype=torch.bool)
+    input_mask = target_mask
     token_loss = token_cross_entropy(
         model_output.logits_final,
         loss_target,
@@ -971,8 +987,11 @@ def compute_phase_b_loss(
     )
     close_loss, close_metrics = _ln_close_loss(
         close_logits=model_output.close_logits,
-        labels=close_labels[:, :-1].to(device=model_output.close_logits.device),
-        mask=close_label_mask[:, :-1].to(device=model_output.close_logits.device),
+        labels=close_labels.to(device=model_output.close_logits.device),
+        mask=(
+            close_label_mask.to(device=model_output.close_logits.device, dtype=torch.bool)
+            & target_mask.to(device=model_output.close_logits.device, dtype=torch.bool).unsqueeze(-1)
+        ),
         max_pos_weight=loss_config.close_pos_weight_max,
     )
     adapter_reg = adapter_bias_regularization(
@@ -981,20 +1000,41 @@ def compute_phase_b_loss(
         model_output.time_shift_bias,
         mask=input_mask,
     )
-    density_loss = token_loss.new_zeros(())
+    current_ms = target_fragment_states.get("current_ms") if isinstance(target_fragment_states, Mapping) else None
+    if density_target_8s is None or density_confidence_8s is None:
+        if loss_config.lambda_density > 0.0:
+            raise ValueError("density_target_8s and density_confidence_8s are required when lambda_density > 0")
+        density_loss = token_loss.new_zeros(())
+        density_weight = 0.0
+    else:
+        if not isinstance(current_ms, torch.Tensor):
+            raise ValueError("target_fragment_states.current_ms must be supplied for density loss")
+        density_loss = density_auxiliary_loss(
+            logits_final=model_output.logits_final,
+            current_ms=current_ms.to(device=model_output.logits_final.device),
+            write_start_ms=write_start_ms.to(device=model_output.logits_final.device),
+            target=density_target_8s.to(device=model_output.logits_final.device),
+            confidence=density_confidence_8s.to(device=model_output.logits_final.device),
+            vocab=vocab,
+            target_mask=target_mask,
+            calibration_scale=loss_config.density_calibration_scale,
+            calibration_bias=loss_config.density_calibration_bias,
+        )
+        density_weight = float(density_confidence_8s.detach().to(dtype=torch.float32).clamp_min(0.0).sum().cpu())
     total_loss = (
         token_loss
         + float(loss_config.lambda_ln_close) * close_loss
         + float(loss_config.lambda_adapter_reg) * adapter_reg
-        + density_loss
+        + float(loss_config.lambda_density) * density_loss
     )
     metrics = {
         "loss/total": float(total_loss.detach().cpu()),
         "loss/token": float(token_loss.detach().cpu()),
         "loss/ln_close": float(close_loss.detach().cpu()),
         "loss/adapter_reg": float(adapter_reg.detach().cpu()),
-        "loss/density": 0.0,
+        "loss/density": float(density_loss.detach().cpu()),
         "target/token_count": float(target_mask.sum().detach().cpu()),
+        "density/frame_count": density_weight,
         **close_metrics,
     }
     return MapperV1LossOutput(
@@ -1003,13 +1043,43 @@ def compute_phase_b_loss(
         metric_numerators={
             "loss/token": float(token_loss.detach().cpu()) * max(metrics["target/token_count"], 1.0),
             "loss/ln_close": float(close_loss.detach().cpu()) * max(metrics["ln_close/open_lane_count"], 1.0),
+            "loss/density": float(density_loss.detach().cpu()) * max(density_weight, 1.0),
         },
         metric_denominators={
             "loss/token": max(metrics["target/token_count"], 1.0),
             "loss/ln_close": max(metrics["ln_close/open_lane_count"], 1.0),
+            "loss/density": max(density_weight, 1.0),
         },
         model_output=model_output,
     )
+
+
+def _move_mapper_batch_tensors(raw_batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
+    for key in ("target_fragment_states", "ln_carry_in", "ln_carry_out"):
+        value = batch.get(key)
+        if isinstance(value, Mapping):
+            batch[key] = {
+                nested_key: nested_value.to(device) if isinstance(nested_value, torch.Tensor) else nested_value
+                for nested_key, nested_value in value.items()
+            }
+    return batch
+
+
+def _reject_old_mapper_contract(batch: Mapping[str, Any]) -> None:
+    old_keys = {
+        "target_tokens",
+        "target_token_mask",
+        "teacher_current_ms",
+        "teacher_open_mask",
+        "teacher_open_age_ms",
+    }
+    present = sorted(key for key in old_keys if key in batch)
+    if present:
+        raise ValueError(
+            "old target_tokens/teacher_* mapper contract is not supported by mapper v1 training; "
+            f"received {present}"
+        )
 
 
 def _loss_for_raw_batch(
@@ -1019,17 +1089,21 @@ def _loss_for_raw_batch(
     device: torch.device,
     loss_config: MapperV1PhaseBLossConfig | None = None,
 ) -> MapperV1LossOutput:
-    batch = _move_batch_tensors(raw_batch, device, keys=MAPPER_BATCH_TENSOR_KEYS)
+    _reject_old_mapper_contract(raw_batch)
+    batch = _move_mapper_batch_tensors(raw_batch, device)
     if isinstance(batch.get("control_memory_padding_mask_8s"), torch.Tensor):
         raise ValueError("control_memory_padding_mask_8s is not supported in Phase B")
     model_output = model(
-        target_tokens=batch["target_tokens"],
-        target_token_mask=batch.get("target_token_mask"),
-        teacher_current_ms=batch["teacher_current_ms"],
-        teacher_open_mask=batch["teacher_open_mask"],
-        teacher_open_age_ms=batch["teacher_open_age_ms"],
+        decoder_input_tokens=batch["decoder_input_tokens"],
+        target_fragment_tokens=batch["target_fragment_tokens"],
+        target_fragment_mask=batch["target_fragment_mask"],
+        target_fragment_states=batch["target_fragment_states"],
+        ln_carry_in=batch["ln_carry_in"],
+        ln_carry_out=batch["ln_carry_out"],
         write_start_ms=batch["write_start_ms"],
         write_end_ms=batch["write_end_ms"],
+        is_full_chart_start=batch["is_full_chart_start"],
+        is_full_chart_end=batch["is_full_chart_end"],
         difficulty=batch.get("difficulty"),
         normalized_difficulty=batch.get("normalized_difficulty"),
         control_memory_8s=batch.get("control_memory_8s"),
@@ -1042,10 +1116,14 @@ def _loss_for_raw_batch(
     )
     return compute_phase_b_loss(
         model_output,
-        target_tokens=batch["target_tokens"],
-        target_token_mask=batch.get("target_token_mask"),
+        target_fragment_tokens=batch["target_fragment_tokens"],
+        target_fragment_mask=batch["target_fragment_mask"],
+        target_fragment_states=batch["target_fragment_states"],
         close_labels=batch["close_labels"],
         close_label_mask=batch["close_label_mask"],
+        density_target_8s=batch.get("density_target_8s"),
+        density_confidence_8s=batch.get("density_confidence_8s"),
+        write_start_ms=batch["write_start_ms"],
         vocab=model.vocab,
         loss_config=MapperV1PhaseBLossConfig() if loss_config is None else loss_config,
     )
@@ -1090,8 +1168,8 @@ def metrics_for_loader(
         metrics.get("loss/token", 0.0)
         + loss_config.lambda_ln_close * metrics.get("loss/ln_close", 0.0)
         + loss_config.lambda_adapter_reg * metrics.get("loss/adapter_reg", 0.0)
+        + loss_config.lambda_density * metrics.get("loss/density", 0.0)
     )
-    metrics["loss/density"] = 0.0
     return metrics
 
 
@@ -1314,7 +1392,7 @@ def _write_checkpoint_and_report(
         "weight_decay": weight_decay,
         "eval_every": eval_every,
         "save_every": save_every,
-        "density_enabled": False,
+        "density_enabled": bool(loss_config.lambda_density > 0.0),
         "dataset": _json_safe(dataset_report),
     }
     checkpoint_payload = {
@@ -1377,33 +1455,39 @@ def _write_checkpoint_and_report(
 
 
 def _synthetic_mapper_samples(*, model_config: MapperV1Config) -> list[dict[str, Any]]:
-    from train.stage_2.model_mapper_v1.replay import close_labels_from_tokens, replay_state_tensors
+    from train.stage_2.model_mapper_v1.replay import ln_carry_state_tensors
+    from train.stage_2.model_mapper_v1.tokenizer import encode_mapper_window
 
     vocab = MapperV1Vocab()
-    target_ids = [
-        vocab.bos_id,
-        vocab.time_shift_token_id(4000),
-        vocab.time_shift_token_id(4000),
-        vocab.eos_id,
-    ]
-    states = replay_state_tensors(target_ids, vocab=vocab, write_start_ms=0, write_end_ms=8000)
-    close_labels, close_label_mask = close_labels_from_tokens(
-        target_ids,
+    tokenized = encode_mapper_window(
+        [],
         vocab=vocab,
         write_start_ms=0,
         write_end_ms=8000,
+        chart_start_ms=0,
+        chart_end_ms=8000,
     )
+    fragment_states = {
+        "current_ms": tokenized.target_fragment_current_ms,
+        "open_mask": tokenized.target_fragment_open_mask,
+        "open_start_ms": tokenized.target_fragment_open_start_ms,
+        "open_age_ms": tokenized.target_fragment_open_age_ms,
+    }
+    ln_carry_in = ln_carry_state_tensors(tokenized.ln_carry_in)
+    ln_carry_out = ln_carry_state_tensors(tokenized.ln_carry_out)
     samples: list[dict[str, Any]] = []
     generator = torch.Generator().manual_seed(20260509)
     for index in range(4):
         samples.append(
             {
-                "target_tokens": torch.tensor(target_ids, dtype=torch.long),
-                "teacher_current_ms": states["current_ms"],
-                "teacher_open_mask": states["open_mask"],
-                "teacher_open_age_ms": states["open_age_ms"],
-                "close_labels": close_labels,
-                "close_label_mask": close_label_mask,
+                "decoder_input_tokens": tokenized.decoder_input_tensor(),
+                "target_fragment_tokens": tokenized.target_fragment_tensor(),
+                "target_fragment_mask": torch.ones(tokenized.seq_len, dtype=torch.bool),
+                "target_fragment_states": {key: value.clone() for key, value in fragment_states.items()},
+                "ln_carry_in": {key: value.clone() for key, value in ln_carry_in.items()},
+                "ln_carry_out": {key: value.clone() for key, value in ln_carry_out.items()},
+                "close_labels": tokenized.close_labels,
+                "close_label_mask": tokenized.close_label_mask,
                 "control_memory_8s": torch.randn(
                     model_config.density_frames,
                     model_config.control_dim,
@@ -1413,9 +1497,11 @@ def _synthetic_mapper_samples(*, model_config: MapperV1Config) -> list[dict[str,
                 * 0.05,
                 "density_teacher_8s": torch.zeros(model_config.density_frames, 1, dtype=torch.float32),
                 "density_target_8s": torch.zeros(model_config.density_frames, 1, dtype=torch.float32),
-                "density_confidence_8s": torch.zeros(model_config.density_frames, 1, dtype=torch.float32),
+                "density_confidence_8s": torch.ones(model_config.density_frames, 1, dtype=torch.float32),
                 "write_start_ms": torch.tensor(0, dtype=torch.long),
                 "write_end_ms": torch.tensor(8000, dtype=torch.long),
+                "is_full_chart_start": torch.tensor(True, dtype=torch.bool),
+                "is_full_chart_end": torch.tensor(True, dtype=torch.bool),
                 "difficulty": torch.tensor([2.0 + index], dtype=torch.float32),
                 "normalized_difficulty": torch.tensor([-0.5 + 0.25 * index], dtype=torch.float32),
             }
@@ -1427,10 +1513,9 @@ def _collate_synthetic_mapper_samples(samples: Sequence[dict[str, Any]]) -> dict
     if not samples:
         raise ValueError("synthetic mapper collate requires at least one sample")
     keys = [
-        "target_tokens",
-        "teacher_current_ms",
-        "teacher_open_mask",
-        "teacher_open_age_ms",
+        "decoder_input_tokens",
+        "target_fragment_tokens",
+        "target_fragment_mask",
         "close_labels",
         "close_label_mask",
         "control_memory_8s",
@@ -1439,10 +1524,26 @@ def _collate_synthetic_mapper_samples(samples: Sequence[dict[str, Any]]) -> dict
         "density_confidence_8s",
         "write_start_ms",
         "write_end_ms",
+        "is_full_chart_start",
+        "is_full_chart_end",
         "difficulty",
         "normalized_difficulty",
     ]
-    return {key: torch.stack([sample[key] for sample in samples]) for key in keys}
+    batch = {key: torch.stack([sample[key] for sample in samples]) for key in keys}
+    for state_key in ("target_fragment_states", "ln_carry_in", "ln_carry_out"):
+        state = samples[0][state_key]
+        if not isinstance(state, Mapping):
+            raise ValueError(f"{state_key} must be a mapping")
+        batch[state_key] = {
+            key: torch.stack([sample[state_key][key] for sample in samples])
+            for key in state
+        }
+    return batch
+
+
+def _open_start_from_age(*, current_ms: torch.Tensor, open_mask: torch.Tensor, open_age_ms: torch.Tensor) -> torch.Tensor:
+    current = current_ms.reshape(*current_ms.shape, 1).expand_as(open_age_ms)
+    return torch.where(open_mask.to(dtype=torch.bool), current - open_age_ms.to(dtype=torch.long), torch.full_like(open_age_ms, -1))
 
 
 def _normalized_section(source: object, *, allowed: set[str], name: str) -> dict[str, Any]:

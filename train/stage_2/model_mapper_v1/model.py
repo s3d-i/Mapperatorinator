@@ -52,6 +52,8 @@ class MapperV1ForwardOutput:
     loss_target_tokens: torch.Tensor
     state_current_ms: torch.Tensor
     state_open_mask: torch.Tensor
+    state_open_start_ms: torch.Tensor
+    state_open_age_ms: torch.Tensor
     base_logits: torch.Tensor
     logits_final: torch.Tensor
     decoder_hidden: torch.Tensor
@@ -188,53 +190,66 @@ class MapperV1Model(nn.Module):
         if isinstance(batch.get("control_memory_padding_mask_8s"), torch.Tensor):
             raise ValueError("control_memory_padding_mask_8s is not supported in Phase B; supply full 8s control memory")
 
-        target_tokens = _require_tensor(batch, "target_tokens", ndim=2)
-        if int(target_tokens.shape[1]) < 2:
-            raise ValueError("target_tokens must contain at least BOS and one prediction target")
-        decoder_input = target_tokens[:, :-1].to(dtype=torch.long)
-        target_token_mask = _optional_tensor(batch, "target_token_mask")
-        input_padding_mask = None
-        valid_input_mask = torch.ones_like(decoder_input, dtype=torch.bool)
-        if target_token_mask is not None:
-            if tuple(target_token_mask.shape) != tuple(target_tokens.shape):
-                raise ValueError("target_token_mask must match target_tokens shape")
-            if not bool(target_token_mask[:, :2].to(dtype=torch.bool).all()):
-                raise ValueError("target_token_mask must mark BOS and the first prediction target valid")
-            valid_input_mask = (
-                target_token_mask[:, :-1].to(device=target_tokens.device, dtype=torch.bool)
-                & target_token_mask[:, 1:].to(device=target_tokens.device, dtype=torch.bool)
-            )
-            input_padding_mask = ~valid_input_mask
+        _reject_old_mapper_contract(batch)
+        decoder_input = _require_tensor(batch, "decoder_input_tokens", ndim=2).to(dtype=torch.long)
+        loss_target_tokens = _require_tensor(batch, "target_fragment_tokens", ndim=2).to(
+            device=decoder_input.device,
+            dtype=torch.long,
+        )
+        target_fragment_mask = _require_tensor(batch, "target_fragment_mask", ndim=2).to(
+            device=decoder_input.device,
+            dtype=torch.bool,
+        )
+        if int(decoder_input.shape[1]) < 1:
+            raise ValueError("decoder_input_tokens must contain at least one fragment position")
+        if tuple(loss_target_tokens.shape) != tuple(decoder_input.shape):
+            raise ValueError("target_fragment_tokens must match decoder_input_tokens shape")
+        if tuple(target_fragment_mask.shape) != tuple(decoder_input.shape):
+            raise ValueError("target_fragment_mask must match decoder_input_tokens shape")
+        input_padding_mask = ~target_fragment_mask
 
         device = decoder_input.device
-        current_ms = _require_tensor(batch, "teacher_current_ms", ndim=2)[:, :-1].to(device=device, dtype=torch.long)
-        open_mask = _require_tensor(batch, "teacher_open_mask", ndim=3)[:, :-1].to(device=device, dtype=torch.bool)
-        open_age_ms = _require_tensor(batch, "teacher_open_age_ms", ndim=3)[:, :-1].to(device=device, dtype=torch.long)
+        states = _require_state_mapping(batch, "target_fragment_states")
+        current_ms = _require_state_tensor(states, "current_ms", ndim=2).to(device=device, dtype=torch.long)
+        open_mask = _require_state_tensor(states, "open_mask", ndim=3).to(device=device, dtype=torch.bool)
+        open_start_ms = _require_state_tensor(states, "open_start_ms", ndim=3).to(device=device, dtype=torch.long)
+        open_age_ms = _require_state_tensor(states, "open_age_ms", ndim=3).to(device=device, dtype=torch.long)
         write_start_ms = _require_tensor(batch, "write_start_ms", ndim=1).to(device=device, dtype=torch.long)
         write_end_ms = _require_tensor(batch, "write_end_ms", ndim=1).to(device=device, dtype=torch.long)
+        is_full_chart_start = _require_tensor(batch, "is_full_chart_start", ndim=1).to(device=device, dtype=torch.bool)
+        is_full_chart_end = _require_tensor(batch, "is_full_chart_end", ndim=1).to(device=device, dtype=torch.bool)
+        ln_carry_in = _load_carry_state(batch, "ln_carry_in", device=device)
+        ln_carry_out = _load_carry_state(batch, "ln_carry_out", device=device)
         if tuple(current_ms.shape) != tuple(decoder_input.shape):
-            raise ValueError("teacher_current_ms[:, :-1] must align with decoder input")
+            raise ValueError("target_fragment_states.current_ms must align with decoder_input_tokens")
         if tuple(open_mask.shape[:2]) != tuple(decoder_input.shape) or int(open_mask.shape[-1]) != 4:
-            raise ValueError("teacher_open_mask[:, :-1] must have shape [B,S-1,4]")
+            raise ValueError("target_fragment_states.open_mask must have shape [B,S,4]")
+        if tuple(open_start_ms.shape) != tuple(open_mask.shape):
+            raise ValueError("target_fragment_states.open_start_ms must align with target_fragment_states.open_mask")
         if tuple(open_age_ms.shape) != tuple(open_mask.shape):
-            raise ValueError("teacher_open_age_ms[:, :-1] must align with teacher_open_mask[:, :-1]")
-        valid_input_mask = valid_input_mask.to(device=device, dtype=torch.bool)
-        loss_target_tokens = target_tokens[:, 1:].to(device=device, dtype=torch.long)
-        _validate_window_and_teacher_states(
+            raise ValueError("target_fragment_states.open_age_ms must align with target_fragment_states.open_mask")
+        valid_input_mask = target_fragment_mask.to(device=device, dtype=torch.bool)
+        _validate_fragment_contract(
             decoder_input_tokens=decoder_input,
+            target_fragment_tokens=loss_target_tokens,
+            target_fragment_mask=valid_input_mask,
             current_ms=current_ms,
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             write_start_ms=write_start_ms,
             write_end_ms=write_end_ms,
-            loss_target_tokens=loss_target_tokens,
-            valid_input_mask=valid_input_mask,
+            is_full_chart_start=is_full_chart_start,
+            is_full_chart_end=is_full_chart_end,
+            ln_carry_in=ln_carry_in,
+            ln_carry_out=ln_carry_out,
             bos_id=self.vocab.bos_id,
             eos_id=self.vocab.eos_id,
         )
-        current_ms, open_mask, open_age_ms = _sanitize_padded_teacher_states(
+        current_ms, open_mask, open_start_ms, open_age_ms = _sanitize_padded_fragment_states(
             current_ms=current_ms,
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             write_end_ms=write_end_ms,
             valid_input_mask=valid_input_mask,
@@ -267,8 +282,10 @@ class MapperV1Model(nn.Module):
         remaining_ms = (write_end_ms.reshape(-1, 1) - current_ms).clamp_min(0)
         state_prior = self.state_prior_adapter(
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             remaining_ms=remaining_ms,
+            write_start_ms=write_start_ms,
         )
         ln_close = self.ln_close_adapter(
             decoder_hidden=decoder_hidden,
@@ -277,6 +294,7 @@ class MapperV1Model(nn.Module):
             current_ms=current_ms,
             write_start_ms=write_start_ms,
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             remaining_ms=remaining_ms,
         )
@@ -284,8 +302,14 @@ class MapperV1Model(nn.Module):
         grammar_mask = build_grammar_mask(
             current_ms=current_ms,
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
+            open_age_ms=open_age_ms,
             write_start_ms=write_start_ms,
             write_end_ms=write_end_ms,
+            ln_carry_in=ln_carry_in,
+            ln_carry_out=ln_carry_out,
+            is_full_chart_start=is_full_chart_start,
+            is_full_chart_end=is_full_chart_end,
             vocab=self.vocab,
             positions=positions.expand(decoder_input.shape[0], -1),
         ).to(dtype=base_logits.dtype)
@@ -301,6 +325,8 @@ class MapperV1Model(nn.Module):
             loss_target_tokens=loss_target_tokens,
             state_current_ms=current_ms,
             state_open_mask=open_mask,
+            state_open_start_ms=open_start_ms,
+            state_open_age_ms=open_age_ms,
             base_logits=base_logits,
             logits_final=logits_final,
             decoder_hidden=decoder_hidden,
@@ -361,8 +387,9 @@ class MapperV1Model(nn.Module):
         return decoder_hidden, base_logits
 
     def _control_teacher_8s(self, batch: Mapping[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = int(_require_tensor(batch, "target_tokens", ndim=2).shape[0])
-        device = _require_tensor(batch, "target_tokens", ndim=2).device
+        decoder_input_tokens = _require_tensor(batch, "decoder_input_tokens", ndim=2)
+        batch_size = int(decoder_input_tokens.shape[0])
+        device = decoder_input_tokens.device
         if self.control_encoder is None:
             return (
                 torch.zeros((batch_size, MAPPER_DENSITY_FRAMES, self.config.control_dim), dtype=torch.float32, device=device),
@@ -425,8 +452,8 @@ def compute_control_teacher_8s(
             )
         return _stacked_control_teacher_output_8s(output, batch_size=batch_size)
 
-    target_tokens = _require_tensor(batch, "target_tokens", ndim=2)
-    batch_size = int(target_tokens.shape[0])
+    decoder_input_tokens = _require_tensor(batch, "decoder_input_tokens", ndim=2)
+    batch_size = int(decoder_input_tokens.shape[0])
     outputs = []
     with torch.no_grad():
         for slice_index in range(4):
@@ -523,27 +550,35 @@ def _time_features(
     return torch.stack((rel, remaining), dim=-1)
 
 
-def _validate_window_and_teacher_states(
+def _validate_fragment_contract(
     *,
     decoder_input_tokens: torch.Tensor,
+    target_fragment_tokens: torch.Tensor,
+    target_fragment_mask: torch.Tensor,
     current_ms: torch.Tensor,
     open_mask: torch.Tensor,
+    open_start_ms: torch.Tensor,
     open_age_ms: torch.Tensor,
     write_start_ms: torch.Tensor,
     write_end_ms: torch.Tensor,
-    loss_target_tokens: torch.Tensor,
-    valid_input_mask: torch.Tensor,
+    is_full_chart_start: torch.Tensor,
+    is_full_chart_end: torch.Tensor,
+    ln_carry_in: Mapping[str, torch.Tensor],
+    ln_carry_out: Mapping[str, torch.Tensor],
     bos_id: int,
     eos_id: int,
 ) -> None:
+    batch_size = int(current_ms.shape[0])
     if tuple(write_start_ms.shape) != (current_ms.shape[0],) or tuple(write_end_ms.shape) != (current_ms.shape[0],):
         raise ValueError("write_start_ms and write_end_ms must have one value per batch item")
+    if tuple(is_full_chart_start.shape) != (batch_size,) or tuple(is_full_chart_end.shape) != (batch_size,):
+        raise ValueError("is_full_chart_start and is_full_chart_end must have one value per batch item")
     if tuple(decoder_input_tokens.shape) != tuple(current_ms.shape):
-        raise ValueError("decoder input tokens must align with teacher_current_ms[:, :-1]")
-    if tuple(loss_target_tokens.shape) != tuple(current_ms.shape):
-        raise ValueError("loss_target_tokens must align with teacher_current_ms[:, :-1]")
-    if tuple(valid_input_mask.shape) != tuple(current_ms.shape):
-        raise ValueError("valid_input_mask must align with teacher_current_ms[:, :-1]")
+        raise ValueError("decoder_input_tokens must align with target_fragment_states.current_ms")
+    if tuple(target_fragment_tokens.shape) != tuple(current_ms.shape):
+        raise ValueError("target_fragment_tokens must align with target_fragment_states.current_ms")
+    if tuple(target_fragment_mask.shape) != tuple(current_ms.shape):
+        raise ValueError("target_fragment_mask must align with target_fragment_states.current_ms")
     span = write_end_ms - write_start_ms
     if bool(torch.any(span != MAPPER_WRITE_MS)):
         raise ValueError(f"mapper v1 requires an exact {MAPPER_WRITE_MS}ms write window")
@@ -554,44 +589,189 @@ def _validate_window_and_teacher_states(
 
     start = write_start_ms.reshape(-1, 1)
     end = write_end_ms.reshape(-1, 1)
-    valid = valid_input_mask.to(dtype=torch.bool, device=current_ms.device)
+    valid = target_fragment_mask.to(dtype=torch.bool, device=current_ms.device)
     if bool((((current_ms < start) | (current_ms > end)) & valid).any()):
-        raise ValueError("teacher_current_ms must be within [write_start_ms, write_end_ms] on valid decoder steps")
+        raise ValueError("target_fragment_states.current_ms must be within [write_start_ms, write_end_ms]")
     if bool(((current_ms % 10 != 0) & valid).any()):
-        raise ValueError("teacher_current_ms must align to the 10ms token grid")
+        raise ValueError("target_fragment_states.current_ms must align to the 10ms token grid")
 
     at_write_end = (current_ms == end) & valid
-    if bool((at_write_end & (loss_target_tokens != int(eos_id))).any()):
-        raise ValueError("teacher_current_ms == write_end_ms is valid only for EOS prediction")
+    if bool((at_write_end & (target_fragment_tokens != int(eos_id))).any()):
+        raise ValueError("target_fragment_states.current_ms == write_end_ms is valid only for EOS prediction")
     if bool((at_write_end & open_mask.any(dim=-1)).any()):
-        raise ValueError("teacher_current_ms == write_end_ms requires all lanes closed")
+        raise ValueError("target_fragment_states.current_ms == write_end_ms requires all lanes closed")
+    if bool((at_write_end & ~is_full_chart_end.reshape(-1, 1)).any()):
+        raise ValueError("EOS prediction at write_end_ms requires is_full_chart_end")
 
-    if bool((decoder_input_tokens[:, 0] != int(bos_id)).any()):
-        raise ValueError("target_tokens[:, 0] must be BOS")
-    if bool((current_ms[:, 0] != write_start_ms).any()):
-        raise ValueError("teacher_current_ms[:, 0] must equal write_start_ms")
-    if bool(open_mask[:, 0].any()):
-        raise ValueError("teacher_open_mask[:, 0] must have all lanes closed")
-    if bool((open_age_ms[:, 0] != 0).any()):
-        raise ValueError("teacher_open_age_ms[:, 0] must be zero")
+    valid_target_bos = valid & (target_fragment_tokens == int(bos_id))
+    if bool((valid_target_bos & ~is_full_chart_start.reshape(-1, 1)).any()):
+        raise ValueError("BOS target is valid only when is_full_chart_start is true")
+    valid_target_eos = valid & (target_fragment_tokens == int(eos_id))
+    if bool((valid_target_eos & ~is_full_chart_end.reshape(-1, 1)).any()):
+        raise ValueError("EOS target is valid only when is_full_chart_end is true")
+    first_input_is_bos = decoder_input_tokens[:, 0] == int(bos_id)
+    if bool((first_input_is_bos & ~is_full_chart_start).any()):
+        raise ValueError("decoder_input_tokens[:, 0] may be BOS only at full-chart start")
+
+    carry_in_current = ln_carry_in["current_ms"]
+    carry_out_current = ln_carry_out["current_ms"]
+    if tuple(carry_in_current.shape) != (batch_size,) or tuple(carry_out_current.shape) != (batch_size,):
+        raise ValueError("ln_carry_in.current_ms and ln_carry_out.current_ms must have shape [B]")
+    if bool((carry_in_current != write_start_ms).any()):
+        raise ValueError("ln_carry_in.current_ms must equal write_start_ms")
+    if bool((carry_out_current != write_end_ms).any()):
+        raise ValueError("ln_carry_out.current_ms must equal write_end_ms")
+    _validate_open_start_age_consistency(
+        current_ms=current_ms,
+        open_mask=open_mask,
+        open_start_ms=open_start_ms,
+        open_age_ms=open_age_ms,
+        valid=valid,
+        name="target_fragment_states",
+    )
+    _validate_carry_state_consistency(ln_carry_in, name="ln_carry_in")
+    _validate_carry_state_consistency(ln_carry_out, name="ln_carry_out")
+
+    first_valid = target_fragment_mask[:, 0].to(dtype=torch.bool)
+    if bool(first_valid.any()):
+        rows = first_valid
+        if bool((current_ms[rows, 0] != ln_carry_in["current_ms"][rows]).any()):
+            raise ValueError("target_fragment_states.current_ms[:, 0] must equal ln_carry_in.current_ms")
+        for key, tensor in (
+            ("open_mask", open_mask),
+            ("open_start_ms", open_start_ms),
+            ("open_age_ms", open_age_ms),
+        ):
+            expected = ln_carry_in[key][rows]
+            actual = tensor[rows, 0]
+            if bool((actual != expected).any()):
+                raise ValueError(f"target_fragment_states.{key}[:, 0] must equal ln_carry_in.{key}")
 
 
-def _sanitize_padded_teacher_states(
+def _sanitize_padded_fragment_states(
     *,
     current_ms: torch.Tensor,
     open_mask: torch.Tensor,
+    open_start_ms: torch.Tensor,
     open_age_ms: torch.Tensor,
     write_end_ms: torch.Tensor,
     valid_input_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     valid = valid_input_mask.to(device=current_ms.device, dtype=torch.bool)
     if bool(valid.all()):
-        return current_ms, open_mask, open_age_ms
+        return current_ms, open_mask, open_start_ms, open_age_ms
     padded = ~valid
     safe_current = torch.where(padded, write_end_ms.reshape(-1, 1), current_ms)
     safe_open = torch.where(padded.unsqueeze(-1), torch.zeros_like(open_mask), open_mask)
+    safe_start = torch.where(padded.unsqueeze(-1), torch.full_like(open_start_ms, -1), open_start_ms)
     safe_age = torch.where(padded.unsqueeze(-1), torch.zeros_like(open_age_ms), open_age_ms)
-    return safe_current, safe_open, safe_age
+    return safe_current, safe_open, safe_start, safe_age
+
+
+def _reject_old_mapper_contract(batch: Mapping[str, Any]) -> None:
+    old_keys = {
+        "target_tokens",
+        "target_token_mask",
+        "teacher_current_ms",
+        "teacher_open_mask",
+        "teacher_open_age_ms",
+    }
+    present = sorted(key for key in old_keys if key in batch)
+    if present:
+        raise ValueError(
+            "old target_tokens/teacher_* mapper contract is not supported; "
+            "supply decoder_input_tokens, target_fragment_tokens, target_fragment_mask, and target_fragment_states "
+            f"instead of {present}"
+        )
+
+
+def _require_state_mapping(batch: Mapping[str, Any], key: str) -> Mapping[str, torch.Tensor]:
+    value = batch.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"batch[{key!r}] must be a mapping of state tensors")
+    return value
+
+
+def _require_state_tensor(state: Mapping[str, torch.Tensor], key: str, *, ndim: int) -> torch.Tensor:
+    value = state.get(key)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"state[{key!r}] must be a torch.Tensor")
+    if value.ndim != ndim:
+        raise ValueError(f"state[{key!r}] must be rank {ndim}, got shape {tuple(value.shape)}")
+    return value
+
+
+def _load_carry_state(batch: Mapping[str, Any], key: str, *, device: torch.device) -> dict[str, torch.Tensor]:
+    raw = _require_state_mapping(batch, key)
+    current_ms = _require_state_tensor(raw, "current_ms", ndim=1).to(device=device, dtype=torch.long)
+    open_mask = _require_state_tensor(raw, "open_mask", ndim=2).to(device=device, dtype=torch.bool)
+    open_start_ms = _require_state_tensor(raw, "open_start_ms", ndim=2).to(device=device, dtype=torch.long)
+    open_age_ms = _require_state_tensor(raw, "open_age_ms", ndim=2).to(device=device, dtype=torch.long)
+    if tuple(open_mask.shape) != tuple(open_start_ms.shape) or tuple(open_mask.shape) != tuple(open_age_ms.shape):
+        raise ValueError(f"{key}.open_mask, open_start_ms, and open_age_ms must have matching shapes")
+    if int(open_mask.shape[-1]) != 4:
+        raise ValueError(f"{key}.open_mask must have shape [B,4]")
+    if int(open_mask.shape[0]) != int(current_ms.shape[0]):
+        raise ValueError(f"{key} tensors must share batch size")
+    return {
+        "current_ms": current_ms,
+        "open_mask": open_mask,
+        "open_start_ms": open_start_ms,
+        "open_age_ms": open_age_ms,
+    }
+
+
+def _validate_open_start_age_consistency(
+    *,
+    current_ms: torch.Tensor,
+    open_mask: torch.Tensor,
+    open_start_ms: torch.Tensor,
+    open_age_ms: torch.Tensor,
+    valid: torch.Tensor,
+    name: str,
+) -> None:
+    if current_ms.ndim == 1:
+        current = current_ms.reshape(-1, 1).expand_as(open_start_ms)
+        valid_expanded = valid.reshape(-1, 1).expand_as(open_start_ms)
+    else:
+        current = current_ms.unsqueeze(-1).expand_as(open_start_ms)
+        valid_expanded = valid.unsqueeze(-1).expand_as(open_start_ms)
+    open_bool = open_mask.to(dtype=torch.bool)
+    valid_bool = valid_expanded.to(dtype=torch.bool)
+    closed = (~open_bool) & valid_bool
+    if bool((closed & (open_start_ms >= 0)).any()):
+        raise ValueError(f"{name}.open_start_ms must be negative for closed lanes")
+    if bool((closed & (open_age_ms != 0)).any()):
+        raise ValueError(f"{name}.open_age_ms must be zero for closed lanes")
+    open_valid = open_bool & valid_bool
+    if not bool(open_valid.any()):
+        return
+    if bool((open_valid & (open_start_ms < 0)).any()):
+        raise ValueError(f"{name}.open_start_ms must be set for open lanes")
+    expected_age = current - open_start_ms
+    if bool((open_valid & (expected_age != open_age_ms)).any()):
+        raise ValueError(f"{name}.open_age_ms must equal current_ms - open_start_ms for open lanes")
+    if bool((open_valid & (open_age_ms < 0)).any()):
+        raise ValueError(f"{name}.open_age_ms must be non-negative for open lanes")
+
+
+def _validate_carry_state_consistency(carry: Mapping[str, torch.Tensor], *, name: str) -> None:
+    current_ms = carry["current_ms"]
+    open_mask = carry["open_mask"]
+    open_start_ms = carry["open_start_ms"]
+    open_age_ms = carry["open_age_ms"]
+    valid = torch.ones_like(current_ms, dtype=torch.bool)
+    _validate_open_start_age_consistency(
+        current_ms=current_ms,
+        open_mask=open_mask,
+        open_start_ms=open_start_ms,
+        open_age_ms=open_age_ms,
+        valid=valid,
+        name=name,
+    )
+    open_bool = open_mask.to(dtype=torch.bool)
+    if bool((open_bool & (open_start_ms >= current_ms.reshape(-1, 1))).any()):
+        raise ValueError(f"{name}.open_start_ms must be before current_ms for open carry lanes")
 
 
 def _difficulty_tensor(batch: Mapping[str, torch.Tensor], *, device: torch.device, dim: int) -> torch.Tensor:

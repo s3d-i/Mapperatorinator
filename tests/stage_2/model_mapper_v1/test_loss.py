@@ -5,13 +5,16 @@ import torch
 import torch.nn.functional as F
 
 from train.stage_2.model_mapper_v1.grammar import build_grammar_mask
+from train.stage_2.model_mapper_v1.replay import empty_ln_carry_state
 from train.stage_2.model_mapper_v1.loss import (
     adapter_regularization,
     close_pos_weight,
+    density_auxiliary_loss,
+    expected_density_from_logits,
     ln_close_aux_loss,
     token_cross_entropy,
 )
-from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
+from train.stage_2.model_mapper_v1.vocab import LaneAction, MapperV1Vocab
 
 
 class MapperV1LossTests(unittest.TestCase):
@@ -23,8 +26,14 @@ class MapperV1LossTests(unittest.TestCase):
         grammar_mask = build_grammar_mask(
             current_ms=torch.tensor([[8000]]),
             open_mask=torch.zeros((1, 1, 4), dtype=torch.bool),
+            open_start_ms=torch.full((1, 1, 4), -1, dtype=torch.long),
+            open_age_ms=torch.zeros((1, 1, 4), dtype=torch.long),
             write_start_ms=torch.tensor([0]),
             write_end_ms=torch.tensor([8000]),
+            ln_carry_in=empty_ln_carry_state(0),
+            ln_carry_out=empty_ln_carry_state(8000),
+            is_full_chart_start=torch.tensor([True]),
+            is_full_chart_end=torch.tensor([True]),
             positions=torch.tensor([[3]]),
             vocab=vocab,
         )
@@ -119,6 +128,71 @@ class MapperV1LossTests(unittest.TestCase):
         reg = adapter_regularization(first, second)
 
         self.assertEqual(float(reg.item()), 5.0 + 10.0)
+
+    def test_expected_density_scatters_grammar_masked_onset_mass_to_20ms_frame(self) -> None:
+        vocab = MapperV1Vocab()
+        event_id = vocab.encode_event((LaneAction.TAP, LaneAction.NONE, LaneAction.NONE, LaneAction.NONE))
+        logits = torch.full((1, 1, vocab.size), -20.0)
+        logits[0, 0, event_id] = 20.0
+        logits[0, 0, vocab.eos_id] = 30.0
+        grammar_mask = build_grammar_mask(
+            current_ms=torch.tensor([[40]]),
+            open_mask=torch.zeros((1, 1, 4), dtype=torch.bool),
+            open_start_ms=torch.full((1, 1, 4), -1, dtype=torch.long),
+            open_age_ms=torch.zeros((1, 1, 4), dtype=torch.long),
+            write_start_ms=torch.tensor([0]),
+            write_end_ms=torch.tensor([8000]),
+            ln_carry_in=empty_ln_carry_state(0),
+            ln_carry_out=empty_ln_carry_state(8000),
+            is_full_chart_start=torch.tensor([True]),
+            is_full_chart_end=torch.tensor([True]),
+            positions=torch.tensor([[0]]),
+            vocab=vocab,
+        )
+
+        density = expected_density_from_logits(
+            logits_final=logits + grammar_mask,
+            current_ms=torch.tensor([[40]]),
+            write_start_ms=torch.tensor([0]),
+            target_mask=torch.tensor([[True]]),
+            vocab=vocab,
+        )
+
+        self.assertGreater(float(density[0, 2, 0].item()), 0.99)
+        self.assertAlmostEqual(float(density.sum().item()), float(density[0, 2, 0].item()), places=5)
+
+    def test_density_auxiliary_uses_confidence_and_backpropagates_through_logits(self) -> None:
+        vocab = MapperV1Vocab()
+        logits = torch.zeros((1, 1, vocab.size), requires_grad=True)
+        target = torch.zeros((1, 400, 1), dtype=torch.float32)
+        confidence = torch.zeros((1, 400, 1), dtype=torch.float32)
+        confidence[0, 0, 0] = 1.0
+
+        loss = density_auxiliary_loss(
+            logits_final=logits,
+            current_ms=torch.tensor([[0]]),
+            write_start_ms=torch.tensor([0]),
+            target=target,
+            confidence=confidence,
+            target_mask=torch.tensor([[True]]),
+            vocab=vocab,
+        )
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(logits.grad)
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+        zero_confidence = density_auxiliary_loss(
+            logits_final=logits.detach(),
+            current_ms=torch.tensor([[0]]),
+            write_start_ms=torch.tensor([0]),
+            target=target,
+            confidence=torch.zeros_like(confidence),
+            target_mask=torch.tensor([[True]]),
+            vocab=vocab,
+        )
+        self.assertEqual(float(zero_confidence.item()), 0.0)
 
 
 if __name__ == "__main__":

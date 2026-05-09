@@ -43,13 +43,14 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         self.assertEqual(config["model"]["state_prior_adapter_scale"], 0.03)
         self.assertIn("stage2_control_demo_global", config["init_from_control_checkpoint"])
 
-    def test_phase_b_loss_config_rejects_density_enablement(self) -> None:
-        with self.assertRaisesRegex(ValueError, "density loss is disabled"):
-            MapperV1PhaseBLossConfig(lambda_density=0.01)
-        with self.assertRaisesRegex(ValueError, "density loss is disabled"):
+    def test_phase_b_loss_config_allows_density_enablement(self) -> None:
+        config = MapperV1PhaseBLossConfig(lambda_density=0.01)
+
+        self.assertEqual(config.lambda_density, 0.01)
+        with self.assertRaisesRegex(ValueError, "density teacher loss is not implemented"):
             MapperV1PhaseBLossConfig(lambda_density_teacher=0.01)
 
-    def test_synthetic_loss_path_reports_density_zero(self) -> None:
+    def test_synthetic_loss_path_reports_finite_density_auxiliary(self) -> None:
         torch.manual_seed(23)
         model_config = MapperV1Config(
             control_dim=16,
@@ -73,7 +74,7 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         )
 
         self.assertTrue(torch.isfinite(loss_output.total_loss))
-        self.assertEqual(loss_output.metrics["loss/density"], 0.0)
+        self.assertGreaterEqual(loss_output.metrics["loss/density"], 0.0)
         self.assertGreater(loss_output.metrics["target/token_count"], 0.0)
 
     def test_masked_pad_column_with_invalid_state_does_not_affect_loss(self) -> None:
@@ -92,7 +93,7 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         model = MapperV1Model(model_config)
         model.eval()
         batch = _collate_synthetic_mapper_samples(_synthetic_mapper_samples(model_config=model_config)[:2])
-        batch["target_token_mask"] = torch.ones_like(batch["target_tokens"], dtype=torch.bool)
+        batch["target_fragment_mask"] = torch.ones_like(batch["target_fragment_tokens"], dtype=torch.bool)
         base = _loss_for_raw_batch(
             model,
             batch,
@@ -100,26 +101,36 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
             loss_config=MapperV1PhaseBLossConfig(),
         )
         padded = dict(batch)
-        padded["target_tokens"] = torch.cat(
-            [batch["target_tokens"], torch.zeros((2, 1), dtype=torch.long)],
+        padded["decoder_input_tokens"] = torch.cat(
+            [batch["decoder_input_tokens"], torch.zeros((2, 1), dtype=torch.long)],
             dim=1,
         )
-        padded["target_token_mask"] = torch.cat(
-            [batch["target_token_mask"], torch.zeros((2, 1), dtype=torch.bool)],
+        padded["target_fragment_tokens"] = torch.cat(
+            [batch["target_fragment_tokens"], torch.zeros((2, 1), dtype=torch.long)],
             dim=1,
         )
-        padded["teacher_current_ms"] = torch.cat(
-            [batch["teacher_current_ms"], torch.full((2, 1), 99_999, dtype=torch.long)],
+        padded["target_fragment_mask"] = torch.cat(
+            [batch["target_fragment_mask"], torch.zeros((2, 1), dtype=torch.bool)],
             dim=1,
         )
-        padded["teacher_open_mask"] = torch.cat(
-            [batch["teacher_open_mask"], torch.ones((2, 1, 4), dtype=torch.bool)],
-            dim=1,
-        )
-        padded["teacher_open_age_ms"] = torch.cat(
-            [batch["teacher_open_age_ms"], torch.full((2, 1, 4), 99_999, dtype=torch.long)],
-            dim=1,
-        )
+        padded["target_fragment_states"] = {
+            "current_ms": torch.cat(
+                [batch["target_fragment_states"]["current_ms"], torch.full((2, 1), 99_999, dtype=torch.long)],
+                dim=1,
+            ),
+            "open_mask": torch.cat(
+                [batch["target_fragment_states"]["open_mask"], torch.ones((2, 1, 4), dtype=torch.bool)],
+                dim=1,
+            ),
+            "open_start_ms": torch.cat(
+                [batch["target_fragment_states"]["open_start_ms"], torch.full((2, 1, 4), 99_999, dtype=torch.long)],
+                dim=1,
+            ),
+            "open_age_ms": torch.cat(
+                [batch["target_fragment_states"]["open_age_ms"], torch.full((2, 1, 4), 99_999, dtype=torch.long)],
+                dim=1,
+            ),
+        }
         padded["close_labels"] = torch.cat(
             [batch["close_labels"], torch.ones((2, 1, 4), dtype=torch.bool)],
             dim=1,

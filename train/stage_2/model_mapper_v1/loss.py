@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .tokenizer import MAPPER_DENSITY_FRAME_MS, MAPPER_DENSITY_FRAMES
 from .vocab import MapperV1Vocab
 
 
@@ -18,6 +19,8 @@ class MapperV1LossConfig:
     lambda_adapter_reg: float = 1e-5
     ln_close_pos_weight: float = 1.0
     ln_close_focal_gamma: float = 1.5
+    density_calibration_scale: float = 1.0
+    density_calibration_bias: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -42,16 +45,17 @@ class MapperV1ModelLoss(nn.Module):
 
     def forward(self, output: Any, batch: Mapping[str, torch.Tensor]) -> MapperV1LossOutput:
         logits_final = _require_tensor_attr(output, "logits_final")
-        target_tokens = _require_batch_tensor(batch, "target_tokens")
-        if target_tokens.ndim != 2:
-            raise ValueError(f"target_tokens must have shape [B,S], got {tuple(target_tokens.shape)}")
-        if logits_final.ndim != 3 or tuple(logits_final.shape[:2]) != tuple(target_tokens[:, 1:].shape):
+        _reject_old_mapper_contract(batch)
+        target = _require_batch_tensor(batch, "target_fragment_tokens")
+        if target.ndim != 2:
+            raise ValueError(f"target_fragment_tokens must have shape [B,T], got {tuple(target.shape)}")
+        if logits_final.ndim != 3 or tuple(logits_final.shape[:2]) != tuple(target.shape):
             raise ValueError(
-                "logits_final must have shape [B,S-1,V] matching target_tokens[:, 1:], "
-                f"got logits={tuple(logits_final.shape)} target={tuple(target_tokens.shape)}"
+                "logits_final must have shape [B,T,V] matching target_fragment_tokens, "
+                f"got logits={tuple(logits_final.shape)} target={tuple(target.shape)}"
             )
 
-        target = target_tokens[:, 1:].to(device=logits_final.device, dtype=torch.long)
+        target = target.to(device=logits_final.device, dtype=torch.long)
         target_mask = _target_loss_mask(batch, target=target, pad_id=self.vocab.pad_id)
         token_loss = token_cross_entropy(
             logits_final,
@@ -61,8 +65,9 @@ class MapperV1ModelLoss(nn.Module):
         )
 
         close_logits = _require_tensor_attr(output, "ln_close_logits")
-        close_labels = _require_batch_tensor(batch, "close_labels")[:, :-1]
-        close_mask = _require_batch_tensor(batch, "close_label_mask")[:, :-1]
+        close_labels = _require_batch_tensor(batch, "close_labels")
+        close_mask = _require_batch_tensor(batch, "close_label_mask").to(device=close_logits.device, dtype=torch.bool)
+        close_mask = close_mask & target_mask.to(device=close_logits.device, dtype=torch.bool).unsqueeze(-1)
         ln_close_loss = ln_close_focal_bce_loss(
             close_logits=close_logits,
             labels=close_labels,
@@ -78,7 +83,30 @@ class MapperV1ModelLoss(nn.Module):
             getattr(output, "ln_close_time_shift_bias", None),
             mask=input_mask,
         )
-        density_loss = logits_final.new_zeros(())
+        density_target = batch.get("density_target_8s")
+        density_confidence = batch.get("density_confidence_8s")
+        if density_target is None or density_confidence is None:
+            if self.config.lambda_density > 0.0:
+                raise ValueError("density_target_8s and density_confidence_8s are required when lambda_density > 0")
+            density_loss = logits_final.new_zeros(())
+            density_weight = logits_final.new_zeros(())
+        else:
+            if not isinstance(density_target, torch.Tensor) or not isinstance(density_confidence, torch.Tensor):
+                raise ValueError("density_target_8s and density_confidence_8s must be tensors")
+            density_loss = density_auxiliary_loss(
+                logits_final=logits_final,
+                current_ms=_require_fragment_state_tensor(batch, "current_ms").to(device=logits_final.device),
+                write_start_ms=_require_batch_tensor(batch, "write_start_ms").to(device=logits_final.device),
+                target=density_target.to(device=logits_final.device),
+                confidence=density_confidence.to(device=logits_final.device),
+                vocab=self.vocab,
+                target_mask=target_mask,
+                calibration_scale=self.config.density_calibration_scale,
+                calibration_bias=self.config.density_calibration_bias,
+            )
+            density_weight = _density_loss_weight(
+                confidence=density_confidence.to(device=density_loss.device),
+            )
         total_loss = (
             token_loss
             + float(self.config.lambda_ln_close) * ln_close_loss
@@ -98,13 +126,23 @@ class MapperV1ModelLoss(nn.Module):
         metrics["phase/lambda_ln_close"] = float(self.config.lambda_ln_close)
         metrics["token/valid_count"] = int(target_mask.sum().detach().cpu())
         metrics["ln_close/open_lane_count"] = int(close_mask.to(dtype=torch.bool).sum().detach().cpu())
-        metrics["ln_close/positive_count"] = int((close_labels.to(dtype=torch.bool) & close_mask.to(dtype=torch.bool)).sum().detach().cpu())
+        metrics["ln_close/positive_count"] = int(
+            (
+                close_labels.to(device=close_mask.device, dtype=torch.bool)
+                & close_mask.to(dtype=torch.bool)
+            )
+            .sum()
+            .detach()
+            .cpu()
+        )
         numerators["loss/token"] = float((token_loss.detach() * target_mask.to(dtype=token_loss.dtype).sum().clamp_min(1)).cpu())
         denominators["loss/token"] = float(target_mask.sum().detach().cpu())
         numerators["loss/ln_close"] = float(
             (ln_close_loss.detach() * close_mask.to(device=ln_close_loss.device, dtype=ln_close_loss.dtype).sum().clamp_min(1)).cpu()
         )
         denominators["loss/ln_close"] = float(close_mask.sum().detach().cpu())
+        numerators["loss/density"] = float((density_loss.detach() * density_weight.clamp_min(1)).cpu())
+        denominators["loss/density"] = float(density_weight.detach().cpu())
 
         return MapperV1LossOutput(
             total_loss=total_loss,
@@ -290,29 +328,114 @@ def token_ce(
     )
 
 
+def density_auxiliary_loss(
+    *,
+    logits_final: torch.Tensor,
+    current_ms: torch.Tensor,
+    write_start_ms: torch.Tensor,
+    target: torch.Tensor,
+    confidence: torch.Tensor,
+    vocab: MapperV1Vocab,
+    target_mask: torch.Tensor | None = None,
+    calibration_scale: float = 1.0,
+    calibration_bias: float = 0.0,
+) -> torch.Tensor:
+    prediction = expected_density_from_logits(
+        logits_final=logits_final,
+        current_ms=current_ms,
+        write_start_ms=write_start_ms,
+        vocab=vocab,
+        target_mask=target_mask,
+        calibration_scale=calibration_scale,
+        calibration_bias=calibration_bias,
+    )
+    if tuple(target.shape) != tuple(prediction.shape):
+        raise ValueError(f"density_target_8s must have shape {tuple(prediction.shape)}, got {tuple(target.shape)}")
+    if tuple(confidence.shape) != tuple(prediction.shape):
+        raise ValueError(f"density_confidence_8s must have shape {tuple(prediction.shape)}, got {tuple(confidence.shape)}")
+    weight = confidence.to(device=prediction.device, dtype=prediction.dtype).clamp_min(0.0)
+    if not bool((weight > 0).any()):
+        return logits_final.sum() * 0.0
+    target = target.to(device=prediction.device, dtype=prediction.dtype)
+    loss = F.smooth_l1_loss(prediction, target, reduction="none") * weight
+    return loss.sum() / weight.sum().clamp_min(torch.finfo(weight.dtype).eps)
+
+
+def expected_density_from_logits(
+    *,
+    logits_final: torch.Tensor,
+    current_ms: torch.Tensor,
+    write_start_ms: torch.Tensor,
+    vocab: MapperV1Vocab,
+    target_mask: torch.Tensor | None = None,
+    calibration_scale: float = 1.0,
+    calibration_bias: float = 0.0,
+    frame_count: int = MAPPER_DENSITY_FRAMES,
+    frame_ms: int = MAPPER_DENSITY_FRAME_MS,
+) -> torch.Tensor:
+    if logits_final.ndim != 3:
+        raise ValueError(f"logits_final must have shape [B,T,V], got {tuple(logits_final.shape)}")
+    if tuple(current_ms.shape) != tuple(logits_final.shape[:2]):
+        raise ValueError(f"current_ms must have shape {tuple(logits_final.shape[:2])}, got {tuple(current_ms.shape)}")
+    if write_start_ms.ndim != 1 or int(write_start_ms.shape[0]) != int(logits_final.shape[0]):
+        raise ValueError(f"write_start_ms must have shape [{logits_final.shape[0]}]")
+    if int(logits_final.shape[-1]) != vocab.size:
+        raise ValueError(f"logits_final vocab dim must be {vocab.size}, got {logits_final.shape[-1]}")
+    if target_mask is None:
+        valid = torch.ones_like(current_ms, dtype=torch.bool)
+    else:
+        if tuple(target_mask.shape) != tuple(current_ms.shape):
+            raise ValueError(f"target_mask must have shape {tuple(current_ms.shape)}, got {tuple(target_mask.shape)}")
+        valid = target_mask.to(device=logits_final.device, dtype=torch.bool)
+
+    density_logits = logits_final.masked_fill(~valid.unsqueeze(-1), 0.0)
+    probs = torch.softmax(density_logits, dim=-1)
+    onset_weights = logits_final.new_zeros((vocab.size,))
+    if vocab.event_token_ids:
+        event_ids = torch.tensor(vocab.event_token_ids, dtype=torch.long, device=logits_final.device)
+        weights = [float(vocab.event_onset_weight(token_id)) for token_id in vocab.event_token_ids]
+        onset_weights[event_ids] = torch.tensor(weights, dtype=logits_final.dtype, device=logits_final.device)
+    expected_onset_mass = (probs * onset_weights.reshape(1, 1, -1)).sum(dim=-1)
+    expected_onset_mass = expected_onset_mass * valid.to(dtype=expected_onset_mass.dtype)
+
+    batch_size, steps = current_ms.shape
+    write_start = write_start_ms.to(device=logits_final.device, dtype=torch.long).reshape(batch_size, 1)
+    relative_ms = current_ms.to(device=logits_final.device, dtype=torch.long) - write_start
+    frame_index = torch.div(relative_ms, int(frame_ms), rounding_mode="floor")
+    in_window = (relative_ms >= 0) & (frame_index >= 0) & (frame_index < int(frame_count)) & valid
+    safe_index = frame_index.clamp(0, int(frame_count) - 1)
+
+    density = logits_final.new_zeros((batch_size, int(frame_count), 1))
+    density.scatter_add_(
+        dim=1,
+        index=safe_index.reshape(batch_size, steps, 1),
+        src=(expected_onset_mass * in_window.to(dtype=expected_onset_mass.dtype)).reshape(batch_size, steps, 1),
+    )
+    return float(calibration_scale) * density + float(calibration_bias)
+
+
 def _target_loss_mask(batch: Mapping[str, torch.Tensor], *, target: torch.Tensor, pad_id: int) -> torch.Tensor:
-    raw_mask = batch.get("target_token_mask")
+    raw_mask = batch.get("target_fragment_mask")
     if raw_mask is None:
         return target != int(pad_id)
     if not isinstance(raw_mask, torch.Tensor) or raw_mask.ndim != 2:
-        raise ValueError("target_token_mask must have shape [B,S]")
-    shifted = raw_mask[:, 1:].to(device=target.device, dtype=torch.bool)
-    if tuple(shifted.shape) != tuple(target.shape):
-        raise ValueError(f"target_token_mask[:, 1:] must have shape {tuple(target.shape)}")
-    return shifted & (target != int(pad_id))
+        raise ValueError("target_fragment_mask must have shape [B,T]")
+    mask = raw_mask.to(device=target.device, dtype=torch.bool)
+    if tuple(mask.shape) != tuple(target.shape):
+        raise ValueError(f"target_fragment_mask must have shape {tuple(target.shape)}")
+    return mask & (target != int(pad_id))
 
 
 def _input_loss_mask(batch: Mapping[str, torch.Tensor], *, steps: int, device: torch.device) -> torch.Tensor:
-    raw_mask = batch.get("target_token_mask")
+    raw_mask = batch.get("target_fragment_mask")
     if raw_mask is None:
-        return torch.ones((int(_require_batch_tensor(batch, "target_tokens").shape[0]), steps), dtype=torch.bool, device=device)
+        return torch.ones((int(_require_batch_tensor(batch, "target_fragment_tokens").shape[0]), steps), dtype=torch.bool, device=device)
     if not isinstance(raw_mask, torch.Tensor) or raw_mask.ndim != 2:
-        raise ValueError("target_token_mask must have shape [B,S]")
-    shifted = raw_mask[:, :-1].to(device=device, dtype=torch.bool)
-    shifted = shifted & raw_mask[:, 1:].to(device=device, dtype=torch.bool)
-    if int(shifted.shape[1]) != int(steps):
-        raise ValueError(f"target_token_mask[:, :-1] must have {steps} steps")
-    return shifted
+        raise ValueError("target_fragment_mask must have shape [B,T]")
+    mask = raw_mask.to(device=device, dtype=torch.bool)
+    if int(mask.shape[1]) != int(steps):
+        raise ValueError(f"target_fragment_mask must have {steps} steps")
+    return mask
 
 
 def _require_tensor_attr(output: Any, name: str) -> torch.Tensor:
@@ -322,11 +445,41 @@ def _require_tensor_attr(output: Any, name: str) -> torch.Tensor:
     return value
 
 
+def _reject_old_mapper_contract(batch: Mapping[str, Any]) -> None:
+    old_keys = {
+        "target_tokens",
+        "target_token_mask",
+        "teacher_current_ms",
+        "teacher_open_mask",
+        "teacher_open_age_ms",
+    }
+    present = sorted(key for key in old_keys if key in batch)
+    if present:
+        raise ValueError(
+            "old target_tokens/teacher_* mapper contract is not supported; "
+            f"received {present}"
+        )
+
+
 def _require_batch_tensor(batch: Mapping[str, torch.Tensor], name: str) -> torch.Tensor:
     value = batch.get(name)
     if not isinstance(value, torch.Tensor):
         raise ValueError(f"batch[{name!r}] must be a torch.Tensor")
     return value
+
+
+def _require_fragment_state_tensor(batch: Mapping[str, Any], name: str) -> torch.Tensor:
+    states = batch.get("target_fragment_states")
+    if not isinstance(states, Mapping):
+        raise ValueError("batch['target_fragment_states'] must be a mapping")
+    value = states.get(name)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"target_fragment_states[{name!r}] must be a torch.Tensor")
+    return value
+
+
+def _density_loss_weight(*, confidence: torch.Tensor) -> torch.Tensor:
+    return confidence.detach().to(dtype=torch.float32).clamp_min(0.0).sum()
 
 
 def _record_scalar(metrics: dict[str, float], key: str, value: torch.Tensor) -> None:
@@ -340,6 +493,8 @@ def _validate_config(config: MapperV1LossConfig) -> None:
         "lambda_adapter_reg",
         "ln_close_pos_weight",
         "ln_close_focal_gamma",
+        "density_calibration_scale",
+        "density_calibration_bias",
     ):
         _require_finite_number(getattr(config, name), name)
     if config.lambda_density < 0.0:
@@ -352,6 +507,8 @@ def _validate_config(config: MapperV1LossConfig) -> None:
         raise ValueError("ln_close_pos_weight must be positive")
     if config.ln_close_focal_gamma < 0.0:
         raise ValueError("ln_close_focal_gamma must be non-negative")
+    if config.density_calibration_scale < 0.0:
+        raise ValueError("density_calibration_scale must be non-negative")
 
 
 def _require_finite_number(value: float, name: str) -> None:

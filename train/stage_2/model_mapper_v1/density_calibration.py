@@ -7,7 +7,7 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
-from .replay import replay_tokens
+from .replay import LNCarryState, empty_ln_carry_state, replay_tokens
 from .tokenizer import MAPPER_DENSITY_FRAME_MS, MAPPER_DENSITY_FRAMES, TokenizedMapperWindow
 from .vocab import MapperV1Vocab
 
@@ -33,23 +33,29 @@ def scatter_gold_onset_mass(
     vocab: MapperV1Vocab,
     write_start_ms: int,
     write_end_ms: int,
+    ln_carry_in: LNCarryState | None = None,
+    ln_carry_out: LNCarryState | None = None,
+    is_full_chart_end: bool = False,
     frame_count: int = MAPPER_DENSITY_FRAMES,
     frame_ms: int = MAPPER_DENSITY_FRAME_MS,
 ) -> torch.Tensor:
+    carry_in = empty_ln_carry_state(write_start_ms) if ln_carry_in is None else ln_carry_in
+    carry_out = empty_ln_carry_state(write_end_ms) if ln_carry_out is None else ln_carry_out
     states = replay_tokens(
         token_ids,
         vocab=vocab,
         write_start_ms=write_start_ms,
         write_end_ms=write_end_ms,
-        validate_final=True,
+        ln_carry_in=carry_in,
+        ln_carry_out=carry_out,
+        is_full_chart_end=is_full_chart_end,
+        validate_terminal=True,
     )
     mass = torch.zeros(frame_count, dtype=torch.float32)
     for token_index, token_id in enumerate(token_ids):
         if not vocab.is_event_token(int(token_id)):
             continue
-        if token_index == 0:
-            raise ValueError("EVENT cannot appear before BOS state")
-        event_ms = states[token_index - 1].current_ms
+        event_ms = states[token_index].current_ms
         frame_index = (event_ms - int(write_start_ms)) // int(frame_ms)
         if 0 <= frame_index < frame_count:
             mass[frame_index] += float(vocab.event_onset_weight(int(token_id)))
@@ -63,10 +69,13 @@ def scatter_tokenized_gold_onset_mass(
     frame_count: int = MAPPER_DENSITY_FRAMES,
 ) -> torch.Tensor:
     return scatter_gold_onset_mass(
-        tokenized.target_ids,
+        tokenized.target_fragment_ids,
         vocab=vocab,
         write_start_ms=tokenized.write_start_ms,
         write_end_ms=tokenized.write_end_ms,
+        ln_carry_in=tokenized.ln_carry_in,
+        ln_carry_out=tokenized.ln_carry_out,
+        is_full_chart_end=tokenized.is_full_chart_end,
         frame_count=frame_count,
     )
 

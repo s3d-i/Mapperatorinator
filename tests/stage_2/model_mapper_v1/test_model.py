@@ -3,7 +3,7 @@ import unittest
 import torch
 from torch import nn
 
-from train.stage_2.data.mapper_v1_windows import collate_mapper_v1_windows
+from train.stage_2.model_mapper_v1.replay import ln_carry_state_tensors
 from train.stage_2.model_mapper_v1.model import MapperV1Config, MapperV1Model
 from train.stage_2.model_mapper_v1.tokenizer import MapperTimepoint, encode_mapper_window
 from train.stage_2.model_mapper_v1.vocab import LaneAction, MapperV1Vocab
@@ -19,10 +19,11 @@ class MapperV1ModelTests(unittest.TestCase):
         output = model(**batch)
 
         self.assertEqual(output.logits_final.shape, (1, 3, vocab.size))
-        self.assertTrue(torch.equal(output.decoder_input_tokens, batch["target_tokens"][:, :-1]))
-        self.assertTrue(torch.equal(output.loss_target_tokens, batch["target_tokens"][:, 1:]))
-        self.assertTrue(torch.equal(output.state_current_ms, batch["teacher_current_ms"][:, :-1]))
-        self.assertTrue(torch.equal(output.state_open_mask, batch["teacher_open_mask"][:, :-1]))
+        self.assertTrue(torch.equal(output.decoder_input_tokens, batch["decoder_input_tokens"]))
+        self.assertTrue(torch.equal(output.loss_target_tokens, batch["target_fragment_tokens"]))
+        self.assertTrue(torch.equal(output.state_current_ms, batch["target_fragment_states"]["current_ms"]))
+        self.assertTrue(torch.equal(output.state_open_mask, batch["target_fragment_states"]["open_mask"]))
+        self.assertTrue(torch.equal(output.state_open_start_ms, batch["target_fragment_states"]["open_start_ms"]))
 
     def test_grammar_mask_is_final_authority(self) -> None:
         torch.manual_seed(13)
@@ -36,7 +37,6 @@ class MapperV1ModelTests(unittest.TestCase):
         output = model(**batch)
 
         self.assertTrue(torch.isneginf(output.logits_final[0, 0, vocab.pad_id]))
-        self.assertTrue(torch.isneginf(output.logits_final[0, 0, vocab.bos_id]))
         self.assertTrue(torch.isneginf(output.logits_final[0, 0, vocab.eos_id]))
         self.assertTrue(torch.isneginf(output.logits_final[torch.isneginf(output.grammar_mask)]).all().item())
 
@@ -62,48 +62,48 @@ class MapperV1ModelTests(unittest.TestCase):
         self.assertFalse(control_encoder.weight.requires_grad)
         self.assertFalse(control_encoder.training)
 
+    def test_rejects_old_target_tokens_teacher_contract(self) -> None:
+        vocab = MapperV1Vocab()
+        model = MapperV1Model(_small_config(vocab), vocab=vocab)
+        batch = _empty_batch(vocab)
+        batch["target_tokens"] = batch["target_fragment_tokens"].clone()
+
+        with self.assertRaisesRegex(ValueError, "old target_tokens/teacher_\\* mapper contract"):
+            model(**batch)
+
     def test_rejects_invalid_initial_replay_state_contract(self) -> None:
         vocab = MapperV1Vocab()
         model = MapperV1Model(_small_config(vocab), vocab=vocab)
-
-        non_bos = _empty_batch(vocab)
-        non_bos["target_tokens"] = non_bos["target_tokens"].clone()
-        non_bos["target_tokens"][0, 0] = vocab.time_shift_token_id(10)
-        with self.assertRaisesRegex(ValueError, r"target_tokens\[:, 0\] must be BOS"):
-            model(**non_bos)
-
-        masked_bos = _empty_batch(vocab)
-        masked_bos["target_token_mask"] = torch.ones_like(masked_bos["target_tokens"], dtype=torch.bool)
-        masked_bos["target_token_mask"][0, 0] = False
-        with self.assertRaisesRegex(ValueError, "target_token_mask must mark BOS"):
-            model(**masked_bos)
-
         shifted_current = _empty_batch(vocab)
-        shifted_current["teacher_current_ms"] = shifted_current["teacher_current_ms"].clone()
-        shifted_current["teacher_current_ms"][0, 0] = 10
-        with self.assertRaisesRegex(ValueError, r"teacher_current_ms\[:, 0\] must equal write_start_ms"):
+        shifted_current["target_fragment_states"] = dict(shifted_current["target_fragment_states"])
+        shifted_current["target_fragment_states"]["current_ms"] = shifted_current["target_fragment_states"]["current_ms"].clone()
+        shifted_current["target_fragment_states"]["current_ms"][0, 0] = 10
+        with self.assertRaisesRegex(ValueError, r"target_fragment_states.current_ms\[:, 0\] must equal ln_carry_in.current_ms"):
             model(**shifted_current)
 
-        open_initial = _empty_batch(vocab)
-        open_initial["teacher_open_mask"] = open_initial["teacher_open_mask"].clone()
-        open_initial["teacher_open_mask"][0, 0, 0] = True
-        with self.assertRaisesRegex(ValueError, r"teacher_open_mask\[:, 0\] must have all lanes closed"):
-            model(**open_initial)
+        mismatched_open = _empty_batch(vocab)
+        mismatched_open["target_fragment_states"] = dict(mismatched_open["target_fragment_states"])
+        mismatched_open["target_fragment_states"]["open_mask"] = mismatched_open["target_fragment_states"]["open_mask"].clone()
+        mismatched_open["target_fragment_states"]["open_mask"][0, 0, 0] = True
+        with self.assertRaisesRegex(ValueError, r"target_fragment_states.open_start_ms must be set for open lanes"):
+            model(**mismatched_open)
 
         aged_initial = _empty_batch(vocab)
-        aged_initial["teacher_open_age_ms"] = aged_initial["teacher_open_age_ms"].clone()
-        aged_initial["teacher_open_age_ms"][0, 0, 0] = 10
-        with self.assertRaisesRegex(ValueError, r"teacher_open_age_ms\[:, 0\] must be zero"):
+        aged_initial["target_fragment_states"] = dict(aged_initial["target_fragment_states"])
+        aged_initial["target_fragment_states"]["open_age_ms"] = aged_initial["target_fragment_states"]["open_age_ms"].clone()
+        aged_initial["target_fragment_states"]["open_age_ms"][0, 0, 0] = 10
+        with self.assertRaisesRegex(ValueError, r"target_fragment_states.open_age_ms must be zero for closed lanes"):
             model(**aged_initial)
 
     def test_rejects_non_8s_windows_and_out_of_window_teacher_states(self) -> None:
         vocab = MapperV1Vocab()
         model = MapperV1Model(_small_config(vocab), vocab=vocab)
         batch = _empty_batch(vocab, write_start_ms=8000)
-        batch["teacher_current_ms"] = batch["teacher_current_ms"].clone()
-        batch["teacher_current_ms"][0, 0] = 0
+        batch["target_fragment_states"] = dict(batch["target_fragment_states"])
+        batch["target_fragment_states"]["current_ms"] = batch["target_fragment_states"]["current_ms"].clone()
+        batch["target_fragment_states"]["current_ms"][0, 0] = 0
 
-        with self.assertRaisesRegex(ValueError, "teacher_current_ms.*within"):
+        with self.assertRaisesRegex(ValueError, "target_fragment_states.current_ms.*within"):
             model(**batch)
 
         bad_span = _empty_batch(vocab)
@@ -115,8 +115,9 @@ class MapperV1ModelTests(unittest.TestCase):
         vocab = MapperV1Vocab()
         model = MapperV1Model(_small_config(vocab), vocab=vocab)
         batch = _empty_batch(vocab)
-        batch["teacher_current_ms"] = batch["teacher_current_ms"].clone()
-        batch["teacher_current_ms"][0, 0] = 8000
+        batch["target_fragment_states"] = dict(batch["target_fragment_states"])
+        batch["target_fragment_states"]["current_ms"] = batch["target_fragment_states"]["current_ms"].clone()
+        batch["target_fragment_states"]["current_ms"][0, 0] = 8000
 
         with self.assertRaisesRegex(ValueError, "write_end_ms is valid only for EOS"):
             model(**batch)
@@ -143,7 +144,7 @@ class MapperV1ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "control_memory_8s and density_teacher_8s must be supplied together"):
             model(**missing_control)
 
-    def test_target_token_mask_hides_padded_teacher_state_from_window_validation(self) -> None:
+    def test_target_fragment_mask_hides_padded_state_from_window_validation(self) -> None:
         vocab = MapperV1Vocab()
         model = MapperV1Model(_small_config(vocab), vocab=vocab)
         long = _sample(
@@ -155,17 +156,21 @@ class MapperV1ModelTests(unittest.TestCase):
             ),
         )
         short = _sample(encode_mapper_window([], vocab=vocab, write_start_ms=8000, write_end_ms=16000))
-        batch = collate_mapper_v1_windows([long, short], pad_id=vocab.pad_id)
+        batch = _collate_samples([long, short], vocab=vocab)
         batch["control_memory_8s"] = torch.randn(2, 400, 32, dtype=torch.float32)
         batch["density_teacher_8s"] = torch.zeros(2, 400, 1, dtype=torch.float32)
+        batch["target_fragment_states"]["current_ms"][1, -1] = 99_999
+        batch["target_fragment_states"]["open_mask"][1, -1] = True
+        batch["target_fragment_states"]["open_start_ms"][1, -1] = 99_999
+        batch["target_fragment_states"]["open_age_ms"][1, -1] = 99_999
 
         output = model(**batch)
 
-        self.assertEqual(output.logits_final.shape[:2], batch["target_tokens"][:, :-1].shape)
+        self.assertEqual(output.logits_final.shape[:2], batch["target_fragment_tokens"].shape)
 
         unmasked = dict(batch)
-        unmasked.pop("target_token_mask")
-        with self.assertRaisesRegex(ValueError, "teacher_current_ms.*within"):
+        unmasked["target_fragment_mask"] = torch.ones_like(batch["target_fragment_mask"], dtype=torch.bool)
+        with self.assertRaisesRegex(ValueError, "target_fragment_states.current_ms.*within"):
             model(**unmasked)
 
 
@@ -197,18 +202,13 @@ def _empty_batch(vocab: MapperV1Vocab, *, write_start_ms: int = 0) -> dict[str, 
         vocab=vocab,
         write_start_ms=write_start_ms,
         write_end_ms=write_start_ms + 8000,
+        chart_end_ms=write_start_ms + 8000,
     )
-    return {
-        "target_tokens": tokenized.target_tensor().unsqueeze(0),
-        "teacher_current_ms": tokenized.teacher_current_ms.unsqueeze(0),
-        "teacher_open_mask": tokenized.teacher_open_mask.unsqueeze(0),
-        "teacher_open_age_ms": tokenized.teacher_open_age_ms.unsqueeze(0),
-        "write_start_ms": torch.tensor([tokenized.write_start_ms], dtype=torch.long),
-        "write_end_ms": torch.tensor([tokenized.write_end_ms], dtype=torch.long),
-        "normalized_difficulty": torch.tensor([[0.0]], dtype=torch.float32),
-        "control_memory_8s": torch.randn(1, 400, 32, dtype=torch.float32),
-        "density_teacher_8s": torch.zeros(1, 400, 1, dtype=torch.float32),
-    }
+    sample = _sample(tokenized)
+    batch = _collate_samples([sample], vocab=vocab)
+    batch["control_memory_8s"] = torch.randn(1, 400, 32, dtype=torch.float32)
+    batch["density_teacher_8s"] = torch.zeros(1, 400, 1, dtype=torch.float32)
+    return batch
 
 
 def _sample(tokenized) -> dict[str, torch.Tensor]:
@@ -218,16 +218,82 @@ def _sample(tokenized) -> dict[str, torch.Tensor]:
         "context_padding_mask": torch.zeros(400, dtype=torch.bool),
         "difficulty": torch.zeros(1, dtype=torch.float32),
         "normalized_difficulty": torch.zeros(1, dtype=torch.float32),
-        "target_tokens": tokenized.target_tensor(),
-        "teacher_current_ms": tokenized.teacher_current_ms,
-        "teacher_open_mask": tokenized.teacher_open_mask,
-        "teacher_open_age_ms": tokenized.teacher_open_age_ms,
+        "decoder_input_tokens": tokenized.decoder_input_tensor(),
+        "target_fragment_tokens": tokenized.target_fragment_tensor(),
+        "target_fragment_mask": torch.ones(tokenized.seq_len, dtype=torch.bool),
+        "target_fragment_states": {
+            "current_ms": tokenized.target_fragment_current_ms,
+            "open_mask": tokenized.target_fragment_open_mask,
+            "open_start_ms": tokenized.target_fragment_open_start_ms,
+            "open_age_ms": tokenized.target_fragment_open_age_ms,
+        },
+        "ln_carry_in": ln_carry_state_tensors(tokenized.ln_carry_in),
+        "ln_carry_out": ln_carry_state_tensors(tokenized.ln_carry_out),
         "close_labels": tokenized.close_labels,
         "close_label_mask": tokenized.close_label_mask,
         "density_target_8s": torch.zeros(400, 1, dtype=torch.float32),
         "density_confidence_8s": torch.ones(400, 1, dtype=torch.float32),
         "write_start_ms": torch.tensor(tokenized.write_start_ms, dtype=torch.long),
         "write_end_ms": torch.tensor(tokenized.write_end_ms, dtype=torch.long),
+        "is_full_chart_start": torch.tensor(tokenized.is_full_chart_start, dtype=torch.bool),
+        "is_full_chart_end": torch.tensor(tokenized.is_full_chart_end, dtype=torch.bool),
+    }
+
+
+def _collate_samples(samples, *, vocab: MapperV1Vocab) -> dict[str, torch.Tensor]:
+    batch_size = len(samples)
+    max_len = max(int(sample["target_fragment_tokens"].shape[0]) for sample in samples)
+    decoder_input_tokens = torch.full((batch_size, max_len), vocab.pad_id, dtype=torch.long)
+    target_fragment_tokens = torch.full((batch_size, max_len), vocab.pad_id, dtype=torch.long)
+    target_fragment_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
+    current_ms = torch.zeros((batch_size, max_len), dtype=torch.long)
+    open_mask = torch.zeros((batch_size, max_len, 4), dtype=torch.bool)
+    open_start_ms = torch.full((batch_size, max_len, 4), -1, dtype=torch.long)
+    open_age_ms = torch.zeros((batch_size, max_len, 4), dtype=torch.long)
+    close_labels = torch.zeros((batch_size, max_len, 4), dtype=torch.bool)
+    close_label_mask = torch.zeros((batch_size, max_len, 4), dtype=torch.bool)
+    for index, sample in enumerate(samples):
+        length = int(sample["target_fragment_tokens"].shape[0])
+        decoder_input_tokens[index, :length] = sample["decoder_input_tokens"]
+        target_fragment_tokens[index, :length] = sample["target_fragment_tokens"]
+        target_fragment_mask[index, :length] = sample["target_fragment_mask"]
+        states = sample["target_fragment_states"]
+        current_ms[index, :length] = states["current_ms"]
+        open_mask[index, :length] = states["open_mask"]
+        open_start_ms[index, :length] = states["open_start_ms"]
+        open_age_ms[index, :length] = states["open_age_ms"]
+        close_labels[index, :length] = sample["close_labels"]
+        close_label_mask[index, :length] = sample["close_label_mask"]
+        if length < max_len:
+            current_ms[index, length:] = sample["write_end_ms"]
+    scalar_keys = ("write_start_ms", "write_end_ms", "is_full_chart_start", "is_full_chart_end")
+    return {
+        "decoder_input_tokens": decoder_input_tokens,
+        "target_fragment_tokens": target_fragment_tokens,
+        "target_fragment_mask": target_fragment_mask,
+        "target_fragment_states": {
+            "current_ms": current_ms,
+            "open_mask": open_mask,
+            "open_start_ms": open_start_ms,
+            "open_age_ms": open_age_ms,
+        },
+        "ln_carry_in": {
+            key: torch.stack([sample["ln_carry_in"][key] for sample in samples])
+            for key in samples[0]["ln_carry_in"]
+        },
+        "ln_carry_out": {
+            key: torch.stack([sample["ln_carry_out"][key] for sample in samples])
+            for key in samples[0]["ln_carry_out"]
+        },
+        "close_labels": close_labels,
+        "close_label_mask": close_label_mask,
+        "density_target_8s": torch.stack([sample["density_target_8s"] for sample in samples]),
+        "density_confidence_8s": torch.stack([sample["density_confidence_8s"] for sample in samples]),
+        "write_start_ms": torch.stack([sample["write_start_ms"] for sample in samples]),
+        "write_end_ms": torch.stack([sample["write_end_ms"] for sample in samples]),
+        "is_full_chart_start": torch.stack([sample["is_full_chart_start"] for sample in samples]),
+        "is_full_chart_end": torch.stack([sample["is_full_chart_end"] for sample in samples]),
+        "normalized_difficulty": torch.stack([sample["normalized_difficulty"] for sample in samples]),
     }
 
 

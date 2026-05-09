@@ -21,16 +21,14 @@ from train.stage_2.data.control_windows import (
     normalize_difficulty,
 )
 from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES, VALUE_FEATURE_NAMES
+from train.stage_2.model_mapper_v1.replay import CLOSED_OPEN_START_MS, ln_carry_state_tensors
 from train.stage_2.model_mapper_v1.tokenizer import (
     MAPPER_DENSITY_FRAMES,
     MAPPER_WRITE_MS,
-    CrossWindowLongNoteError,
     TokenizedMapperWindow,
     UnsupportedMapperActionError,
-    cross_window_ln_state_reason,
     encode_mapper_window,
     hitobjects_to_mapper_timepoints,
-    window_timepoints,
 )
 from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
 
@@ -140,14 +138,22 @@ class MapperV1WindowDataset(Dataset):
         sample: dict[str, Any] = {
             "difficulty": torch.tensor([record.difficulty], dtype=torch.float32),
             "normalized_difficulty": torch.tensor([normalize_difficulty(record.difficulty)], dtype=torch.float32),
-            "target_tokens": tokenized.target_tensor(),
-            "teacher_current_ms": tokenized.teacher_current_ms,
-            "teacher_open_mask": tokenized.teacher_open_mask,
-            "teacher_open_age_ms": tokenized.teacher_open_age_ms,
+            "decoder_input_tokens": tokenized.decoder_input_tensor(),
+            "target_fragment_tokens": tokenized.target_fragment_tensor(),
+            "target_fragment_states": {
+                "current_ms": tokenized.target_fragment_current_ms,
+                "open_mask": tokenized.target_fragment_open_mask,
+                "open_start_ms": tokenized.target_fragment_open_start_ms,
+                "open_age_ms": tokenized.target_fragment_open_age_ms,
+            },
+            "ln_carry_in": ln_carry_state_tensors(tokenized.ln_carry_in),
+            "ln_carry_out": ln_carry_state_tensors(tokenized.ln_carry_out),
             "close_labels": tokenized.close_labels,
             "close_label_mask": tokenized.close_label_mask,
             "write_start_ms": torch.tensor(tokenized.write_start_ms, dtype=torch.long),
             "write_end_ms": torch.tensor(tokenized.write_end_ms, dtype=torch.long),
+            "is_full_chart_start": torch.tensor(tokenized.is_full_chart_start, dtype=torch.bool),
+            "is_full_chart_end": torch.tensor(tokenized.is_full_chart_end, dtype=torch.bool),
             "metadata": metadata,
         }
         if cache_entry is not None:
@@ -248,12 +254,6 @@ class MapperV1WindowDataset(Dataset):
             valid_by_song[song_key] = valid_by_song.get(song_key, 0) + 1
             try:
                 self._tokenize_record(record)
-            except CrossWindowLongNoteError:
-                dropped_cross_window += 1
-                _increment_drop(dropped_by_difficulty, difficulty_key)
-                _increment_drop(dropped_by_song, song_key)
-                maybe_print_progress(index)
-                continue
             except UnsupportedMapperActionError:
                 dropped_unsupported_action += 1
                 _increment_drop(dropped_by_difficulty, difficulty_key)
@@ -292,22 +292,13 @@ class MapperV1WindowDataset(Dataset):
         write_start_ms = record.target_start_ms
         write_end_ms = write_start_ms + MAPPER_WRITE_MS
         timepoints = self._load_timepoints(record.beatmap_path)
-        reason = cross_window_ln_state_reason(
-            timepoints,
-            write_start_ms=write_start_ms,
-            write_end_ms=write_end_ms,
-        )
-        if reason is not None:
-            raise CrossWindowLongNoteError(f"window requires {reason} LN state")
         return encode_mapper_window(
-            window_timepoints(
-                timepoints,
-                write_start_ms=write_start_ms,
-                write_end_ms=write_end_ms,
-            ),
+            timepoints,
             vocab=self.vocab,
             write_start_ms=write_start_ms,
             write_end_ms=write_end_ms,
+            chart_start_ms=0,
+            chart_end_ms=int(record.frame_count) * FRAME_HOP_MS,
         )
 
     def _load_timepoints(self, beatmap_path: Path) -> tuple:
@@ -521,22 +512,31 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
     if not samples:
         raise ValueError("collate_mapper_v1_windows requires at least one sample")
     batch_size = len(samples)
-    max_seq_len = max(int(sample["target_tokens"].shape[0]) for sample in samples)
-    target_tokens = torch.full((batch_size, max_seq_len), int(pad_id), dtype=torch.long)
-    target_token_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.bool)
-    teacher_current_ms = torch.zeros((batch_size, max_seq_len), dtype=torch.long)
-    teacher_open_mask = torch.zeros((batch_size, max_seq_len, 4), dtype=torch.bool)
-    teacher_open_age_ms = torch.zeros((batch_size, max_seq_len, 4), dtype=torch.long)
+    max_seq_len = max(int(sample["target_fragment_tokens"].shape[0]) for sample in samples)
+    decoder_input_tokens = torch.full((batch_size, max_seq_len), int(pad_id), dtype=torch.long)
+    target_fragment_tokens = torch.full((batch_size, max_seq_len), int(pad_id), dtype=torch.long)
+    target_fragment_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.bool)
+    target_fragment_current_ms = torch.zeros((batch_size, max_seq_len), dtype=torch.long)
+    target_fragment_open_mask = torch.zeros((batch_size, max_seq_len, 4), dtype=torch.bool)
+    target_fragment_open_start_ms = torch.full(
+        (batch_size, max_seq_len, 4),
+        int(CLOSED_OPEN_START_MS),
+        dtype=torch.long,
+    )
+    target_fragment_open_age_ms = torch.zeros((batch_size, max_seq_len, 4), dtype=torch.long)
     close_labels = torch.zeros((batch_size, max_seq_len, 4), dtype=torch.bool)
     close_label_mask = torch.zeros((batch_size, max_seq_len, 4), dtype=torch.bool)
 
     for batch_index, sample in enumerate(samples):
-        length = int(sample["target_tokens"].shape[0])
-        target_tokens[batch_index, :length] = sample["target_tokens"].to(dtype=torch.long)
-        target_token_mask[batch_index, :length] = True
-        teacher_current_ms[batch_index, :length] = sample["teacher_current_ms"].to(dtype=torch.long)
-        teacher_open_mask[batch_index, :length] = sample["teacher_open_mask"].to(dtype=torch.bool)
-        teacher_open_age_ms[batch_index, :length] = sample["teacher_open_age_ms"].to(dtype=torch.long)
+        length = int(sample["target_fragment_tokens"].shape[0])
+        fragment_states = sample["target_fragment_states"]
+        decoder_input_tokens[batch_index, :length] = sample["decoder_input_tokens"].to(dtype=torch.long)
+        target_fragment_tokens[batch_index, :length] = sample["target_fragment_tokens"].to(dtype=torch.long)
+        target_fragment_mask[batch_index, :length] = True
+        target_fragment_current_ms[batch_index, :length] = fragment_states["current_ms"].to(dtype=torch.long)
+        target_fragment_open_mask[batch_index, :length] = fragment_states["open_mask"].to(dtype=torch.bool)
+        target_fragment_open_start_ms[batch_index, :length] = fragment_states["open_start_ms"].to(dtype=torch.long)
+        target_fragment_open_age_ms[batch_index, :length] = fragment_states["open_age_ms"].to(dtype=torch.long)
         close_labels[batch_index, :length] = sample["close_labels"].to(dtype=torch.bool)
         close_label_mask[batch_index, :length] = sample["close_label_mask"].to(dtype=torch.bool)
 
@@ -545,11 +545,17 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         "normalized_difficulty": torch.stack(
             [sample.get("normalized_difficulty", sample["difficulty"]).to(dtype=torch.float32) for sample in samples],
         ),
-        "target_tokens": target_tokens,
-        "target_token_mask": target_token_mask,
-        "teacher_current_ms": teacher_current_ms,
-        "teacher_open_mask": teacher_open_mask,
-        "teacher_open_age_ms": teacher_open_age_ms,
+        "decoder_input_tokens": decoder_input_tokens,
+        "target_fragment_tokens": target_fragment_tokens,
+        "target_fragment_mask": target_fragment_mask,
+        "target_fragment_states": {
+            "current_ms": target_fragment_current_ms,
+            "open_mask": target_fragment_open_mask,
+            "open_start_ms": target_fragment_open_start_ms,
+            "open_age_ms": target_fragment_open_age_ms,
+        },
+        "ln_carry_in": _stack_carry_batch(samples, "ln_carry_in"),
+        "ln_carry_out": _stack_carry_batch(samples, "ln_carry_out"),
         "close_labels": close_labels,
         "close_label_mask": close_label_mask,
         "write_start_ms": torch.stack([sample["write_start_ms"].to(dtype=torch.long) for sample in samples]).reshape(
@@ -558,6 +564,12 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         "write_end_ms": torch.stack([sample["write_end_ms"].to(dtype=torch.long) for sample in samples]).reshape(
             batch_size,
         ),
+        "is_full_chart_start": torch.stack(
+            [sample["is_full_chart_start"].to(dtype=torch.bool) for sample in samples],
+        ).reshape(batch_size),
+        "is_full_chart_end": torch.stack(
+            [sample["is_full_chart_end"].to(dtype=torch.bool) for sample in samples],
+        ).reshape(batch_size),
         "metadata": [sample.get("metadata", {}) for sample in samples],
     }
 
@@ -621,6 +633,15 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
                 [sample["control_slice_start_frames"].to(dtype=torch.long) for sample in samples],
             )
     return batch
+
+
+def _stack_carry_batch(samples: Sequence[dict[str, Any]], key: str) -> dict[str, torch.Tensor]:
+    return {
+        "current_ms": torch.stack([sample[key]["current_ms"].to(dtype=torch.long) for sample in samples]).reshape(len(samples)),
+        "open_mask": torch.stack([sample[key]["open_mask"].to(dtype=torch.bool) for sample in samples]),
+        "open_start_ms": torch.stack([sample[key]["open_start_ms"].to(dtype=torch.long) for sample in samples]),
+        "open_age_ms": torch.stack([sample[key]["open_age_ms"].to(dtype=torch.long) for sample in samples]),
+    }
 
 
 def _difficulty_report_key(difficulty: float) -> str:

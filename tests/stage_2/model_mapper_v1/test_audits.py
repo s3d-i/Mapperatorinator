@@ -1,20 +1,23 @@
 import unittest
-from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 
 from train.stage_2.model_mapper_v1.audits import (
+    audit_boundary_tokens,
+    audit_carry_windows,
     audit_grammar_replay,
     audit_ln_close_imbalance,
     audit_tokenized_windows,
     build_phase_a_gate_decision,
     build_phase_a_report,
 )
-from train.stage_2.model_mapper_v1.density_calibration import (
-    scatter_tokenized_gold_onset_mass,
-    smooth_density_mass,
+from train.stage_2.model_mapper_v1.generation import (
+    LNCarryState,
+    grammar_constrained_window_generation,
+    replay_fragment_tokens,
+    short_rollout_recovery_ce,
 )
-from train.stage_2.model_mapper_v1.tokenizer import MapperTimepoint, encode_mapper_window
 from train.stage_2.model_mapper_v1.vocab import LaneAction, MapperV1Vocab
 
 
@@ -43,19 +46,11 @@ def _filter_report(*, eligible_windows: int, dropped_cross_window_ln_windows: in
 
 
 class MapperV1AuditTests(unittest.TestCase):
-    def test_phase_a_audits_report_zero_grammar_violations_and_ln_imbalance(self) -> None:
+    def test_carry_aware_audits_report_zero_grammar_violations_and_ln_imbalance(self) -> None:
         vocab = MapperV1Vocab()
         windows = [
-            encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000),
-            encode_mapper_window(
-                [
-                    MapperTimepoint(1000, _actions(LaneAction.HOLD_START)),
-                    MapperTimepoint(1400, _actions(LaneAction.HOLD_END)),
-                ],
-                vocab=vocab,
-                write_start_ms=0,
-                write_end_ms=8000,
-            ),
+            _window(vocab, _ts(vocab, 8000), write_start_ms=0, write_end_ms=8000),
+            _hold_window(vocab),
         ]
 
         tokenizer_report = audit_tokenized_windows(
@@ -63,24 +58,25 @@ class MapperV1AuditTests(unittest.TestCase):
             vocab=vocab,
             filter_report=_filter_report(eligible_windows=2),
         )
+        carry_report = audit_carry_windows(windows, vocab=vocab)
+        boundary_report = audit_boundary_tokens(windows, vocab=vocab)
         grammar_report = audit_grammar_replay(windows, vocab=vocab)
         close_report = audit_ln_close_imbalance(windows)
 
         self.assertEqual(tokenizer_report.num_windows, 2)
-        self.assertEqual(tokenizer_report.open_mask_nonzero_before_eos_count, 0)
         self.assertEqual(tokenizer_report.invalid_time_delta_count, 0)
         self.assertEqual(tokenizer_report.noncanonical_time_shift_count, 0)
         self.assertEqual(tokenizer_report.invalid_event_count, 0)
-        self.assertGreaterEqual(tokenizer_report.p99_seq_len, tokenizer_report.p95_seq_len)
+        self.assertEqual(carry_report.terminal_state_mismatch_count, 0)
+        self.assertEqual(boundary_report.non_initial_window_bos_count, 0)
+        self.assertEqual(boundary_report.non_final_window_eos_count, 0)
         self.assertEqual(grammar_report.violation_count, 0)
         self.assertGreater(close_report.num_open_lane_steps, 0)
         self.assertEqual(close_report.num_close_positive_steps, 1)
-        self.assertGreaterEqual(close_report.pos_weight, 1.0)
-        self.assertIn("ln_duration_distribution", close_report.to_dict())
 
-    def test_phase_a_report_contains_design_gate_sections(self) -> None:
+    def test_phase_a_report_contains_v1_carry_generation_and_recovery_sections(self) -> None:
         vocab = MapperV1Vocab()
-        windows = [encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000)]
+        windows = [_window(vocab, _ts(vocab, 8000), write_start_ms=0, write_end_ms=8000)]
 
         report = build_phase_a_report(
             windows=windows,
@@ -90,59 +86,79 @@ class MapperV1AuditTests(unittest.TestCase):
 
         self.assertEqual(
             set(report),
-            {"window_filter", "tokenizer", "grammar", "density", "ln_close", "density_calibration", "gate_decision"},
+            {
+                "window_filter",
+                "carry",
+                "boundary_tokens",
+                "tokenizer",
+                "grammar",
+                "generation",
+                "recovery",
+                "density",
+                "ln_close",
+                "density_calibration",
+                "gate_decision",
+            },
         )
-        self.assertIn("drop_rate_by_difficulty", report["window_filter"])
-        self.assertIn("drop_rate_by_song", report["window_filter"])
-        self.assertIn("num_dropped_short_windows", report["window_filter"])
-        self.assertIn("short_drop_rate", report["window_filter"])
-        self.assertIn("cross_window_ln_drop_rate", report["window_filter"])
-        self.assertIn("invalid_time_delta_count", report["tokenizer"])
-        self.assertIn("noncanonical_time_shift_count", report["tokenizer"])
-        self.assertIn("invalid_event_count", report["tokenizer"])
-        self.assertIn("gold_mass_to_density_mae", report["density"])
+        self.assertIn("carry_reconstruction_failure_count", report["carry"])
+        self.assertIn("non_final_window_eos_count", report["boundary_tokens"])
+        self.assertIn("generated_carry_out_match_rate", report["generation"])
+        self.assertIn("recovery_batch_valid_fraction", report["recovery"])
         self.assertEqual(report["gate_decision"]["status"], "PASS")
-        self.assertEqual(report["gate_decision"]["tokenizer_status"], "PASS")
-        self.assertEqual(report["gate_decision"]["grammar_status"], "PASS")
 
     def test_phase_a_report_requires_filter_report_to_avoid_fabricated_drop_rates(self) -> None:
         vocab = MapperV1Vocab()
-        windows = [encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000)]
+        windows = [_window(vocab, _ts(vocab, 8000), write_start_ms=0, write_end_ms=8000)]
 
         with self.assertRaisesRegex(ValueError, "filter_report is required"):
             build_phase_a_report(windows=windows, vocab=vocab, filter_report=None)
 
-    def test_phase_a_report_carries_cross_window_ln_drop_counts_from_filter_report(self) -> None:
+    def test_boundary_audit_flags_legacy_per_window_eos(self) -> None:
         vocab = MapperV1Vocab()
-        windows = [encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000)]
-
-        report = build_phase_a_report(
-            windows=windows,
-            vocab=vocab,
-            filter_report=_filter_report(eligible_windows=1, dropped_cross_window_ln_windows=2),
+        legacy = _window(
+            vocab,
+            [vocab.bos_id, *_ts(vocab, 8000), vocab.eos_id],
+            write_start_ms=0,
+            write_end_ms=8000,
+            is_full_chart_start=True,
+            is_full_chart_end=False,
+            raw_tokens=True,
         )
 
-        self.assertEqual(report["window_filter"]["num_total_windows"], 3)
-        self.assertEqual(report["window_filter"]["num_dropped_cross_window_ln_windows"], 2)
-        self.assertEqual(report["tokenizer"]["num_windows"], 3)
-        self.assertEqual(report["tokenizer"]["num_dropped_cross_window_ln_windows"], 2)
+        boundary = audit_boundary_tokens([legacy], vocab=vocab)
+        decision = build_phase_a_gate_decision(
+            tokenizer={
+                "open_mask_nonzero_before_eos_count": 0,
+                "invalid_time_delta_count": 0,
+                "invalid_event_count": 0,
+                "noncanonical_time_shift_count": 0,
+            },
+            grammar={"violation_count": 0},
+            boundary=boundary,
+        )
+
+        self.assertEqual(boundary.window_start_bos_count, 1)
+        self.assertEqual(boundary.window_end_eos_count, 1)
+        self.assertEqual(boundary.non_final_window_eos_count, 1)
+        self.assertEqual(decision.boundary_status, "FAIL")
+        self.assertIn("non_final_window_eos_count > 0", decision.failure_reasons)
 
     def test_tokenizer_audit_counts_invalid_and_noncanonical_tokens(self) -> None:
         vocab = MapperV1Vocab()
-        base = encode_mapper_window([], vocab=vocab, write_start_ms=0, write_end_ms=8000)
         invalid_hold_end_event = vocab.encode_event(_actions(LaneAction.HOLD_END))
-        malformed = replace(
-            base,
-            target_ids=[
-                vocab.bos_id,
+        malformed = _window(
+            vocab,
+            [
                 vocab.time_shift_token_id(100),
                 vocab.time_shift_token_id(200),
                 invalid_hold_end_event,
                 vocab.time_shift_token_id(4000),
                 vocab.time_shift_token_id(4000),
                 vocab.time_shift_token_id(10),
-                vocab.eos_id,
             ],
+            write_start_ms=0,
+            write_end_ms=8000,
+            allow_invalid=True,
         )
 
         report = audit_tokenized_windows(
@@ -164,59 +180,198 @@ class MapperV1AuditTests(unittest.TestCase):
                 "noncanonical_time_shift_count": 3,
             },
             grammar={"violation_count": 4},
+            carry={"carry_reconstruction_failure_count": 5, "terminal_state_mismatch_count": 6},
+            boundary={"non_initial_window_bos_count": 7, "non_final_window_eos_count": 8},
+            generation={
+                "generated_invalid_token_count": 9,
+                "generated_dead_end_count": 10,
+                "generated_carry_out_mismatch_count": 11,
+            },
         )
 
         self.assertEqual(decision.status, "FAIL")
         self.assertEqual(decision.tokenizer_status, "FAIL")
         self.assertEqual(decision.grammar_status, "FAIL")
-        self.assertEqual(
-            decision.failure_reasons,
-            [
-                "invalid_time_delta_count > 0",
-                "invalid_event_count > 0",
-                "noncanonical_time_shift_count > 0",
-                "grammar violation_count > 0",
-            ],
-        )
+        self.assertEqual(decision.carry_status, "FAIL")
+        self.assertEqual(decision.boundary_status, "FAIL")
+        self.assertEqual(decision.generation_status, "FAIL")
+        self.assertIn("terminal_state_mismatch_count > 0", decision.failure_reasons)
+        self.assertIn("generated_carry_out_mismatch_count > 0", decision.failure_reasons)
 
-    def test_phase_a_report_fits_density_calibration_from_gold_tokens(self) -> None:
+    def test_generation_starts_from_carry_in_and_recovery_ce_uses_only_strict_matches(self) -> None:
         vocab = MapperV1Vocab()
-        windows = [
-            encode_mapper_window(
-                [
-                    MapperTimepoint(1000, _actions(LaneAction.TAP)),
-                    MapperTimepoint(1400, _actions(LaneAction.TAP, LaneAction.TAP)),
-                ],
-                vocab=vocab,
-                write_start_ms=0,
-                write_end_ms=8000,
-            ),
-            encode_mapper_window(
-                [
-                    MapperTimepoint(2000, _actions(LaneAction.HOLD_START)),
-                    MapperTimepoint(2400, _actions(LaneAction.HOLD_END)),
-                ],
-                vocab=vocab,
-                write_start_ms=0,
-                write_end_ms=8000,
-            ),
-        ]
-        gold_mass = torch.stack([scatter_tokenized_gold_onset_mass(window, vocab=vocab) for window in windows])
-        density_target = (0.2 + 0.7 * smooth_density_mass(gold_mass)).unsqueeze(-1)
-        density_confidence = torch.ones_like(density_target)
+        carry_in = LNCarryState.from_open_starts(1000, [500, None, None, None])
+        carry_out = LNCarryState.from_open_starts(9000, [500, None, None, None])
 
-        report = build_phase_a_report(
-            windows=windows,
+        generated = grammar_constrained_window_generation(
             vocab=vocab,
-            filter_report=_filter_report(eligible_windows=2),
-            density_target=density_target,
-            density_confidence=density_confidence,
+            write_start_ms=1000,
+            write_end_ms=9000,
+            ln_carry_in=carry_in,
+            ln_carry_out=carry_out,
+            left_context_tokens=[vocab.time_shift_token_id(500)],
+            max_tokens=4,
         )
 
-        self.assertAlmostEqual(report["density_calibration"]["scale"], 0.7, places=5)
-        self.assertAlmostEqual(report["density_calibration"]["bias"], 0.2, places=5)
-        self.assertLess(report["density"]["gold_mass_to_density_mae"], 1e-6)
-        self.assertLess(report["density"]["density_frame_mae"], 1e-6)
+        self.assertTrue(generated.completed)
+        self.assertEqual(generated.states_before[0], carry_in)
+        self.assertNotIn(vocab.eos_id, generated.tokens)
+        self.assertEqual(generated.terminal_state, carry_out)
+
+        gold_states = [carry_in, LNCarryState.closed(1000)]
+        logits = torch.zeros((2, vocab.size), dtype=torch.float32)
+        logits[0, vocab.time_shift_token_id(4000)] = 5.0
+        logits[1, vocab.time_shift_token_id(10)] = 5.0
+        recovery = short_rollout_recovery_ce(
+            logits=logits,
+            generated_states=[carry_in, LNCarryState.closed(2000)],
+            gold_states=gold_states,
+            gold_target_tokens=[vocab.time_shift_token_id(4000), vocab.time_shift_token_id(20)],
+        )
+
+        self.assertEqual(recovery.matched_count, 1)
+        self.assertEqual(recovery.mismatch_reasons["current_ms_mismatch"], 1)
+        self.assertGreater(float(recovery.loss.item()), 0.0)
+
+    def test_generation_final_chart_emits_eos_after_carry_completion(self) -> None:
+        vocab = MapperV1Vocab()
+
+        generated = grammar_constrained_window_generation(
+            vocab=vocab,
+            write_start_ms=0,
+            write_end_ms=8000,
+            ln_carry_in=LNCarryState.closed(0),
+            ln_carry_out=LNCarryState.closed(8000),
+            is_full_chart_start=True,
+            is_full_chart_end=True,
+            max_tokens=4,
+        )
+
+        self.assertTrue(generated.completed)
+        self.assertEqual(generated.tokens[-1], vocab.eos_id)
+        self.assertEqual(generated.states_before[-1], LNCarryState.closed(8000))
+
+    def test_carry_audit_accepts_tensor_backed_window_dict(self) -> None:
+        vocab = MapperV1Vocab()
+        window = _window(vocab, _ts(vocab, 8000), write_start_ms=0, write_end_ms=8000)
+        tensor_window = {
+            "write_start_ms": torch.tensor(window.write_start_ms, dtype=torch.long),
+            "write_end_ms": torch.tensor(window.write_end_ms, dtype=torch.long),
+            "target_fragment_tokens": torch.tensor(window.target_fragment_ids, dtype=torch.long),
+            "target_fragment_states": {
+                "current_ms": window.target_fragment_current_ms,
+            },
+            "ln_carry_in": {
+                "current_ms": torch.tensor(window.ln_carry_in.current_ms, dtype=torch.long),
+                "open_mask": torch.tensor(window.ln_carry_in.open_mask, dtype=torch.bool),
+                "open_start_ms": torch.full((4,), -1, dtype=torch.long),
+                "open_age_ms": torch.tensor(window.ln_carry_in.open_age_ms, dtype=torch.long),
+            },
+            "ln_carry_out": {
+                "current_ms": torch.tensor(window.ln_carry_out.current_ms, dtype=torch.long),
+                "open_mask": torch.tensor(window.ln_carry_out.open_mask, dtype=torch.bool),
+                "open_start_ms": torch.full((4,), -1, dtype=torch.long),
+                "open_age_ms": torch.tensor(window.ln_carry_out.open_age_ms, dtype=torch.long),
+            },
+        }
+
+        boundary = audit_boundary_tokens([tensor_window], vocab=vocab)
+        carry = audit_carry_windows([tensor_window], vocab=vocab)
+
+        self.assertEqual(boundary.non_initial_window_bos_count, 0)
+        self.assertEqual(carry.terminal_state_mismatch_count, 0)
+
+
+def _ts(vocab: MapperV1Vocab, delta_ms: int) -> list[int]:
+    return [vocab.time_shift_token_id(value) for value in vocab.decompose_time_shift_delta(delta_ms)]
+
+
+def _hold_window(vocab: MapperV1Vocab):
+    tokens = [
+        *_ts(vocab, 1000),
+        vocab.encode_event(_actions(LaneAction.HOLD_START)),
+        *_ts(vocab, 400),
+        vocab.encode_event(_actions(LaneAction.HOLD_END)),
+        *_ts(vocab, 6600),
+    ]
+    return _window(vocab, tokens, write_start_ms=0, write_end_ms=8000)
+
+
+def _window(
+    vocab: MapperV1Vocab,
+    tokens: list[int],
+    *,
+    write_start_ms: int,
+    write_end_ms: int,
+    ln_carry_in: LNCarryState | None = None,
+    ln_carry_out: LNCarryState | None = None,
+    is_full_chart_start: bool = False,
+    is_full_chart_end: bool = False,
+    raw_tokens: bool = False,
+    allow_invalid: bool = False,
+):
+    carry_in = LNCarryState.closed(write_start_ms) if ln_carry_in is None else ln_carry_in
+    carry_out = LNCarryState.closed(write_end_ms) if ln_carry_out is None else ln_carry_out
+    fragment = list(tokens)
+    if raw_tokens and fragment and fragment[0] == vocab.bos_id:
+        fragment = fragment[1:]
+    if raw_tokens and fragment and fragment[-1] == vocab.eos_id:
+        fragment = fragment[:-1]
+    try:
+        trace = replay_fragment_tokens(
+            fragment,
+            vocab=vocab,
+            write_start_ms=write_start_ms,
+            write_end_ms=write_end_ms,
+            ln_carry_in=carry_in,
+            ln_carry_out=carry_out,
+        )
+        states_before = trace.states_before
+    except ValueError:
+        if not allow_invalid:
+            raise
+        from train.stage_2.model_mapper_v1.generation import transition_carry_state
+
+        states_before = []
+        state = carry_in
+        for token_id in fragment:
+            states_before.append(state)
+            try:
+                state = transition_carry_state(
+                    state,
+                    token_id,
+                    vocab=vocab,
+                    write_start_ms=write_start_ms,
+                    write_end_ms=write_end_ms,
+                )
+            except ValueError:
+                pass
+    close_labels = torch.zeros((len(fragment), 4), dtype=torch.bool)
+    close_label_mask = torch.zeros((len(fragment), 4), dtype=torch.bool)
+    for index, state in enumerate(states_before):
+        close_label_mask[index] = torch.tensor(state.open_mask, dtype=torch.bool)
+        token_id = int(fragment[index])
+        if vocab.is_event_token(token_id):
+            for lane, action in enumerate(vocab.decode_event(token_id)):
+                close_labels[index, lane] = state.open_mask[lane] and action == LaneAction.HOLD_END
+    payload = {
+        "write_start_ms": write_start_ms,
+        "write_end_ms": write_end_ms,
+        "ln_carry_in": carry_in,
+        "ln_carry_out": carry_out,
+        "is_full_chart_start": is_full_chart_start,
+        "is_full_chart_end": is_full_chart_end,
+        "target_fragment_ids": fragment,
+        "target_fragment_current_ms": torch.tensor([state.current_ms for state in states_before], dtype=torch.long),
+        "target_fragment_open_mask": torch.tensor([state.open_mask for state in states_before], dtype=torch.bool),
+        "target_fragment_open_age_ms": torch.tensor([state.open_age_ms for state in states_before], dtype=torch.long),
+        "close_labels": close_labels,
+        "close_label_mask": close_label_mask,
+        "seq_len": len(fragment),
+    }
+    if raw_tokens:
+        payload["target_ids"] = list(tokens)
+    return SimpleNamespace(**payload)
 
 
 if __name__ == "__main__":

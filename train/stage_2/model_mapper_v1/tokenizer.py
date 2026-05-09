@@ -7,7 +7,14 @@ from typing import Any, Sequence
 
 import torch
 
-from .replay import ReplayError, close_labels_from_tokens, replay_state_tensors
+from .replay import (
+    LNCarryState,
+    ReplayError,
+    close_labels_from_tokens,
+    empty_ln_carry_state,
+    ln_carry_state_from_open_starts,
+    replay_state_tensors,
+)
 from .vocab import KEY_COUNT, LaneAction, MapperV1Vocab, coerce_lane_action
 
 
@@ -17,10 +24,6 @@ MAPPER_DENSITY_FRAME_MS = 20
 
 
 class MapperTokenizationError(ValueError):
-    pass
-
-
-class CrossWindowLongNoteError(MapperTokenizationError):
     pass
 
 
@@ -36,21 +39,65 @@ class MapperTimepoint:
 
 @dataclass(frozen=True)
 class TokenizedMapperWindow:
-    target_ids: list[int]
+    target_fragment_ids: list[int]
+    decoder_input_ids: list[int]
     write_start_ms: int
     write_end_ms: int
-    teacher_current_ms: torch.Tensor
-    teacher_open_mask: torch.Tensor
-    teacher_open_age_ms: torch.Tensor
+    is_full_chart_start: bool
+    is_full_chart_end: bool
+    ln_carry_in: LNCarryState
+    ln_carry_out: LNCarryState
+    target_fragment_current_ms: torch.Tensor
+    target_fragment_open_mask: torch.Tensor
+    target_fragment_open_start_ms: torch.Tensor
+    target_fragment_open_age_ms: torch.Tensor
     close_labels: torch.Tensor
     close_label_mask: torch.Tensor
 
     @property
     def seq_len(self) -> int:
-        return len(self.target_ids)
+        return len(self.target_fragment_ids)
 
-    def target_tensor(self) -> torch.Tensor:
-        return torch.tensor(self.target_ids, dtype=torch.long)
+    def target_fragment_tensor(self) -> torch.Tensor:
+        return torch.tensor(self.target_fragment_ids, dtype=torch.long)
+
+    def decoder_input_tensor(self) -> torch.Tensor:
+        return torch.tensor(self.decoder_input_ids, dtype=torch.long)
+
+
+def encode_full_chart_tokens(
+    timepoints: Sequence[MapperTimepoint | Any],
+    *,
+    vocab: MapperV1Vocab,
+    chart_start_ms: int = 0,
+    chart_end_ms: int | None = None,
+) -> list[int]:
+    chart_start_ms = int(chart_start_ms)
+    grouped = _group_timepoints(timepoints)
+    if chart_end_ms is None:
+        chart_end_ms = max([chart_start_ms, *(timepoint.time_ms for timepoint in grouped)])
+    chart_end_ms = int(chart_end_ms)
+    if chart_end_ms < chart_start_ms:
+        raise ValueError(f"chart_end_ms must be at or after chart_start_ms: {chart_start_ms}..{chart_end_ms}")
+
+    token_ids = [vocab.bos_id]
+    current_ms = chart_start_ms
+    for timepoint in grouped:
+        if timepoint.time_ms < chart_start_ms:
+            raise MapperTokenizationError(f"timepoint before chart_start_ms: {timepoint}")
+        if timepoint.time_ms > chart_end_ms:
+            raise MapperTokenizationError(f"timepoint after chart_end_ms: {timepoint}")
+        _require_10ms_grid(timepoint.time_ms)
+        delta_ms = timepoint.time_ms - current_ms
+        if delta_ms < 0:
+            raise MapperTokenizationError(f"timepoints must be nondecreasing after grouping: {grouped}")
+        token_ids.extend(vocab.time_shift_token_id(value) for value in vocab.decompose_time_shift_delta(delta_ms))
+        token_ids.append(vocab.encode_event(timepoint.lane_actions))
+        current_ms = timepoint.time_ms
+
+    token_ids.extend(vocab.time_shift_token_id(value) for value in vocab.decompose_time_shift_delta(chart_end_ms - current_ms))
+    token_ids.append(vocab.eos_id)
+    return token_ids
 
 
 def encode_mapper_window(
@@ -59,66 +106,152 @@ def encode_mapper_window(
     vocab: MapperV1Vocab,
     write_start_ms: int,
     write_end_ms: int,
+    chart_start_ms: int = 0,
+    chart_end_ms: int | None = None,
 ) -> TokenizedMapperWindow:
     write_start_ms = int(write_start_ms)
     write_end_ms = int(write_end_ms)
+    chart_start_ms = int(chart_start_ms)
     if write_end_ms <= write_start_ms:
         raise ValueError(f"write_end_ms must be after write_start_ms: {write_start_ms}..{write_end_ms}")
     if (write_end_ms - write_start_ms) % 10 != 0:
         raise ValueError("mapper write window must align to the 10ms grid")
+    if write_start_ms < chart_start_ms:
+        raise ValueError(f"write_start_ms must be at or after chart_start_ms: {write_start_ms} < {chart_start_ms}")
+    if chart_end_ms is not None and int(chart_end_ms) < write_end_ms:
+        raise ValueError(f"chart_end_ms must cover the write window: {chart_end_ms} < {write_end_ms}")
 
     grouped = _group_timepoints(timepoints)
-    target_ids = [vocab.bos_id]
-    current_ms = write_start_ms
-    for timepoint in grouped:
-        if not write_start_ms <= timepoint.time_ms < write_end_ms:
-            raise MapperTokenizationError(f"timepoint outside write window: {timepoint}")
-        if timepoint.time_ms % 10 != 0:
-            raise MapperTokenizationError(f"timepoint must be on the 10ms grid: {timepoint.time_ms}")
-        delta_ms = timepoint.time_ms - current_ms
-        if delta_ms < 0:
-            raise MapperTokenizationError(f"timepoints must be nondecreasing after grouping: {grouped}")
-        target_ids.extend(vocab.time_shift_token_id(value) for value in vocab.decompose_time_shift_delta(delta_ms))
-        target_ids.append(vocab.encode_event(timepoint.lane_actions))
-        current_ms = timepoint.time_ms
+    ln_carry_in = ln_carry_state_at(grouped, write_start_ms)
+    ln_carry_out = ln_carry_state_at(grouped, write_end_ms)
+    is_full_chart_start = write_start_ms == chart_start_ms
+    is_full_chart_end = chart_end_ms is not None and write_end_ms == int(chart_end_ms)
+    if is_full_chart_start and ln_carry_in != empty_ln_carry_state(write_start_ms):
+        raise MapperTokenizationError("full-chart start requires empty ln_carry_in")
+    if is_full_chart_end and any(ln_carry_out.open_mask):
+        raise MapperTokenizationError("full-chart end requires all long notes closed")
 
-    target_ids.extend(
-        vocab.time_shift_token_id(value)
-        for value in vocab.decompose_time_shift_delta(write_end_ms - current_ms)
+    fragment_timepoints = _fragment_timepoints(
+        grouped,
+        write_start_ms=write_start_ms,
+        write_end_ms=write_end_ms,
     )
-    target_ids.append(vocab.eos_id)
-
-    try:
-        state_tensors = replay_state_tensors(
-            target_ids,
-            vocab=vocab,
-            write_start_ms=write_start_ms,
-            write_end_ms=write_end_ms,
-        )
-    except ReplayError as exc:
-        message = str(exc)
-        if "HOLD_END is illegal on closed lane" in message:
-            raise CrossWindowLongNoteError(f"window requires carry-in LN state: {message}") from exc
-        if "EOS requires all lanes closed" in message or "TIME_SHIFT to write_end_ms while an LN is open" in message:
-            raise CrossWindowLongNoteError(f"window requires carry-out LN state: {message}") from exc
-        raise MapperTokenizationError(message) from exc
-
-    close_labels, close_label_mask = close_labels_from_tokens(
-        target_ids,
+    target_fragment_ids = _encode_fragment_tokens(
+        fragment_timepoints,
         vocab=vocab,
         write_start_ms=write_start_ms,
         write_end_ms=write_end_ms,
     )
+    if is_full_chart_end:
+        target_fragment_ids.append(vocab.eos_id)
+
+    first_decoder_input = (
+        vocab.bos_id
+        if is_full_chart_start
+        else final_full_chart_token_before(
+            grouped,
+            vocab=vocab,
+            chart_start_ms=chart_start_ms,
+            boundary_ms=write_start_ms,
+        )
+    )
+    decoder_input_ids = [first_decoder_input, *target_fragment_ids[:-1]]
+    if len(decoder_input_ids) != len(target_fragment_ids):
+        raise MapperTokenizationError("decoder input and target fragment lengths must match")
+
+    try:
+        state_tensors = replay_state_tensors(
+            target_fragment_ids,
+            vocab=vocab,
+            write_start_ms=write_start_ms,
+            write_end_ms=write_end_ms,
+            ln_carry_in=ln_carry_in,
+            ln_carry_out=ln_carry_out,
+            is_full_chart_end=is_full_chart_end,
+        )
+        close_labels, close_label_mask = close_labels_from_tokens(
+            target_fragment_ids,
+            vocab=vocab,
+            write_start_ms=write_start_ms,
+            write_end_ms=write_end_ms,
+            ln_carry_in=ln_carry_in,
+            ln_carry_out=ln_carry_out,
+            is_full_chart_end=is_full_chart_end,
+        )
+    except ReplayError as exc:
+        raise MapperTokenizationError(str(exc)) from exc
+
     return TokenizedMapperWindow(
-        target_ids=target_ids,
+        target_fragment_ids=target_fragment_ids,
+        decoder_input_ids=decoder_input_ids,
         write_start_ms=write_start_ms,
         write_end_ms=write_end_ms,
-        teacher_current_ms=state_tensors["current_ms"],
-        teacher_open_mask=state_tensors["open_mask"],
-        teacher_open_age_ms=state_tensors["open_age_ms"],
+        is_full_chart_start=is_full_chart_start,
+        is_full_chart_end=is_full_chart_end,
+        ln_carry_in=ln_carry_in,
+        ln_carry_out=ln_carry_out,
+        target_fragment_current_ms=state_tensors["current_ms"],
+        target_fragment_open_mask=state_tensors["open_mask"],
+        target_fragment_open_start_ms=state_tensors["open_start_ms"],
+        target_fragment_open_age_ms=state_tensors["open_age_ms"],
         close_labels=close_labels,
         close_label_mask=close_label_mask,
     )
+
+
+def ln_carry_state_at(timepoints: Sequence[MapperTimepoint | Any], boundary_ms: int) -> LNCarryState:
+    boundary_ms = int(boundary_ms)
+    open_start_ms: list[int | None] = [None] * KEY_COUNT
+    for timepoint in _group_timepoints(timepoints):
+        if timepoint.time_ms >= boundary_ms:
+            break
+        for lane, action in enumerate(timepoint.lane_actions):
+            if action == LaneAction.HOLD_START:
+                if open_start_ms[lane] is not None:
+                    raise MapperTokenizationError(f"HOLD_START on open lane {lane} at {timepoint.time_ms}ms")
+                open_start_ms[lane] = timepoint.time_ms
+            elif action == LaneAction.HOLD_END:
+                if open_start_ms[lane] is None:
+                    raise MapperTokenizationError(f"HOLD_END on closed lane {lane} at {timepoint.time_ms}ms")
+                open_start_ms[lane] = None
+            elif action == LaneAction.TAP and open_start_ms[lane] is not None:
+                raise MapperTokenizationError(f"TAP on open lane {lane} at {timepoint.time_ms}ms")
+    return ln_carry_state_from_open_starts(boundary_ms, open_start_ms)
+
+
+def final_full_chart_token_before(
+    timepoints: Sequence[MapperTimepoint | Any],
+    *,
+    vocab: MapperV1Vocab,
+    chart_start_ms: int,
+    boundary_ms: int,
+) -> int:
+    chart_start_ms = int(chart_start_ms)
+    boundary_ms = int(boundary_ms)
+    if boundary_ms < chart_start_ms:
+        raise ValueError(f"boundary_ms must be at or after chart_start_ms: {boundary_ms} < {chart_start_ms}")
+    if boundary_ms == chart_start_ms:
+        return vocab.bos_id
+
+    current_ms = chart_start_ms
+    final_token = vocab.bos_id
+    for timepoint in _group_timepoints(timepoints):
+        if timepoint.time_ms < chart_start_ms:
+            raise MapperTokenizationError(f"timepoint before chart_start_ms: {timepoint}")
+        if timepoint.time_ms >= boundary_ms:
+            break
+        _require_10ms_grid(timepoint.time_ms)
+        delta_ms = timepoint.time_ms - current_ms
+        if delta_ms < 0:
+            raise MapperTokenizationError(f"timepoints must be nondecreasing: {timepoints}")
+        for value in vocab.decompose_time_shift_delta(delta_ms):
+            final_token = vocab.time_shift_token_id(value)
+        final_token = vocab.encode_event(timepoint.lane_actions)
+        current_ms = timepoint.time_ms
+
+    for value in vocab.decompose_time_shift_delta(boundary_ms - current_ms):
+        final_token = vocab.time_shift_token_id(value)
+    return final_token
 
 
 def window_timepoints(
@@ -174,59 +307,63 @@ def tokenize_hitobjects_window(
     vocab: MapperV1Vocab,
     write_start_ms: int,
     write_end_ms: int,
+    chart_start_ms: int = 0,
+    chart_end_ms: int | None = None,
 ) -> TokenizedMapperWindow:
-    timepoints = hitobjects_to_mapper_timepoints(hitobjects)
-    reason = cross_window_ln_state_reason(
-        timepoints,
-        write_start_ms=write_start_ms,
-        write_end_ms=write_end_ms,
-    )
-    if reason is not None:
-        raise CrossWindowLongNoteError(f"window requires {reason} LN state")
     return encode_mapper_window(
-        window_timepoints(
-            timepoints,
-            write_start_ms=write_start_ms,
-            write_end_ms=write_end_ms,
-        ),
+        hitobjects_to_mapper_timepoints(hitobjects),
         vocab=vocab,
         write_start_ms=write_start_ms,
         write_end_ms=write_end_ms,
+        chart_start_ms=chart_start_ms,
+        chart_end_ms=chart_end_ms,
     )
-
-
-def cross_window_ln_state_reason(
-    timepoints: Sequence[MapperTimepoint | Any],
-    *,
-    write_start_ms: int,
-    write_end_ms: int,
-) -> str | None:
-    """Return the V1 carry-state reason that makes a mapper window ineligible."""
-
-    grouped = _group_timepoints(timepoints)
-    open_mask = [False] * KEY_COUNT
-    for timepoint in grouped:
-        if timepoint.time_ms >= int(write_start_ms):
-            break
-        _apply_timepoint_to_open_mask(open_mask, timepoint)
-    if any(open_mask):
-        return "carry-in"
-
-    for timepoint in grouped:
-        if timepoint.time_ms < int(write_start_ms):
-            continue
-        if timepoint.time_ms >= int(write_end_ms):
-            break
-        _apply_timepoint_to_open_mask(open_mask, timepoint)
-    if any(open_mask):
-        return "carry-out"
-    return None
 
 
 def quantize_10ms_half_up(time_ms: float) -> int:
     if time_ms < 0:
         raise ValueError(f"cannot quantize negative time: {time_ms}")
     return int(10 * math.floor((time_ms + 5) / 10))
+
+
+def _encode_fragment_tokens(
+    timepoints: Sequence[MapperTimepoint],
+    *,
+    vocab: MapperV1Vocab,
+    write_start_ms: int,
+    write_end_ms: int,
+) -> list[int]:
+    token_ids: list[int] = []
+    current_ms = int(write_start_ms)
+    for timepoint in timepoints:
+        if not int(write_start_ms) <= timepoint.time_ms < int(write_end_ms):
+            raise MapperTokenizationError(f"timepoint outside write window: {timepoint}")
+        _require_10ms_grid(timepoint.time_ms)
+        delta_ms = timepoint.time_ms - current_ms
+        if delta_ms < 0:
+            raise MapperTokenizationError(f"timepoints must be nondecreasing after grouping: {timepoints}")
+        token_ids.extend(vocab.time_shift_token_id(value) for value in vocab.decompose_time_shift_delta(delta_ms))
+        token_ids.append(vocab.encode_event(timepoint.lane_actions))
+        current_ms = timepoint.time_ms
+
+    token_ids.extend(vocab.time_shift_token_id(value) for value in vocab.decompose_time_shift_delta(int(write_end_ms) - current_ms))
+    return token_ids
+
+
+def _fragment_timepoints(
+    timepoints: Sequence[MapperTimepoint],
+    *,
+    write_start_ms: int,
+    write_end_ms: int,
+) -> list[MapperTimepoint]:
+    fragment: list[MapperTimepoint] = []
+    for timepoint in timepoints:
+        if timepoint.time_ms < int(write_start_ms):
+            continue
+        if timepoint.time_ms >= int(write_end_ms):
+            break
+        fragment.append(timepoint)
+    return fragment
 
 
 def _group_timepoints(timepoints: Sequence[MapperTimepoint | Any]) -> list[MapperTimepoint]:
@@ -269,15 +406,6 @@ def _merge_lane_primitive_actions(actions: Sequence[LaneAction], *, time_ms: int
     )
 
 
-def _apply_timepoint_to_open_mask(open_mask: list[bool], timepoint: MapperTimepoint) -> None:
-    for lane, action in enumerate(timepoint.lane_actions):
-        if action == LaneAction.HOLD_START:
-            if open_mask[lane]:
-                raise MapperTokenizationError(f"HOLD_START on open lane {lane} at {timepoint.time_ms}ms")
-            open_mask[lane] = True
-        elif action == LaneAction.HOLD_END:
-            if not open_mask[lane]:
-                raise MapperTokenizationError(f"HOLD_END on closed lane {lane} at {timepoint.time_ms}ms")
-            open_mask[lane] = False
-        elif action == LaneAction.TAP and open_mask[lane]:
-            raise MapperTokenizationError(f"TAP on open lane {lane} at {timepoint.time_ms}ms")
+def _require_10ms_grid(time_ms: int) -> None:
+    if int(time_ms) % 10 != 0:
+        raise MapperTokenizationError(f"timepoint must be on the 10ms grid: {time_ms}")

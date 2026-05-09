@@ -80,7 +80,7 @@ class StatePriorAdapter(nn.Module):
         self.adapter_scale = nn.Parameter(torch.tensor(float(adapter_scale_init), dtype=torch.float32))
         self.lane_embedding = nn.Embedding(KEY_COUNT, lane_embedding_dim)
         self.age_embedding = nn.Embedding(self.num_age_buckets, age_embedding_dim)
-        input_dim = 3 + lane_embedding_dim + age_embedding_dim
+        input_dim = 5 + lane_embedding_dim + age_embedding_dim
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
@@ -100,16 +100,21 @@ class StatePriorAdapter(nn.Module):
         open_mask: torch.Tensor,
         open_age_ms: torch.Tensor,
         remaining_ms: torch.Tensor,
+        open_start_ms: torch.Tensor | None = None,
+        write_start_ms: torch.Tensor | int = 0,
     ) -> StatePriorAdapterOutput:
-        open_mask, open_age_ms, remaining_ms = _validate_lane_state_inputs(
+        open_mask, open_start_ms, open_age_ms, remaining_ms = _validate_lane_state_inputs(
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             remaining_ms=remaining_ms,
         )
         features = self._state_features(
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             remaining_ms=remaining_ms,
+            write_start_ms=write_start_ms,
         )
         raw_bias = self.net(features)
         lane_action_bias = self.adapter_scale.to(dtype=raw_bias.dtype) * self.max_bias * torch.tanh(
@@ -132,12 +137,21 @@ class StatePriorAdapter(nn.Module):
         self,
         *,
         open_mask: torch.Tensor,
+        open_start_ms: torch.Tensor,
         open_age_ms: torch.Tensor,
         remaining_ms: torch.Tensor,
+        write_start_ms: torch.Tensor | int,
     ) -> torch.Tensor:
         batch_size, steps, _ = open_mask.shape
         device = open_mask.device
         open_float = open_mask.to(dtype=torch.float32).unsqueeze(-1)
+        write_start = _broadcast_window_tensor(write_start_ms, batch_size=batch_size, device=device)
+        start_known = (open_mask & (open_start_ms >= 0)).to(dtype=torch.float32).unsqueeze(-1)
+        start_rel = (
+            (open_start_ms.to(dtype=torch.float32) - write_start.reshape(batch_size, 1, 1).to(dtype=torch.float32))
+            / float(self.remaining_cap_ms)
+        ).clamp(-1.0, 1.0)
+        start_rel = torch.where(open_mask, start_rel, torch.zeros_like(start_rel)).unsqueeze(-1)
         age_norm = (open_age_ms.to(dtype=torch.float32) / float(self.age_cap_ms)).clamp(0.0, 1.0)
         age_bucket = torch.floor(age_norm * float(self.num_age_buckets - 1)).to(dtype=torch.long)
         remaining_norm = (
@@ -151,6 +165,8 @@ class StatePriorAdapter(nn.Module):
         return torch.cat(
             (
                 open_float,
+                start_known,
+                start_rel,
                 age_norm.unsqueeze(-1),
                 remaining_feature,
                 lane_feature,
@@ -203,7 +219,7 @@ class LNCloseAdapter(nn.Module):
         self.skip_scale = float(skip_scale)
         self.lane_embedding = nn.Embedding(KEY_COUNT, lane_embedding_dim)
         self.age_embedding = nn.Embedding(self.num_age_buckets, age_embedding_dim)
-        input_dim = 2 * self.d_model + 4 + lane_embedding_dim + age_embedding_dim
+        input_dim = 2 * self.d_model + 6 + lane_embedding_dim + age_embedding_dim
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
@@ -233,9 +249,11 @@ class LNCloseAdapter(nn.Module):
         open_mask: torch.Tensor,
         open_age_ms: torch.Tensor,
         remaining_ms: torch.Tensor,
+        open_start_ms: torch.Tensor | None = None,
     ) -> LNCloseAdapterOutput:
-        open_mask, open_age_ms, remaining_ms = _validate_lane_state_inputs(
+        open_mask, open_start_ms, open_age_ms, remaining_ms = _validate_lane_state_inputs(
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             remaining_ms=remaining_ms,
         )
@@ -271,8 +289,10 @@ class LNCloseAdapter(nn.Module):
             local_control=local_control,
             local_density=local_density,
             open_mask=open_mask,
+            open_start_ms=open_start_ms,
             open_age_ms=open_age_ms,
             remaining_ms=remaining_ms,
+            write_start_ms=write_start_ms,
         )
         close_logits = self.net(features).squeeze(-1)
         close_bias = self.close_scale * torch.tanh(close_logits)
@@ -329,12 +349,24 @@ class LNCloseAdapter(nn.Module):
         local_control: torch.Tensor,
         local_density: torch.Tensor,
         open_mask: torch.Tensor,
+        open_start_ms: torch.Tensor,
         open_age_ms: torch.Tensor,
         remaining_ms: torch.Tensor,
+        write_start_ms: torch.Tensor | int,
     ) -> torch.Tensor:
         batch_size, steps, _ = decoder_hidden.shape
         device = decoder_hidden.device
         open_float = open_mask.to(dtype=decoder_hidden.dtype).unsqueeze(-1)
+        write_start = _broadcast_window_tensor(write_start_ms, batch_size=batch_size, device=device)
+        start_known = (open_mask & (open_start_ms >= 0)).to(dtype=decoder_hidden.dtype).unsqueeze(-1)
+        start_rel = (
+            (
+                open_start_ms.to(device=device, dtype=decoder_hidden.dtype)
+                - write_start.reshape(batch_size, 1, 1).to(dtype=decoder_hidden.dtype)
+            )
+            / float(self.remaining_cap_ms)
+        ).clamp(-1.0, 1.0)
+        start_rel = torch.where(open_mask, start_rel, torch.zeros_like(start_rel)).unsqueeze(-1)
         age_norm = (open_age_ms.to(dtype=decoder_hidden.dtype) / float(self.age_cap_ms)).clamp(0.0, 1.0)
         age_bucket = torch.floor(age_norm * float(self.num_age_buckets - 1)).to(dtype=torch.long)
         remaining_norm = (
@@ -354,6 +386,8 @@ class LNCloseAdapter(nn.Module):
                 control_feature,
                 density_feature,
                 open_float,
+                start_known,
+                start_rel,
                 age_norm.unsqueeze(-1),
                 remaining_feature,
                 lane_feature,
@@ -533,18 +567,27 @@ def _register_event_projection_buffers(module: nn.Module, vocab: MapperV1Vocab) 
 def _validate_lane_state_inputs(
     *,
     open_mask: torch.Tensor,
+    open_start_ms: torch.Tensor | None,
     open_age_ms: torch.Tensor,
     remaining_ms: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if open_mask.ndim != 3 or int(open_mask.shape[-1]) != KEY_COUNT:
         raise ValueError(f"open_mask must have shape [B,T,{KEY_COUNT}], got {tuple(open_mask.shape)}")
     if tuple(open_age_ms.shape) != tuple(open_mask.shape):
         raise ValueError(f"open_age_ms must have shape {tuple(open_mask.shape)}, got {tuple(open_age_ms.shape)}")
+    if open_start_ms is None:
+        open_start_ms = torch.where(
+            open_mask.to(dtype=torch.bool),
+            -open_age_ms.to(dtype=torch.long),
+            torch.full_like(open_age_ms, -1),
+        )
+    elif tuple(open_start_ms.shape) != tuple(open_mask.shape):
+        raise ValueError(f"open_start_ms must have shape {tuple(open_mask.shape)}, got {tuple(open_start_ms.shape)}")
     if remaining_ms.ndim == 3 and int(remaining_ms.shape[-1]) == 1:
         remaining_ms = remaining_ms.squeeze(-1)
     if tuple(remaining_ms.shape) != tuple(open_mask.shape[:2]):
         raise ValueError(f"remaining_ms must have shape {tuple(open_mask.shape[:2])}, got {tuple(remaining_ms.shape)}")
-    return open_mask.to(dtype=torch.bool), open_age_ms, remaining_ms
+    return open_mask.to(dtype=torch.bool), open_start_ms.to(dtype=torch.long), open_age_ms, remaining_ms
 
 
 def _broadcast_window_tensor(value: torch.Tensor | int, *, batch_size: int, device: torch.device) -> torch.Tensor:
