@@ -92,6 +92,7 @@ class MapperV1WindowDataset(Dataset):
         mapper_record_cache_path: str | Path | None = None,
         control_teacher_cache_dir: str | Path | None = None,
         require_control_teacher_cache: bool = False,
+        include_full_song_context: bool = False,
         progress: bool = False,
         **control_dataset_kwargs: Any,
     ) -> None:
@@ -108,6 +109,7 @@ class MapperV1WindowDataset(Dataset):
         self.mapper_record_cache_path = None if mapper_record_cache_path is None else Path(mapper_record_cache_path)
         self.control_teacher_cache_dir = None if control_teacher_cache_dir is None else Path(control_teacher_cache_dir)
         self.require_control_teacher_cache = bool(require_control_teacher_cache)
+        self.include_full_song_context = bool(include_full_song_context)
         self._timepoints_by_beatmap: dict[str, tuple] = {}
         cached_records = self._load_cached_records(progress=progress)
         if cached_records is None:
@@ -278,20 +280,29 @@ class MapperV1WindowDataset(Dataset):
             "is_full_chart_end": torch.tensor(tokenized.is_full_chart_end, dtype=torch.bool),
             "metadata": metadata,
         }
+        density_target_8s, density_confidence_8s = extract_mapper_density_8s(
+            self._load_control_v3_target_8s(record),
+        )
         if cache_entry is not None:
-            density_target_8s, density_confidence_8s = extract_mapper_density_8s(
-                self._load_control_v3_target_8s(record),
-            )
             sample["control_memory_8s"] = cache_entry["control_memory_8s"]
             sample["density_teacher_8s"] = cache_entry["density_teacher_8s"]
             sample["density_target_8s"] = density_target_8s
             sample["density_confidence_8s"] = density_confidence_8s
+            if self.include_full_song_context:
+                sample.update(self._load_full_song_context_fields(mapper_record, record))
             return sample
 
+        sample.update(self._load_full_song_context_fields(mapper_record, record))
+        sample["density_target_8s"] = density_target_8s
+        sample["density_confidence_8s"] = density_confidence_8s
+        return sample
+
+    def _load_full_song_context_fields(
+        self,
+        mapper_record: MapperV1WindowRecord,
+        record: ControlWindowRecord,
+    ) -> dict[str, Any]:
         base_sample = self.control_dataset[mapper_record.control_record_index]
-        density_target_8s, density_confidence_8s = extract_mapper_density_8s(
-            self._load_control_v3_target_8s(record),
-        )
         source_frame_count = int(base_sample["frame_count"].item())
         write_start_frame = int(base_sample["target_start_frame"].item())
         write_end_frame = write_start_frame + MAPPER_WRITE_FRAMES
@@ -312,30 +323,25 @@ class MapperV1WindowDataset(Dataset):
         )
         context_frame_indexes = torch.arange(MAPPER_CONTEXT_FRAMES, dtype=torch.long) + write_start_frame
         context_padding_mask = context_frame_indexes >= source_frame_count
-        sample.update(
-            {
-                "full_mel": full_mel,
-                "full_dense_timing_v2": full_dense_timing_v2,
-                "frame_count": torch.tensor(inference_frame_count, dtype=torch.long),
-                "source_frame_count": torch.tensor(source_frame_count, dtype=torch.long),
-                "target_start_frame": base_sample["target_start_frame"],
-                "control_slice_start_frames": torch.tensor(
-                    [
-                        record.target_start_frame + offset
-                        for offset in range(0, MAPPER_WRITE_FRAMES, TARGET_WINDOW_LENGTH_FRAMES)
-                    ],
-                    dtype=torch.long,
-                ),
-                "mel_context": full_mel[write_start_frame:write_end_frame].contiguous(),
-                "timing_context": full_dense_timing_v2[write_start_frame:write_end_frame].contiguous(),
-                "context_padding_mask": context_padding_mask,
-                "difficulty": base_sample["difficulty"].reshape(1),
-                "normalized_difficulty": base_sample["normalized_difficulty"].reshape(1),
-                "density_target_8s": density_target_8s,
-                "density_confidence_8s": density_confidence_8s,
-            }
-        )
-        return sample
+        return {
+            "full_mel": full_mel,
+            "full_dense_timing_v2": full_dense_timing_v2,
+            "frame_count": torch.tensor(inference_frame_count, dtype=torch.long),
+            "source_frame_count": torch.tensor(source_frame_count, dtype=torch.long),
+            "target_start_frame": torch.as_tensor(base_sample["target_start_frame"], dtype=torch.long),
+            "control_slice_start_frames": torch.tensor(
+                [
+                    record.target_start_frame + offset
+                    for offset in range(0, MAPPER_WRITE_FRAMES, TARGET_WINDOW_LENGTH_FRAMES)
+                ],
+                dtype=torch.long,
+            ),
+            "mel_context": full_mel[write_start_frame:write_end_frame].contiguous(),
+            "timing_context": full_dense_timing_v2[write_start_frame:write_end_frame].contiguous(),
+            "context_padding_mask": context_padding_mask,
+            "difficulty": base_sample["difficulty"].reshape(1),
+            "normalized_difficulty": base_sample["normalized_difficulty"].reshape(1),
+        }
 
     def control_teacher_cache_path(self, record: ControlWindowRecord) -> Path | None:
         if self.control_teacher_cache_dir is None:
@@ -603,7 +609,11 @@ def extract_mapper_density_8s(control_v3_target_8s: torch.Tensor) -> tuple[torch
 def is_mapper_v1_window_start_allowed(record: ControlWindowRecord, *, mapper_stride_frames: int = MAPPER_WRITE_FRAMES) -> bool:
     if mapper_stride_frames <= 0:
         raise ValueError(f"mapper_stride_frames must be positive: {mapper_stride_frames}")
-    return int(record.target_start_frame) % int(mapper_stride_frames) == 0
+    target_start_frame = int(record.target_start_frame)
+    if target_start_frame % int(mapper_stride_frames) == 0:
+        return True
+    terminal_start_frame = max(0, int(record.frame_count) - MAPPER_WRITE_FRAMES)
+    return target_start_frame == terminal_start_frame
 
 
 def mapper_v1_padded_frame_count(record: ControlWindowRecord) -> int:
@@ -919,12 +929,13 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         "full_mel" in sample and "full_dense_timing_v2" in sample and "frame_count" in sample
         for sample in samples
     )
-    if has_control_inputs and not all(has_control_teacher_cache):
-        batch["mel_context"] = torch.stack([sample["mel_context"].to(dtype=torch.float32) for sample in samples])
-        batch["timing_context"] = torch.stack([sample["timing_context"].to(dtype=torch.float32) for sample in samples])
-        batch["context_padding_mask"] = torch.stack(
-            [sample["context_padding_mask"].to(dtype=torch.bool) for sample in samples]
-        )
+    if has_control_inputs:
+        if all("mel_context" in sample and "timing_context" in sample and "context_padding_mask" in sample for sample in samples):
+            batch["mel_context"] = torch.stack([sample["mel_context"].to(dtype=torch.float32) for sample in samples])
+            batch["timing_context"] = torch.stack([sample["timing_context"].to(dtype=torch.float32) for sample in samples])
+            batch["context_padding_mask"] = torch.stack(
+                [sample["context_padding_mask"].to(dtype=torch.bool) for sample in samples]
+            )
         frame_counts = [int(sample["frame_count"].item()) for sample in samples]
         source_frame_counts = [int(sample["source_frame_count"].item()) for sample in samples]
         max_frame_count = max(frame_counts)
@@ -953,6 +964,10 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         batch["padding_mask"] = padding_mask
         batch["frame_count"] = torch.tensor(frame_counts, dtype=torch.long)
         batch["source_frame_count"] = torch.tensor(source_frame_counts, dtype=torch.long)
+        if all("target_start_frame" in sample for sample in samples):
+            batch["target_start_frame"] = torch.stack(
+                [torch.as_tensor(sample["target_start_frame"], dtype=torch.long) for sample in samples],
+            ).reshape(batch_size)
         if all("control_slice_start_frames" in sample for sample in samples):
             batch["control_slice_start_frames"] = torch.stack(
                 [sample["control_slice_start_frames"].to(dtype=torch.long) for sample in samples],

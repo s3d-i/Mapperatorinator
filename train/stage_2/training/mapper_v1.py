@@ -6,7 +6,7 @@ import pickle
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -135,6 +135,8 @@ MAPPER_BATCH_TENSOR_KEYS = frozenset(
         "full_dense_timing_v2",
         "padding_mask",
         "frame_count",
+        "source_frame_count",
+        "target_start_frame",
         "control_slice_start_frames",
     )
 )
@@ -1276,6 +1278,8 @@ def _loss_for_raw_batch(
         full_dense_timing_v2=batch.get("full_dense_timing_v2"),
         padding_mask=batch.get("padding_mask"),
         frame_count=batch.get("frame_count"),
+        source_frame_count=batch.get("source_frame_count"),
+        target_start_frame=batch.get("target_start_frame"),
         control_slice_start_frames=batch.get("control_slice_start_frames"),
     )
     return compute_phase_b_loss(
@@ -1360,6 +1364,9 @@ def _run_training(
     dataset_report: Mapping[str, Any],
     init_from_control_checkpoint: Path | None,
     init_from_mapper_checkpoint: Path | None,
+    model_factory: Callable[[MapperV1Config, ControlDemoGlobalEncoder | None], MapperV1Model] | None = None,
+    mapper_checkpoint_initializer: Callable[..., Mapping[str, Any]] | None = None,
+    progress_label: str = "mapper_v1_phase_b",
 ) -> ControlTrainingResult:
     _validate_training_args(
         max_steps=max_steps,
@@ -1386,9 +1393,15 @@ def _run_training(
                 control_encoder,
                 init_from_control_checkpoint,
             )
-    model = MapperV1Model(model_config, control_encoder=control_encoder)
+    if model_factory is None:
+        model = MapperV1Model(model_config, control_encoder=control_encoder)
+    else:
+        model = model_factory(model_config, control_encoder)
     if init_from_mapper_checkpoint is not None:
-        initialization_report = initialize_mapper_v1_from_mapper_checkpoint(
+        initializer = initialize_mapper_v1_from_mapper_checkpoint
+        if mapper_checkpoint_initializer is not None:
+            initializer = mapper_checkpoint_initializer
+        initialization_report = initializer(
             model,
             init_from_mapper_checkpoint,
             expected_model_config=model_config,
@@ -1424,7 +1437,7 @@ def _run_training(
             completed_since_start = max(step - log_start_step, 1)
             steps_per_s = completed_since_start / max(elapsed_s, 1e-9)
             print(
-                f"mapper_v1_phase_b_progress step={step}/{max_steps} "
+                f"{progress_label}_progress step={step}/{max_steps} "
                 f"loss={last_train_metrics['loss/total']:.6f} "
                 f"elapsed_s={elapsed_s:.1f} steps_per_s={steps_per_s:.3f}",
                 flush=True,
@@ -1441,7 +1454,7 @@ def _run_training(
                 history_entry["train_eval"] = _json_metrics(final_train_metrics)
             history.append(history_entry)
             print(
-                f"mapper_v1_phase_b_eval step={step}/{max_steps} "
+                f"{progress_label}_eval step={step}/{max_steps} "
                 f"loss={final_eval_metrics.get('loss/total', float('nan')):.6f}",
                 flush=True,
             )

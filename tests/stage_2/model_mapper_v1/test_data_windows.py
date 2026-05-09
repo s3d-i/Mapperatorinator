@@ -17,6 +17,7 @@ from train.stage_2.data.mapper_v1_windows import (
     control_teacher_cache_path,
     control_teacher_slice_batch,
     extract_mapper_density_8s,
+    is_mapper_v1_window_start_allowed,
     load_control_teacher_cache_entry,
     save_control_teacher_cache_entry,
 )
@@ -119,7 +120,7 @@ class MapperV1DataWindowTests(unittest.TestCase):
         self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["3.00"], 1.0)
         self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["4.00"], 0.0)
 
-    def test_mapper_dataset_keeps_non_stride_terminal_full_windows(self) -> None:
+    def test_mapper_dataset_keeps_stride_and_explicit_terminal_windows(self) -> None:
         records = [
             _record("stride.osu", difficulty=4.0, frame_count=700, target_start_frame=0),
             _record("terminal.osu", difficulty=4.0, frame_count=700, target_start_frame=300),
@@ -130,10 +131,27 @@ class MapperV1DataWindowTests(unittest.TestCase):
 
         self.assertEqual(
             [record.control_record.beatmap_path for record in dataset.records],
-            [Path("stride.osu"), Path("short_terminal.osu")],
+            [Path("stride.osu"), Path("terminal.osu"), Path("short_terminal.osu")],
         )
-        self.assertEqual(dataset.filter_report.num_total_windows, 2)
+        self.assertEqual(dataset.filter_report.num_total_windows, 3)
         self.assertEqual(dataset.filter_report.num_dropped_short_windows, 0)
+
+    def test_mapper_window_start_gate_allows_terminal_padding_start(self) -> None:
+        self.assertTrue(
+            is_mapper_v1_window_start_allowed(
+                _record("stride.osu", difficulty=4.0, frame_count=900, target_start_frame=400),
+            ),
+        )
+        self.assertTrue(
+            is_mapper_v1_window_start_allowed(
+                _record("terminal.osu", difficulty=4.0, frame_count=900, target_start_frame=500),
+            ),
+        )
+        self.assertFalse(
+            is_mapper_v1_window_start_allowed(
+                _record("middle.osu", difficulty=4.0, frame_count=900, target_start_frame=300),
+            ),
+        )
 
     def test_mapper_record_cache_reuses_minimal_record_parquet_when_metadata_matches(self) -> None:
         records = [

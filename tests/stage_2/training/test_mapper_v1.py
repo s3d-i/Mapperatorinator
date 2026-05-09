@@ -619,21 +619,25 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
-            self.assertEqual(result.total_entries, 2)
-            self.assertEqual(result.computed_entries, 2)
+            self.assertEqual(result.total_entries, 3)
+            self.assertEqual(result.computed_entries, 3)
             entry = load_control_teacher_cache_entry(
                 control_teacher_cache_path(cache_dir, records[0]),
                 record=records[0],
             )
             self.assertEqual(tuple(entry["control_memory_8s"].shape), (400, 2))
-            self.assertFalse(control_teacher_cache_path(cache_dir, records[1]).exists())
+            terminal_entry = load_control_teacher_cache_entry(
+                control_teacher_cache_path(cache_dir, records[1]),
+                record=records[1],
+            )
+            self.assertEqual(tuple(terminal_entry["control_memory_8s"].shape), (400, 2))
             self.assertFalse(control_teacher_cache_path(cache_dir, records[2]).exists())
             short_entry = load_control_teacher_cache_entry(
                 control_teacher_cache_path(cache_dir, records[3]),
                 record=records[3],
             )
             self.assertEqual(tuple(short_entry["control_memory_8s"].shape), (400, 2))
-            self.assertIn(([500, 800], [300, 300]), encoder.padding_mask_observations)
+            self.assertIn(([800], [300]), encoder.padding_mask_observations)
 
 
 class _TinyControlDataset:

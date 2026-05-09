@@ -1,5 +1,5 @@
 ---
-pinned_commit: b1039d0634e1dec63d5d2f67ea96b8845dfe6a61
+pinned_commit: 607ffdf17d203ff1860817c6d68d769adcb14adb
 status: current blockers before mapper architecture upgrade
 date: 2026-05-09
 owner: s3d-i
@@ -13,43 +13,29 @@ architecture upgrade.
 
 ## Summary
 
-The current mapper is still a teacher-forced Phase B model. It trains against
-tokenized 8s windows with cached control-teacher memory, but it does not yet
-have a rollout evaluation loop that validates generated windows under the same
-grammar and long-note carry constraints used by inference.
+The current mapper is a teacher-forced Phase B model. It trains against
+tokenized 8s windows with cached control-teacher memory and already has the
+essential V1 supervised targets needed for V2 teacher-forced training.
 
-The main blockers are:
+The main V2 blockers are:
 
-1. teacher-forcing-only evaluation;
-2. stale mapper window index generation that misses terminal song windows;
-3. a design mismatch between the mapper decoder and available global song
+1. terminal mapper window coverage needs a first-class index/data contract;
+2. a design mismatch between the mapper decoder and available global song
    information.
 
-## 1. Teacher Forcing Only
+Rollout evaluation remains useful, especially for long-note generation quality,
+but it is not a Mapper V2 design dependency for now.
+
+## 1. Teacher Forcing Status
 
 Current training and evaluation are teacher forced. Metrics report performance
 on gold-prefix fragments, not autoregressive rollouts.
 
-Rollout evaluation is intentionally not the default yet because long-note close
-behavior is high risk. A model that looks acceptable under teacher forcing can
-still drift during generation, miss close events, close on the wrong lane, or
-enter a state where the hard grammar has no good next token. This matters more
-for mapper v1 than a simple event model because LN carry state crosses token
-and window boundaries.
+For Mapper V2 design, keep the V1 teacher-forced target contract: fragment
+tokens, target states, carry-in/out, close labels, density targets, density
+confidence, cached local control memory, and hard grammar masks.
 
-Before treating mapper metrics as reliable, add rollout evaluation that checks:
-
-- exact window completion;
-- legal grammar-constrained generation;
-- LN carry-in and carry-out consistency;
-- close timing and lane correctness;
-- dead-end and max-token failure rates;
-- generated density and section-shape drift.
-
-Until then, teacher-forced loss is only a training signal, not evidence that the
-model can generate stable charts.
-
-## 2. Current Window Index Is Stale
+## 2. Terminal Window Coverage
 
 The current mapper window index was generated before
 `9d5f1a324e5211d7a73d75f3d7bd3ed1c7627c68`.
@@ -65,7 +51,12 @@ windows to an existing index. That is useful evidence of the issue, but the next
 training run should not depend on patching a stale artifact as the long-term
 contract.
 
-We need a new mapper index design that explicitly defines:
+The mapper architecture and sample path are compatible with padded 8s windows.
+The critical data requirement is that the mapper window-selection gate admits
+explicit terminal windows instead of filtering them out before the padding path
+runs.
+
+We still need a new mapper index design that explicitly defines:
 
 - fixed 8s stride windows for normal coverage;
 - terminal windows for non-8s-aligned song endings;
@@ -74,8 +65,8 @@ We need a new mapper index design that explicitly defines:
 - LN carry-in and carry-out reconstruction at every selected window boundary;
 - cache keys and reports that make index provenance auditable.
 
-The new index should be regenerated from the source map index and should make
-terminal coverage part of the first-class generation logic.
+The new index should be regenerated from the source map index, and terminal
+coverage should be part of the first-class generation logic.
 
 ## 3. Mapper Global Context Mismatch
 
