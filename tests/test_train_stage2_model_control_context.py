@@ -48,7 +48,7 @@ class Stage2ControlContextTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_start_frame"):
             prepare_control_context_batch(batch)
 
-    def test_context_honors_padding_mask_but_target_mask_uses_frame_count_formula(self) -> None:
+    def test_context_and_target_mask_honor_padding_mask(self) -> None:
         batch = _full_song_batch(frame_counts=[600], target_starts=[250])
         batch["padding_mask"][0, 10] = True
         batch["padding_mask"][0, 260] = True
@@ -61,7 +61,7 @@ class Stage2ControlContextTests(unittest.TestCase):
 
         self.assertTrue(out["context_padding_mask"][0, 10].item())
         self.assertEqual(float(out["context_mel"][0, 10, 0].item()), 0.0)
-        self.assertTrue(out["target_valid_mask"][0, 10].item())
+        self.assertFalse(out["target_valid_mask"][0, 10].item())
 
     def test_rejects_fractional_frame_index_tensors(self) -> None:
         batch = _full_song_batch(frame_counts=[600], target_starts=[250])

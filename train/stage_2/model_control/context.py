@@ -92,7 +92,11 @@ def prepare_control_context_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
             context_padding_mask[batch_index, destination] = False
 
     target_offsets = torch.arange(TARGET_WINDOW_LENGTH_FRAMES, dtype=torch.long, device=full_mel.device)
-    target_valid_mask = target_start_frame.unsqueeze(1) + target_offsets.unsqueeze(0) < frame_count.unsqueeze(1)
+    target_frames = target_start_frame.unsqueeze(1) + target_offsets.unsqueeze(0)
+    target_in_frame_count = target_frames < frame_count.unsqueeze(1)
+    safe_target_frames = target_frames.clamp(min=0, max=max(int(full_mel.shape[1]) - 1, 0))
+    target_unpadded = ~padding_mask.gather(1, safe_target_frames)
+    target_valid_mask = target_in_frame_count & target_unpadded
 
     prepared = dict(batch)
     prepared["context_mel"] = context_mel

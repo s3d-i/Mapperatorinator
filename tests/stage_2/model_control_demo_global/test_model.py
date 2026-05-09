@@ -100,13 +100,13 @@ class ControlDemoGlobalModelTests(unittest.TestCase):
             )
         )
 
-    def test_rejects_padding_mask_that_does_not_match_frame_count(self) -> None:
+    def test_rejects_padding_mask_that_leaves_frame_count_tail_unmasked(self) -> None:
         model = ControlDemoGlobalEncoder(_global_behavior_config())
         batch_size = 2
         full_frames = 1000
         bad_padding_mask = torch.zeros(batch_size, full_frames, dtype=torch.bool)
 
-        with self.assertRaisesRegex(ValueError, "padding_mask.*frame_count"):
+        with self.assertRaisesRegex(ValueError, "padding_mask.*frame_count tail"):
             model(
                 context_mel=torch.zeros(batch_size, 600, 160),
                 context_dense_timing_v2=torch.zeros(batch_size, 600, 4),
@@ -118,6 +118,28 @@ class ControlDemoGlobalModelTests(unittest.TestCase):
                 frame_count=torch.tensor([1000, 700], dtype=torch.long),
                 target_start_frame=torch.tensor([400, 300], dtype=torch.long),
             )
+
+    def test_allows_masked_valid_window_before_padded_frame_count(self) -> None:
+        model = ControlDemoGlobalEncoder(_global_behavior_config())
+        model.eval()
+        full_frames = 800
+        padding_mask = torch.zeros(1, full_frames, dtype=torch.bool)
+        padding_mask[:, 450:800] = True
+
+        with torch.no_grad():
+            output = model(
+                context_mel=torch.zeros(1, 600, 160),
+                context_dense_timing_v2=torch.zeros(1, 600, 4),
+                normalized_difficulty=torch.tensor([0.0]),
+                context_padding_mask=torch.zeros(1, 600, dtype=torch.bool),
+                full_mel=torch.zeros(1, full_frames, 160),
+                full_dense_timing_v2=torch.zeros(1, full_frames, 4),
+                padding_mask=padding_mask,
+                frame_count=torch.tensor([800], dtype=torch.long),
+                target_start_frame=torch.tensor([400], dtype=torch.long),
+            )
+
+        self.assertEqual(output.memory_padding_mask.shape, (1, 600))
 
     def test_masked_full_song_tail_does_not_affect_output(self) -> None:
         torch.manual_seed(19)

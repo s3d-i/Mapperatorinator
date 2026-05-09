@@ -74,6 +74,7 @@ class MapperV1DataWindowTests(unittest.TestCase):
         sample["full_mel"] = torch.zeros(500, 160, dtype=torch.float32)
         sample["full_dense_timing_v2"] = torch.zeros(500, 4, dtype=torch.float32)
         sample["frame_count"] = torch.tensor(500, dtype=torch.long)
+        sample["source_frame_count"] = torch.tensor(500, dtype=torch.long)
         sample["control_slice_start_frames"] = torch.tensor([0, 100, 200, 300], dtype=torch.long)
         batch = collate_mapper_v1_windows([sample], pad_id=vocab.pad_id)
 
@@ -120,16 +121,49 @@ class MapperV1DataWindowTests(unittest.TestCase):
         records = [
             _record("stride.osu", difficulty=4.0, frame_count=700, target_start_frame=0),
             _record("terminal.osu", difficulty=4.0, frame_count=700, target_start_frame=300),
-            _record("non_terminal.osu", difficulty=4.0, frame_count=700, target_start_frame=100),
+            _record("short_terminal.osu", difficulty=4.0, frame_count=700, target_start_frame=400),
         ]
 
         dataset = _MapperDatasetWithUnsupportedActions(records, unsupported_paths=set())
 
         self.assertEqual(
             [record.control_record.beatmap_path for record in dataset.records],
-            [Path("stride.osu"), Path("terminal.osu")],
+            [Path("stride.osu"), Path("short_terminal.osu")],
         )
         self.assertEqual(dataset.filter_report.num_total_windows, 2)
+        self.assertEqual(dataset.filter_report.num_dropped_short_windows, 0)
+
+    def test_mapper_dataset_pads_short_terminal_window_features(self) -> None:
+        record = _record("tail.osu", difficulty=4.0, frame_count=450, target_start_frame=400)
+        dataset = _MapperDatasetWithFullInputs([record])
+
+        sample = dataset[0]
+
+        self.assertEqual(tuple(sample["full_mel"].shape), (800, 160))
+        self.assertEqual(tuple(sample["full_dense_timing_v2"].shape), (800, 4))
+        self.assertTrue(torch.equal(sample["full_mel"][:450], torch.ones(450, 160)))
+        self.assertTrue(torch.equal(sample["full_mel"][450:], torch.zeros(350, 160)))
+        self.assertTrue(torch.equal(sample["full_dense_timing_v2"][:450], torch.ones(450, 4)))
+        self.assertTrue(torch.equal(sample["full_dense_timing_v2"][450:], torch.zeros(350, 4)))
+        self.assertEqual(int(sample["frame_count"].item()), 800)
+        self.assertEqual(int(sample["source_frame_count"].item()), 450)
+        self.assertEqual(tuple(sample["mel_context"].shape), (400, 160))
+        self.assertTrue(torch.equal(sample["timing_context"][:50], torch.ones(50, 4)))
+        self.assertTrue(torch.equal(sample["timing_context"][50:], torch.zeros(350, 4)))
+        self.assertFalse(sample["context_padding_mask"][:50].any().item())
+        self.assertTrue(sample["context_padding_mask"][50:].all().item())
+        self.assertEqual(sample["control_slice_start_frames"].tolist(), [400, 500, 600, 700])
+        self.assertEqual(sample["metadata"]["source_frame_count"], 450)
+        self.assertEqual(sample["metadata"]["inference_frame_count"], 800)
+
+        batch = collate_mapper_v1_windows([sample], pad_id=MapperV1Vocab().pad_id)
+        self.assertEqual(batch["frame_count"].tolist(), [800])
+        self.assertEqual(batch["source_frame_count"].tolist(), [450])
+        self.assertFalse(batch["padding_mask"][0, :450].any().item())
+        self.assertTrue(batch["padding_mask"][0, 450:].all().item())
+        control_batch = control_teacher_slice_batch(batch, 1)
+        self.assertEqual(control_batch["target_start_frame"].tolist(), [500])
+        self.assertFalse(control_batch["target_valid_mask"].any().item())
 
     def test_control_teacher_cache_hit_skips_full_control_inputs_and_collates_teacher(self) -> None:
         record = _record("cached.osu", difficulty=4.0)
@@ -263,6 +297,35 @@ class _RaisingControlDataset:
 class _MapperDatasetWithControlTeacherCache(MapperV1WindowDataset):
     def __init__(self, records: list[ControlWindowRecord], *, cache_dir: Path) -> None:
         super().__init__(control_dataset=_RaisingControlDataset(records), control_teacher_cache_dir=cache_dir)
+
+    def _load_timepoints(self, beatmap_path: Path) -> tuple:
+        return ()
+
+
+class _FullInputControlDataset:
+    def __init__(self, records: list[ControlWindowRecord]) -> None:
+        self.records = records
+
+    def __getitem__(self, index: int):
+        record = self.records[index]
+        return {
+            "full_mel": torch.ones(record.frame_count, 160, dtype=torch.float32),
+            "full_dense_timing_v2": torch.ones(record.frame_count, 4, dtype=torch.float32),
+            "frame_count": torch.tensor(record.frame_count, dtype=torch.long),
+            "target_start_frame": torch.tensor(record.target_start_frame, dtype=torch.long),
+            "difficulty": torch.tensor(record.difficulty, dtype=torch.float32),
+            "normalized_difficulty": torch.tensor(0.0, dtype=torch.float32),
+        }
+
+    def target_loader(self, record: ControlWindowRecord) -> torch.Tensor:
+        target = torch.zeros(100, len(MODEL_FEATURE_NAMES), dtype=torch.float32)
+        target[:, MODEL_FEATURE_NAMES.index("density_confidence")] = 1.0
+        return target
+
+
+class _MapperDatasetWithFullInputs(MapperV1WindowDataset):
+    def __init__(self, records: list[ControlWindowRecord]) -> None:
+        super().__init__(control_dataset=_FullInputControlDataset(records))
 
     def _load_timepoints(self, beatmap_path: Path) -> tuple:
         return ()

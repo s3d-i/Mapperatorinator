@@ -8,7 +8,7 @@ from train.stage_2.data.build_mapper_v1_end_window_index import build_mapper_v1_
 
 
 class BuildMapperV1EndWindowIndexTests(unittest.TestCase):
-    def test_adds_only_missing_terminal_full_windows(self) -> None:
+    def test_adds_only_missing_terminal_stride_windows(self) -> None:
         source_df = pd.DataFrame.from_records(
             [
                 _row("a.osu", frame_count=900, target_start_frame=0),
@@ -35,12 +35,14 @@ class BuildMapperV1EndWindowIndexTests(unittest.TestCase):
 
         self.assertEqual(report.source_rows, 5)
         self.assertEqual(report.added_end_window_rows, 1)
-        self.assertEqual(report.existing_end_window_rows, 1)
+        self.assertEqual(report.existing_end_window_rows, 2)
         self.assertEqual(report.maps_shorter_than_write_window, 1)
         self.assertEqual(len(output_df), 6)
         added = output_df[(output_df["beatmap_path"] == "a.osu") & (output_df["target_start_frame"] == 500)]
+        self.assertEqual(len(added), 0)
+        added = output_df[(output_df["beatmap_path"] == "a.osu") & (output_df["target_start_frame"] == 800)]
         self.assertEqual(len(added), 1)
-        self.assertEqual(int(added.iloc[0]["target_start_ms"]), 10_000)
+        self.assertEqual(int(added.iloc[0]["target_start_ms"]), 16_000)
         self.assertEqual(len(output_df[(output_df["beatmap_path"] == "b.osu") & (output_df["target_start_frame"] == 400)]), 1)
 
 

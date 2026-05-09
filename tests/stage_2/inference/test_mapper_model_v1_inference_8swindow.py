@@ -99,20 +99,28 @@ class MapperModelV1Inference8sWindowTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "did not complete the exact 8s window"):
             _ensure_completed_generation(generated)
 
-    def test_prepare_feature_batch_rejects_short_audio(self) -> None:
-        short_mel = np.zeros((399, 160), dtype=np.float32)
+    def test_prepare_feature_batch_pads_short_audio_to_8s(self) -> None:
+        short_mel = np.ones((399, 160), dtype=np.float32)
 
         with patch(
             "train.stage_2.inference.mapper_model_v1_inference_8swindow.load_full_song_packed_mel_20ms",
             return_value=short_mel,
         ):
-            with self.assertRaisesRegex(ValueError, "requires at least 400 packed 20ms frames"):
-                prepare_feature_batch(
-                    audio_path=Path("short.mp3"),
-                    difficulty=4.0,
-                    timing_config=TimingConfig(mode="constant"),
-                    device=torch.device("cpu"),
-                )
+            batch = prepare_feature_batch(
+                audio_path=Path("short.mp3"),
+                difficulty=4.0,
+                timing_config=TimingConfig(mode="constant"),
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(batch.source_frame_count, 399)
+        self.assertEqual(batch.inference_frame_count, 400)
+        self.assertEqual(tuple(batch.full_mel.shape), (1, 400, 160))
+        self.assertTrue(torch.equal(batch.full_mel[0, :399], torch.ones(399, 160)))
+        self.assertTrue(torch.equal(batch.full_mel[0, 399:], torch.zeros(1, 160)))
+        self.assertEqual(batch.frame_count.tolist(), [400])
+        self.assertFalse(batch.padding_mask[0, :399].any().item())
+        self.assertTrue(batch.padding_mask[0, 399:].all().item())
 
     def test_seeded_generator_uses_inference_device(self) -> None:
         generator = _make_generation_generator(123, device=torch.device("cpu"))

@@ -69,7 +69,7 @@ def _padding_mask_from_frame_count(
     return frame_index >= frame_count.to(device=device, dtype=torch.long).unsqueeze(1)
 
 
-def _validate_padding_mask_matches_frame_count(
+def _validate_padding_mask_covers_frame_count_tail(
     *,
     padding_mask: torch.Tensor,
     frame_count: torch.Tensor,
@@ -83,15 +83,12 @@ def _validate_padding_mask_matches_frame_count(
         raise ValueError("frame_count must be positive")
     if bool(torch.any(frame_count > max_frames)):
         raise ValueError("frame_count cannot exceed full-song tensor length")
-    expected_padding_mask = _padding_mask_from_frame_count(
-        frame_count=frame_count,
-        max_frames=max_frames,
-        device=padding_mask.device,
-    )
-    if not torch.equal(padding_mask, expected_padding_mask):
+    frame_index = torch.arange(max_frames, device=padding_mask.device).unsqueeze(0)
+    beyond_frame_count = frame_index >= frame_count.to(device=padding_mask.device, dtype=torch.long).unsqueeze(1)
+    if bool((beyond_frame_count & ~padding_mask).any()):
         raise ValueError(
-            "padding_mask must exactly match frame_count: frames before frame_count "
-            "must be unmasked and frames at or beyond frame_count must be masked"
+            "padding_mask must cover frame_count tail: frames at or beyond frame_count "
+            "must be masked"
         )
 
 
@@ -470,11 +467,6 @@ class ControlDemoGlobalEncoder(nn.Module):
             assert padding_mask is not None
             assert frame_count is not None
             assert target_start_frame is not None
-            padding_mask = _padding_mask_from_frame_count(
-                frame_count=frame_count,
-                max_frames=full_mel.shape[1],
-                device=full_mel.device,
-            )
             global_memory, global_padding_mask, global_summary = self.global_encoder(
                 full_mel=full_mel,
                 full_dense_timing_v2=full_dense_timing_v2,
@@ -616,7 +608,7 @@ class ControlDemoGlobalEncoder(nn.Module):
             raise ValueError("padding_mask must be on the same device as full_mel")
         if frame_count.device != full_mel.device or target_start_frame.device != full_mel.device:
             raise ValueError("frame metadata tensors must be on the same device as full_mel")
-        _validate_padding_mask_matches_frame_count(
+        _validate_padding_mask_covers_frame_count_tail(
             padding_mask=padding_mask,
             frame_count=frame_count,
         )

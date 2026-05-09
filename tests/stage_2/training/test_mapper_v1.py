@@ -57,7 +57,7 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         self.assertIn("checkpoint_step_001250.pt", density_eos_config["init_from_mapper_checkpoint"])
         self.assertIn("plus_end.parquet", density_eos_config["index_path"])
         self.assertGreater(density_eos_config["loss"]["lambda_density"], 0.0)
-        self.assertTrue(density_eos_config["precompute_control_teacher_cache"])
+        self.assertFalse(density_eos_config["precompute_control_teacher_cache"])
 
     def test_phase_b_loss_config_allows_density_enablement(self) -> None:
         config = MapperV1PhaseBLossConfig(lambda_density=0.01)
@@ -581,10 +581,11 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_dir = Path(temp_dir) / "cache"
+            encoder = _TinyControlTeacherEncoder(control_dim=2)
             result = precompute_phase_b_control_teacher_cache_from_control_dataset(
                 _TinyControlDataset(records),
                 cache_dir=cache_dir,
-                control_encoder=_TinyControlTeacherEncoder(control_dim=2),
+                control_encoder=encoder,
                 batch_size=2,
                 device=torch.device("cpu"),
             )
@@ -596,13 +597,14 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                 record=records[0],
             )
             self.assertEqual(tuple(entry["control_memory_8s"].shape), (400, 2))
-            terminal_entry = load_control_teacher_cache_entry(
-                control_teacher_cache_path(cache_dir, records[1]),
-                record=records[1],
-            )
-            self.assertEqual(tuple(terminal_entry["control_memory_8s"].shape), (400, 2))
+            self.assertFalse(control_teacher_cache_path(cache_dir, records[1]).exists())
             self.assertFalse(control_teacher_cache_path(cache_dir, records[2]).exists())
-            self.assertFalse(control_teacher_cache_path(cache_dir, records[3]).exists())
+            short_entry = load_control_teacher_cache_entry(
+                control_teacher_cache_path(cache_dir, records[3]),
+                record=records[3],
+            )
+            self.assertEqual(tuple(short_entry["control_memory_8s"].shape), (400, 2))
+            self.assertIn(([500, 800], [300, 300]), encoder.padding_mask_observations)
 
 
 class _TinyControlDataset:
@@ -668,10 +670,19 @@ class _TinyControlTeacherEncoder(nn.Module):
         super().__init__()
         self.control_dim = int(control_dim)
         self.batch_sizes: list[int] = []
+        self.padding_true_counts: list[list[int]] = []
+        self.padding_mask_observations: list[tuple[list[int], list[int]]] = []
 
     def forward(self, *, context_mel: torch.Tensor, target_start_frame: torch.Tensor | None = None, **kwargs):
         batch_size, frames = context_mel.shape[:2]
         self.batch_sizes.append(batch_size)
+        padding_mask = kwargs.get("padding_mask")
+        if isinstance(padding_mask, torch.Tensor):
+            padding_true_counts = padding_mask.to(dtype=torch.long).sum(dim=1).tolist()
+            self.padding_true_counts.append(padding_true_counts)
+            frame_count = kwargs.get("frame_count")
+            if isinstance(frame_count, torch.Tensor):
+                self.padding_mask_observations.append((frame_count.to(dtype=torch.long).tolist(), padding_true_counts))
         control_memory = torch.zeros(batch_size, frames, self.control_dim, dtype=context_mel.dtype, device=context_mel.device)
         if target_start_frame is not None:
             control_memory[:, :, 0] = target_start_frame.to(device=context_mel.device, dtype=context_mel.dtype).reshape(-1, 1)

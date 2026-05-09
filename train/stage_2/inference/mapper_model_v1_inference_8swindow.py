@@ -286,13 +286,14 @@ def prepare_feature_batch(
     packed_mel = load_full_song_packed_mel_20ms(audio_path)
     packed_mel = _as_2d_float32(packed_mel, channels=160, name="packed_mel")
     source_frame_count = int(packed_mel.shape[0])
-    if source_frame_count < MAPPER_DENSITY_FRAMES:
+    if source_frame_count <= 0:
         raise ValueError(
-            "mapper v1 8s inference requires at least 400 packed 20ms frames "
-            f"(8.0s) for this milestone, got {source_frame_count}",
+            "mapper v1 8s inference requires at least one packed 20ms frame, "
+            f"got {source_frame_count}",
         )
-    inference_frame_count = source_frame_count
-    full_mel = packed_mel
+    inference_frame_count = max(source_frame_count, MAPPER_DENSITY_FRAMES)
+    full_mel = np.zeros((inference_frame_count, packed_mel.shape[1]), dtype=np.float32)
+    full_mel[:source_frame_count] = packed_mel
 
     timing_grid = build_timing_grid(audio_path=audio_path, timing_config=timing_config)
     dense_timing = render_dense_timing_v2(
@@ -302,10 +303,13 @@ def prepare_feature_batch(
     )
     dense_timing = _as_2d_float32(dense_timing, channels=4, name="dense_timing_v2")
 
+    padding_mask = torch.zeros((1, inference_frame_count), dtype=torch.bool, device=device)
+    padding_mask[:, source_frame_count:] = True
+
     return PreparedFeatureBatch(
         full_mel=torch.as_tensor(full_mel, dtype=torch.float32, device=device).unsqueeze(0),
         full_dense_timing_v2=torch.as_tensor(dense_timing, dtype=torch.float32, device=device).unsqueeze(0),
-        padding_mask=torch.zeros((1, inference_frame_count), dtype=torch.bool, device=device),
+        padding_mask=padding_mask,
         frame_count=torch.tensor([inference_frame_count], dtype=torch.long, device=device),
         control_slice_start_frames=torch.tensor([[0, 100, 200, 300]], dtype=torch.long, device=device),
         timing_grid=timing_grid,

@@ -60,8 +60,10 @@ def build_mapper_v1_end_window_index(
     map_df = source_df.drop_duplicates(subset=map_columns, keep="first").copy()
     map_df["frame_count"] = pd.to_numeric(map_df["frame_count"], errors="raise").astype("int64")
     short_mask = map_df["frame_count"] < int(write_window_frames)
-    eligible_maps = map_df.loc[~short_mask].copy()
-    eligible_maps["target_start_frame"] = eligible_maps["frame_count"] - int(write_window_frames)
+    eligible_maps = map_df.copy()
+    eligible_maps["target_start_frame"] = (
+        (eligible_maps["frame_count"] - 1) // int(write_window_frames)
+    ) * int(write_window_frames)
     eligible_maps["target_start_ms"] = eligible_maps["target_start_frame"] * int(FRAME_HOP_MS)
 
     key_columns = [*map_columns, "target_start_frame"]

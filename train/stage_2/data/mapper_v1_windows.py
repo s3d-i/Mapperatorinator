@@ -128,6 +128,8 @@ class MapperV1WindowDataset(Dataset):
             "beatmap_path": record.beatmap_path.as_posix(),
             "audio_path": record.audio_path.as_posix(),
             "difficulty": record.difficulty,
+            "source_frame_count": record.frame_count,
+            "inference_frame_count": mapper_v1_padded_frame_count(record),
             "target_start_frame": record.target_start_frame,
             "target_start_ms": record.target_start_ms,
             "control_record_index": mapper_record.control_record_index,
@@ -172,18 +174,32 @@ class MapperV1WindowDataset(Dataset):
         density_target_8s, density_confidence_8s = extract_mapper_density_8s(
             self._load_control_v3_target_8s(record),
         )
-        frame_count = int(base_sample["frame_count"].item())
+        source_frame_count = int(base_sample["frame_count"].item())
         write_start_frame = int(base_sample["target_start_frame"].item())
         write_end_frame = write_start_frame + MAPPER_WRITE_FRAMES
-        if write_end_frame > frame_count:
-            raise ValueError(f"mapper write span exceeds frame_count: {write_end_frame} > {frame_count}")
-        full_mel = base_sample["full_mel"]
-        full_dense_timing_v2 = base_sample["full_dense_timing_v2"]
+        inference_frame_count = max(source_frame_count, write_end_frame)
+        full_mel = pad_mapper_v1_feature_frames(
+            base_sample["full_mel"],
+            inference_frame_count=inference_frame_count,
+            expected_source_frame_count=source_frame_count,
+            expected_channels=160,
+            name="full_mel",
+        )
+        full_dense_timing_v2 = pad_mapper_v1_feature_frames(
+            base_sample["full_dense_timing_v2"],
+            inference_frame_count=inference_frame_count,
+            expected_source_frame_count=source_frame_count,
+            expected_channels=4,
+            name="full_dense_timing_v2",
+        )
+        context_frame_indexes = torch.arange(MAPPER_CONTEXT_FRAMES, dtype=torch.long) + write_start_frame
+        context_padding_mask = context_frame_indexes >= source_frame_count
         sample.update(
             {
-                "full_mel": base_sample["full_mel"],
-                "full_dense_timing_v2": base_sample["full_dense_timing_v2"],
-                "frame_count": base_sample["frame_count"],
+                "full_mel": full_mel,
+                "full_dense_timing_v2": full_dense_timing_v2,
+                "frame_count": torch.tensor(inference_frame_count, dtype=torch.long),
+                "source_frame_count": torch.tensor(source_frame_count, dtype=torch.long),
                 "target_start_frame": base_sample["target_start_frame"],
                 "control_slice_start_frames": torch.tensor(
                     [
@@ -194,7 +210,7 @@ class MapperV1WindowDataset(Dataset):
                 ),
                 "mel_context": full_mel[write_start_frame:write_end_frame].contiguous(),
                 "timing_context": full_dense_timing_v2[write_start_frame:write_end_frame].contiguous(),
-                "context_padding_mask": torch.zeros(MAPPER_CONTEXT_FRAMES, dtype=torch.bool),
+                "context_padding_mask": context_padding_mask,
                 "difficulty": base_sample["difficulty"].reshape(1),
                 "normalized_difficulty": base_sample["normalized_difficulty"].reshape(1),
                 "density_target_8s": density_target_8s,
@@ -252,10 +268,6 @@ class MapperV1WindowDataset(Dataset):
             total_windows += 1
             difficulty_key = _difficulty_report_key(record.difficulty)
             song_key = record.beatmap_path.as_posix()
-            if record.target_start_frame + MAPPER_WRITE_FRAMES > record.frame_count:
-                dropped_short += 1
-                maybe_print_progress(index)
-                continue
             valid_length_windows += 1
             valid_by_difficulty[difficulty_key] = valid_by_difficulty.get(difficulty_key, 0) + 1
             valid_by_song[song_key] = valid_by_song.get(song_key, 0) + 1
@@ -304,6 +316,7 @@ class MapperV1WindowDataset(Dataset):
     def _tokenize_record(self, record: ControlWindowRecord) -> TokenizedMapperWindow:
         write_start_ms = record.target_start_ms
         write_end_ms = write_start_ms + MAPPER_WRITE_MS
+        chart_end_ms = max(int(record.frame_count) * FRAME_HOP_MS, write_end_ms)
         timepoints = self._load_timepoints(record.beatmap_path)
         return encode_mapper_window(
             timepoints,
@@ -311,7 +324,7 @@ class MapperV1WindowDataset(Dataset):
             write_start_ms=write_start_ms,
             write_end_ms=write_end_ms,
             chart_start_ms=0,
-            chart_end_ms=int(record.frame_count) * FRAME_HOP_MS,
+            chart_end_ms=chart_end_ms,
         )
 
     def _load_timepoints(self, beatmap_path: Path) -> tuple:
@@ -356,9 +369,54 @@ def extract_mapper_density_8s(control_v3_target_8s: torch.Tensor) -> tuple[torch
 def is_mapper_v1_window_start_allowed(record: ControlWindowRecord, *, mapper_stride_frames: int = MAPPER_WRITE_FRAMES) -> bool:
     if mapper_stride_frames <= 0:
         raise ValueError(f"mapper_stride_frames must be positive: {mapper_stride_frames}")
-    if int(record.target_start_frame) % int(mapper_stride_frames) == 0:
-        return True
-    return int(record.target_start_frame) + MAPPER_WRITE_FRAMES == int(record.frame_count)
+    return int(record.target_start_frame) % int(mapper_stride_frames) == 0
+
+
+def mapper_v1_padded_frame_count(record: ControlWindowRecord) -> int:
+    return max(int(record.frame_count), int(record.target_start_frame) + MAPPER_WRITE_FRAMES)
+
+
+def validate_mapper_v1_feature_frames(
+    value: Any,
+    *,
+    expected_frame_count: int,
+    expected_channels: int,
+    name: str,
+) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32)
+    expected_shape = (int(expected_frame_count), int(expected_channels))
+    if tuple(tensor.shape) != expected_shape:
+        raise ValueError(f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}")
+    if not torch.isfinite(tensor).all():
+        raise ValueError(f"{name} must contain only finite values")
+    return tensor.contiguous()
+
+
+def pad_mapper_v1_feature_frames(
+    value: Any,
+    *,
+    inference_frame_count: int,
+    expected_source_frame_count: int,
+    expected_channels: int,
+    name: str,
+) -> torch.Tensor:
+    tensor = validate_mapper_v1_feature_frames(
+        value,
+        expected_frame_count=int(expected_source_frame_count),
+        expected_channels=int(expected_channels),
+        name=name,
+    )
+    inference_frame_count = int(inference_frame_count)
+    if inference_frame_count < int(expected_source_frame_count):
+        raise ValueError(
+            f"inference_frame_count must cover source frames: "
+            f"{inference_frame_count} < {expected_source_frame_count}"
+        )
+    if inference_frame_count == int(expected_source_frame_count):
+        return tensor.contiguous()
+    padded = tensor.new_zeros((inference_frame_count, int(expected_channels)))
+    padded[: int(expected_source_frame_count)] = tensor
+    return padded.contiguous()
 
 
 def control_teacher_cache_key(record: ControlWindowRecord) -> str:
@@ -634,12 +692,19 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
             [sample["context_padding_mask"].to(dtype=torch.bool) for sample in samples]
         )
         frame_counts = [int(sample["frame_count"].item()) for sample in samples]
+        source_frame_counts = [int(sample["source_frame_count"].item()) for sample in samples]
         max_frame_count = max(frame_counts)
         full_mel = torch.zeros((batch_size, max_frame_count, 160), dtype=torch.float32)
         full_dense_timing_v2 = torch.zeros((batch_size, max_frame_count, 4), dtype=torch.float32)
         padding_mask = torch.ones((batch_size, max_frame_count), dtype=torch.bool)
         for batch_index, sample in enumerate(samples):
             frame_count = frame_counts[batch_index]
+            source_frame_count = source_frame_counts[batch_index]
+            if source_frame_count > frame_count:
+                raise ValueError(
+                    f"source_frame_count sample {batch_index} cannot exceed frame_count: "
+                    f"{source_frame_count} > {frame_count}"
+                )
             sample_full_mel = sample["full_mel"].to(dtype=torch.float32)
             sample_full_dense_timing_v2 = sample["full_dense_timing_v2"].to(dtype=torch.float32)
             if tuple(sample_full_mel.shape) != (frame_count, 160):
@@ -648,11 +713,12 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
                 raise ValueError(f"full_dense_timing_v2 sample {batch_index} must have shape {(frame_count, 4)}")
             full_mel[batch_index, :frame_count] = sample_full_mel
             full_dense_timing_v2[batch_index, :frame_count] = sample_full_dense_timing_v2
-            padding_mask[batch_index, :frame_count] = False
+            padding_mask[batch_index, :source_frame_count] = False
         batch["full_mel"] = full_mel
         batch["full_dense_timing_v2"] = full_dense_timing_v2
         batch["padding_mask"] = padding_mask
         batch["frame_count"] = torch.tensor(frame_counts, dtype=torch.long)
+        batch["source_frame_count"] = torch.tensor(source_frame_counts, dtype=torch.long)
         if all("control_slice_start_frames" in sample for sample in samples):
             batch["control_slice_start_frames"] = torch.stack(
                 [sample["control_slice_start_frames"].to(dtype=torch.long) for sample in samples],

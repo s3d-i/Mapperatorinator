@@ -42,7 +42,7 @@ class Stage2ControlContextTests(unittest.TestCase):
         self.assertTrue(prepared["target_valid_mask"][0, :40].all())
         self.assertFalse(prepared["target_valid_mask"][0, 40:].any())
 
-    def test_target_valid_mask_uses_frame_count_formula_not_internal_padding(self) -> None:
+    def test_target_valid_mask_honors_internal_padding(self) -> None:
         batch = _batch(frame_count=600, target_start_frame=250)
         batch["padding_mask"][0, 260] = True
         batch["full_mel"][0, 260, 0] = float("nan")
@@ -51,7 +51,7 @@ class Stage2ControlContextTests(unittest.TestCase):
         prepared = prepare_control_context_batch(batch)
 
         self.assertTrue(prepared["context_padding_mask"][0, 260].item())
-        self.assertTrue(prepared["target_valid_mask"][0, 10].item())
+        self.assertFalse(prepared["target_valid_mask"][0, 10].item())
 
 
 def _batch(*, frame_count: int, target_start_frame: int) -> dict[str, torch.Tensor]:

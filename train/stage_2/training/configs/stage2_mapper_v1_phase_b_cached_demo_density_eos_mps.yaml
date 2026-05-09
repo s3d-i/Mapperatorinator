@@ -13,7 +13,7 @@ eval_every: 500
 save_every: 250
 log_every: 10
 
-batch_size: 4
+batch_size: 6
 
 learning_rate: 0.0002
 weight_decay: 0.01
@@ -29,8 +29,8 @@ max_cached_maps: 8
 length_bucketed_batches: true
 length_bucket_size_multiplier: 32
 control_teacher_cache_dir: train/artifacts/cache/stage2_mapper_v1/control_teacher_d384_l3_stride16_step002000
-precompute_control_teacher_cache: true
-control_teacher_precompute_batch_size: 4
+precompute_control_teacher_cache: false
+control_teacher_precompute_batch_size: 12
 require_control_teacher_cache: true
 control_teacher_cache_overwrite: false
 

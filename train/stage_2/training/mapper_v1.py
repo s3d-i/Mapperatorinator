@@ -29,6 +29,8 @@ from train.stage_2.data.mapper_v1_windows import (
     collate_mapper_v1_windows,
     control_teacher_cache_path,
     is_mapper_v1_window_start_allowed,
+    mapper_v1_padded_frame_count,
+    pad_mapper_v1_feature_frames,
     save_control_teacher_cache_entry,
 )
 from train.stage_2.model_control_demo_global import ControlDemoGlobalEncoder, ControlDemoGlobalEncoderConfig
@@ -633,6 +635,7 @@ class _ControlTeacherPrecomputeDataset(Dataset[Any]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         control_record_index, record = self.indexed_records[index]
         control_dataset = self.control_dataset
+        inference_frame_count = mapper_v1_padded_frame_count(record)
         full_mel_loader = getattr(control_dataset, "_load_full_mel", None)
         dense_timing_loader = getattr(control_dataset, "_load_dense_timing_v2", None)
         if callable(full_mel_loader) and callable(dense_timing_loader):
@@ -643,9 +646,22 @@ class _ControlTeacherPrecomputeDataset(Dataset[Any]):
             full_mel = base_sample["full_mel"]
             full_dense_timing_v2 = base_sample["full_dense_timing_v2"]
         return {
-            "full_mel": torch.as_tensor(full_mel, dtype=torch.float32),
-            "full_dense_timing_v2": torch.as_tensor(full_dense_timing_v2, dtype=torch.float32),
-            "frame_count": torch.tensor(record.frame_count, dtype=torch.long),
+            "full_mel": pad_mapper_v1_feature_frames(
+                full_mel,
+                inference_frame_count=inference_frame_count,
+                expected_source_frame_count=record.frame_count,
+                expected_channels=PACKED_MEL_CHANNELS,
+                name="full_mel",
+            ),
+            "full_dense_timing_v2": pad_mapper_v1_feature_frames(
+                full_dense_timing_v2,
+                inference_frame_count=inference_frame_count,
+                expected_source_frame_count=record.frame_count,
+                expected_channels=DENSE_TIMING_V2_CHANNELS,
+                name="full_dense_timing_v2",
+            ),
+            "frame_count": torch.tensor(inference_frame_count, dtype=torch.long),
+            "source_frame_count": torch.tensor(record.frame_count, dtype=torch.long),
             "control_slice_start_frames": torch.tensor(
                 [
                     record.target_start_frame + offset
@@ -659,6 +675,8 @@ class _ControlTeacherPrecomputeDataset(Dataset[Any]):
                 "beatmap_path": record.beatmap_path.as_posix(),
                 "audio_path": record.audio_path.as_posix(),
                 "difficulty": record.difficulty,
+                "source_frame_count": record.frame_count,
+                "inference_frame_count": inference_frame_count,
                 "target_start_frame": record.target_start_frame,
                 "target_start_ms": record.target_start_ms,
                 "control_record_index": control_record_index,
@@ -671,6 +689,7 @@ def _collate_mapper_v1_control_teacher_precompute(samples: Sequence[dict[str, An
         raise ValueError("_collate_mapper_v1_control_teacher_precompute requires at least one sample")
     batch_size = len(samples)
     frame_counts = [int(sample["frame_count"].item()) for sample in samples]
+    source_frame_counts = [int(sample["source_frame_count"].item()) for sample in samples]
     max_frame_count = max(frame_counts)
     full_mel = torch.zeros((batch_size, max_frame_count, PACKED_MEL_CHANNELS), dtype=torch.float32)
     full_dense_timing_v2 = torch.zeros(
@@ -680,6 +699,12 @@ def _collate_mapper_v1_control_teacher_precompute(samples: Sequence[dict[str, An
     padding_mask = torch.ones((batch_size, max_frame_count), dtype=torch.bool)
     for batch_index, sample in enumerate(samples):
         frame_count = frame_counts[batch_index]
+        source_frame_count = source_frame_counts[batch_index]
+        if source_frame_count > frame_count:
+            raise ValueError(
+                f"source_frame_count sample {batch_index} cannot exceed frame_count: "
+                f"{source_frame_count} > {frame_count}"
+            )
         sample_full_mel = sample["full_mel"].to(dtype=torch.float32)
         sample_full_dense_timing_v2 = sample["full_dense_timing_v2"].to(dtype=torch.float32)
         if tuple(sample_full_mel.shape) != (frame_count, PACKED_MEL_CHANNELS):
@@ -693,12 +718,13 @@ def _collate_mapper_v1_control_teacher_precompute(samples: Sequence[dict[str, An
             )
         full_mel[batch_index, :frame_count] = sample_full_mel
         full_dense_timing_v2[batch_index, :frame_count] = sample_full_dense_timing_v2
-        padding_mask[batch_index, :frame_count] = False
+        padding_mask[batch_index, :source_frame_count] = False
     return {
         "full_mel": full_mel,
         "full_dense_timing_v2": full_dense_timing_v2,
         "padding_mask": padding_mask,
         "frame_count": torch.tensor(frame_counts, dtype=torch.long),
+        "source_frame_count": torch.tensor(source_frame_counts, dtype=torch.long),
         "control_slice_start_frames": torch.stack(
             [sample["control_slice_start_frames"].to(dtype=torch.long) for sample in samples],
         ),
@@ -904,21 +930,17 @@ def _mapper_v1_raw_control_indexed_records(
         raise TypeError("control teacher cache precompute requires a dataset with records")
     indexed_records: list[tuple[int, ControlWindowRecord]] = []
     skipped_stride = 0
-    skipped_short = 0
     for index, record in enumerate(records):
         if not isinstance(record, ControlWindowRecord):
             raise TypeError(f"control dataset record {index} must be a ControlWindowRecord")
         if not is_mapper_v1_window_start_allowed(record, mapper_stride_frames=mapper_stride_frames):
             skipped_stride += 1
             continue
-        if record.target_start_frame + MAPPER_WRITE_FRAMES > record.frame_count:
-            skipped_short += 1
-            continue
         indexed_records.append((index, record))
     print(
         "mapper_v1_control_teacher_cache_precompute raw_control_select "
         f"source_windows={len(records)} selected_windows={len(indexed_records)} "
-        f"skipped_stride={skipped_stride} skipped_short={skipped_short}",
+        f"skipped_stride={skipped_stride}",
         flush=True,
     )
     return indexed_records
