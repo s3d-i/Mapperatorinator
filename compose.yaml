@@ -24,3 +24,31 @@ services:
           - PROJECT_PATH=/workspace/Mapperatorinator
           - WANDB_API_KEY=${WANDB_API_KEY}
           - WANDB_ENTITY=${WANDB_ENTITY}
+    stage2-mapper-v2-overnight:
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: all
+                          capabilities:
+                              - gpu
+        volumes:
+        - .:/workspace/Mapperatorinator
+        - ../datasets:/workspace/datasets
+        network_mode: host
+        container_name: mapperatorinator_stage2_mapper_v2_overnight
+        shm_size: 8gb
+        build: .
+        working_dir: /workspace/Mapperatorinator
+        command:
+        - /bin/bash
+        - -lc
+        - uv run python -m train.stage_2.training.mapper_v2_overnight --device cuda
+        environment:
+          - PROJECT_PATH=/workspace/Mapperatorinator
+          - PYTHONUNBUFFERED=1
+          - UV_NO_MANAGED_PYTHON=1
+          - UV_PYTHON=/opt/conda/bin/python
+          - WANDB_API_KEY=${WANDB_API_KEY}
+          - WANDB_ENTITY=${WANDB_ENTITY}
