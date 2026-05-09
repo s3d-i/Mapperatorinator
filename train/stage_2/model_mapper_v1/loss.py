@@ -356,7 +356,7 @@ def density_auxiliary_loss(
         raise ValueError(f"density_confidence_8s must have shape {tuple(prediction.shape)}, got {tuple(confidence.shape)}")
     weight = confidence.to(device=prediction.device, dtype=prediction.dtype).clamp_min(0.0)
     if not bool((weight > 0).any()):
-        return logits_final.sum() * 0.0
+        return logits_final.reshape(-1)[:0].sum() * 0.0
     target = target.to(device=prediction.device, dtype=prediction.dtype)
     loss = F.smooth_l1_loss(prediction, target, reduction="none") * weight
     return loss.sum() / weight.sum().clamp_min(torch.finfo(weight.dtype).eps)
