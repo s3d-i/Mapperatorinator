@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -42,6 +43,7 @@ DENSITY_CONFIDENCE_TARGET_INDEX = MODEL_FEATURE_NAMES.index("density_confidence"
 CONTROL_TEACHER_CACHE_SCHEMA_VERSION = 1
 MAPPER_V1_RECORD_CACHE_SCHEMA_VERSION = 1
 MAPPER_V1_TOKENIZER_CACHE_VERSION = 1
+DEFAULT_MAX_CACHED_TIMEPOINT_MAPS = 256
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class MapperV1WindowDataset(Dataset):
         control_teacher_cache_dir: str | Path | None = None,
         require_control_teacher_cache: bool = False,
         include_full_song_context: bool = False,
+        max_cached_timepoint_maps: int = DEFAULT_MAX_CACHED_TIMEPOINT_MAPS,
         progress: bool = False,
         **control_dataset_kwargs: Any,
     ) -> None:
@@ -110,7 +113,8 @@ class MapperV1WindowDataset(Dataset):
         self.control_teacher_cache_dir = None if control_teacher_cache_dir is None else Path(control_teacher_cache_dir)
         self.require_control_teacher_cache = bool(require_control_teacher_cache)
         self.include_full_song_context = bool(include_full_song_context)
-        self._timepoints_by_beatmap: dict[str, tuple] = {}
+        self.max_cached_timepoint_maps = _validate_timepoint_cache_size(max_cached_timepoint_maps)
+        self._timepoints_by_beatmap: OrderedDict[str, tuple] = OrderedDict()
         cached_records = self._load_cached_records(progress=progress)
         if cached_records is None:
             self.records, self.filter_report = self._build_records(progress=progress)
@@ -454,9 +458,14 @@ class MapperV1WindowDataset(Dataset):
     def _load_timepoints(self, beatmap_path: Path) -> tuple:
         key = beatmap_path.as_posix()
         cached = self._timepoints_by_beatmap.get(key)
-        if cached is None:
-            cached = tuple(hitobjects_to_mapper_timepoints(parse_mania_hit_objects(beatmap_path, expected_key_count=4)))
+        if cached is not None:
+            self._timepoints_by_beatmap.move_to_end(key)
+            return cached
+        cached = tuple(hitobjects_to_mapper_timepoints(parse_mania_hit_objects(beatmap_path, expected_key_count=4)))
+        if self.max_cached_timepoint_maps > 0:
             self._timepoints_by_beatmap[key] = cached
+            while len(self._timepoints_by_beatmap) > self.max_cached_timepoint_maps:
+                self._timepoints_by_beatmap.popitem(last=False)
         return cached
 
     def _load_control_v3_target_8s(self, record: ControlWindowRecord) -> torch.Tensor:
@@ -508,6 +517,17 @@ def _file_sha1(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_timepoint_cache_size(max_cached_timepoint_maps: int) -> int:
+    if not isinstance(max_cached_timepoint_maps, int) or isinstance(max_cached_timepoint_maps, bool):
+        raise TypeError(
+            "max_cached_timepoint_maps must be an integer, "
+            f"got {type(max_cached_timepoint_maps).__name__}"
+        )
+    if max_cached_timepoint_maps < 0:
+        raise ValueError(f"max_cached_timepoint_maps must be non-negative, got {max_cached_timepoint_maps}")
+    return max_cached_timepoint_maps
 
 
 def _mapper_v1_filter_report_from_metadata(payload: object) -> MapperV1WindowFilterReport:
