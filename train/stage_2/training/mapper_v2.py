@@ -38,7 +38,7 @@ from train.stage_2.training.mapper_v1 import (
 
 DEFAULT_RUNS_ROOT = Path("train/artifacts/runs/stage2_mapper_v2")
 DEFAULT_OUTPUT_DIR = DEFAULT_RUNS_ROOT / "phase_b_global_teacher_forced"
-RUN_CONFIG_KEYS = set(MAPPER_V1_RUN_CONFIG_KEYS) | {"include_full_song_context"}
+RUN_CONFIG_KEYS = set(MAPPER_V1_RUN_CONFIG_KEYS) | {"include_full_song_context", "skip_first_eval_pass"}
 MODEL_CONFIG_KEYS = {field.name for field in fields(MapperV2Config)}
 
 
@@ -79,6 +79,7 @@ def run_synthetic_smoke(
     seed: int = 1337,
     device_name: str = "auto",
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
+    skip_first_eval_pass: bool = True,
     model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
 ) -> ControlTrainingResult:
@@ -146,6 +147,7 @@ def run_synthetic_smoke(
         model_factory=_mapper_v2_model_factory,
         mapper_checkpoint_initializer=initialize_mapper_v2_from_mapper_checkpoint,
         progress_label="mapper_v2_phase_b",
+        skip_first_eval_pass=skip_first_eval_pass,
     )
 
 
@@ -183,6 +185,7 @@ def run_mapper_v2_phase_b_training(
     require_control_teacher_cache: bool = False,
     control_teacher_cache_overwrite: bool = False,
     include_full_song_context: bool = True,
+    skip_first_eval_pass: bool = True,
     model_config_overrides: Mapping[str, Any] | None = None,
     control_model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
@@ -344,12 +347,14 @@ def run_mapper_v2_phase_b_training(
             "control_teacher_cache_overwrite": bool(control_teacher_cache_overwrite),
             "control_teacher_cache_precompute": cache_precompute_reports,
             "include_full_song_context": bool(include_full_song_context),
+            "skip_first_eval_pass": bool(skip_first_eval_pass),
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
         init_from_mapper_checkpoint=init_from_mapper_checkpoint,
         model_factory=_mapper_v2_model_factory,
         mapper_checkpoint_initializer=initialize_mapper_v2_from_mapper_checkpoint,
         progress_label="mapper_v2_phase_b",
+        skip_first_eval_pass=skip_first_eval_pass,
     )
 
 
@@ -523,6 +528,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         action=argparse.BooleanOptionalAction,
         default=bool(config_defaults.get("include_full_song_context", True)),
     )
+    parser.add_argument(
+        "--skip-first-eval-pass",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config_defaults.get("skip_first_eval_pass", True)),
+    )
     parser.add_argument("--synthetic-smoke", action="store_true", default=bool(config_defaults.get("synthetic_smoke", False)))
     args = parser.parse_args(argv)
 
@@ -573,6 +583,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             seed=args.seed,
             device_name=args.device,
             final_train_eval_size=args.final_train_eval_size,
+            skip_first_eval_pass=args.skip_first_eval_pass,
             model_config_overrides=model_defaults,
             loss_config_overrides=loss_defaults,
         )
@@ -616,6 +627,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             require_control_teacher_cache=args.require_control_teacher_cache,
             control_teacher_cache_overwrite=args.control_teacher_cache_overwrite,
             include_full_song_context=args.include_full_song_context,
+            skip_first_eval_pass=args.skip_first_eval_pass,
             model_config_overrides=model_defaults,
             control_model_config_overrides=control_model_defaults,
             loss_config_overrides=loss_defaults,

@@ -9,10 +9,11 @@ init_from_control_checkpoint: train/artifacts/runs/stage2_control_demo/stage2_co
 
 max_steps: 12000
 eval_every: 500
+skip_first_eval_pass: true
 save_every: 250
 log_every: 10
 
-batch_size: 4
+batch_size: 1
 
 learning_rate: 0.0001
 weight_decay: 0.01

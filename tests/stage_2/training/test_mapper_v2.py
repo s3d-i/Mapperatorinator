@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ class MapperV2PhaseBTrainingTests(unittest.TestCase):
         config = load_run_config("train/stage_2/training/configs/stage2_mapper_v2_phase_b_global_mps.yaml")
 
         self.assertTrue(config["include_full_song_context"])
+        self.assertTrue(config["skip_first_eval_pass"])
         self.assertTrue(config["model"]["use_global_context"])
         self.assertEqual(config["model"]["global_stride"], 16)
         self.assertEqual(config["model"]["global_layers"], 1)
@@ -30,6 +32,7 @@ class MapperV2PhaseBTrainingTests(unittest.TestCase):
         config = load_run_config("train/stage_2/training/configs/stage2_mapper_v2_phase_b_global_d768_l8_mps.yaml")
 
         self.assertTrue(config["include_full_song_context"])
+        self.assertTrue(config["skip_first_eval_pass"])
         self.assertEqual(config["model"]["d_model"], 768)
         self.assertEqual(config["model"]["heads"], 12)
         self.assertEqual(config["model"]["layers"], 8)
@@ -61,9 +64,29 @@ class MapperV2PhaseBTrainingTests(unittest.TestCase):
         train.assert_called_once()
         kwargs = train.call_args.kwargs
         self.assertTrue(kwargs["include_full_song_context"])
+        self.assertTrue(kwargs["skip_first_eval_pass"])
         self.assertEqual(kwargs["batch_size"], 2)
         self.assertTrue(kwargs["model_config_overrides"]["use_global_context"])
         self.assertEqual(kwargs["model_config_overrides"]["global_gate_init"], -2.94)
+
+    def test_synthetic_smoke_can_skip_initial_eval_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_synthetic_smoke(
+                output_dir=Path(temp_dir),
+                max_steps=2,
+                eval_every=100,
+                save_every=2,
+                batch_size=1,
+                learning_rate=1e-3,
+                device_name="cpu",
+                final_train_eval_size=1,
+                skip_first_eval_pass=True,
+            )
+
+            report = json.loads(result.report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual([entry["step"] for entry in report["history"]], [2])
+        self.assertTrue(report["skip_first_eval_pass"])
 
     def test_cache_only_cli_runs_shared_control_teacher_precompute(self) -> None:
         precompute_result = SimpleNamespace(

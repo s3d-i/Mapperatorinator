@@ -1367,6 +1367,7 @@ def _run_training(
     model_factory: Callable[[MapperV1Config, ControlDemoGlobalEncoder | None], MapperV1Model] | None = None,
     mapper_checkpoint_initializer: Callable[..., Mapping[str, Any]] | None = None,
     progress_label: str = "mapper_v1_phase_b",
+    skip_first_eval_pass: bool = False,
 ) -> ControlTrainingResult:
     _validate_training_args(
         max_steps=max_steps,
@@ -1430,6 +1431,8 @@ def _run_training(
         completed_step = step
 
         should_eval = step == 1 or step % eval_every == 0 or step == max_steps
+        if skip_first_eval_pass and step == 1 and step != max_steps:
+            should_eval = False
         should_save = step == 1 or step % save_every == 0 or step == max_steps
         should_log = log_every is not None and (step == 1 or step % log_every == 0 or step == max_steps)
         if should_log or should_eval or should_save:
@@ -1484,6 +1487,7 @@ def _run_training(
                 final_train_metrics=final_train_metrics,
                 final_eval_metrics=final_eval_metrics,
                 initialization_report=initialization_report,
+                skip_first_eval_pass=skip_first_eval_pass,
             )
 
     result_metrics = final_eval_metrics or last_train_metrics
@@ -1622,6 +1626,7 @@ def _write_checkpoint_and_report(
     final_train_metrics: Mapping[str, float],
     final_eval_metrics: Mapping[str, float],
     initialization_report: Mapping[str, Any] | None,
+    skip_first_eval_pass: bool,
 ) -> None:
     training_config = {
         "phase": "B",
@@ -1630,6 +1635,7 @@ def _write_checkpoint_and_report(
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "eval_every": eval_every,
+        "skip_first_eval_pass": bool(skip_first_eval_pass),
         "save_every": save_every,
         "density_enabled": bool(loss_config.lambda_density > 0.0),
         "dataset": _json_safe(dataset_report),
@@ -1651,6 +1657,7 @@ def _write_checkpoint_and_report(
             "max_steps": max_steps,
             "is_complete": completed_steps >= max_steps,
             "eval_every": eval_every,
+            "skip_first_eval_pass": bool(skip_first_eval_pass),
             "save_every": save_every,
             "log_every": log_every,
             "learning_rate": learning_rate,
@@ -1673,6 +1680,7 @@ def _write_checkpoint_and_report(
         "completed_steps": completed_steps,
         "is_complete": completed_steps >= max_steps,
         "eval_every": eval_every,
+        "skip_first_eval_pass": bool(skip_first_eval_pass),
         "save_every": save_every,
         "log_every": log_every,
         "learning_rate": learning_rate,
