@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import pickle
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -74,6 +75,7 @@ RUN_CONFIG_KEYS = {
     "device",
     "run_name",
     "init_from_control_checkpoint",
+    "init_from_mapper_checkpoint",
     "eval_fraction",
     "eval_size",
     "final_train_eval_size",
@@ -294,6 +296,7 @@ def run_synthetic_smoke(
             "final_train_eval_window_count": len(train_eval_dataset),
         },
         init_from_control_checkpoint=None,
+        init_from_mapper_checkpoint=None,
     )
 
 
@@ -315,6 +318,7 @@ def run_mapper_v1_phase_b_training(
     device_name: str = "auto",
     run_name: str = "mapper_v1_phase_b_teacher_forced",
     init_from_control_checkpoint: Path | None = None,
+    init_from_mapper_checkpoint: Path | None = None,
     eval_fraction: float = 0.1,
     eval_size: int | None = None,
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
@@ -481,6 +485,7 @@ def run_mapper_v1_phase_b_training(
             "control_teacher_cache_precompute": cache_precompute_reports,
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
+        init_from_mapper_checkpoint=init_from_mapper_checkpoint,
     )
 
 
@@ -1324,6 +1329,7 @@ def _run_training(
     run_name: str,
     dataset_report: Mapping[str, Any],
     init_from_control_checkpoint: Path | None,
+    init_from_mapper_checkpoint: Path | None,
 ) -> ControlTrainingResult:
     _validate_training_args(
         max_steps=max_steps,
@@ -1345,12 +1351,20 @@ def _run_training(
     initialization_report: dict[str, Any] | None = None
     if control_model_config is not None:
         control_encoder = ControlDemoGlobalEncoder(control_model_config)
-        if init_from_control_checkpoint is not None:
+        if init_from_control_checkpoint is not None and init_from_mapper_checkpoint is None:
             initialization_report = initialize_global_control_demo_from_control_checkpoint(
                 control_encoder,
                 init_from_control_checkpoint,
             )
-    model = MapperV1Model(model_config, control_encoder=control_encoder).to(device)
+    model = MapperV1Model(model_config, control_encoder=control_encoder)
+    if init_from_mapper_checkpoint is not None:
+        initialization_report = initialize_mapper_v1_from_mapper_checkpoint(
+            model,
+            init_from_mapper_checkpoint,
+            expected_model_config=model_config,
+            expected_control_model_config=control_model_config,
+        )
+    model = model.to(device)
     optimizer = _build_mapper_v1_optimizer(model, learning_rate=learning_rate, weight_decay=weight_decay)
     iterator = _infinite_loader(loader)
     history: list[dict[str, Any]] = []
@@ -1450,6 +1464,57 @@ def _build_mapper_v1_optimizer(
     if not params:
         raise ValueError("mapper model has no trainable parameters")
     return torch.optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
+
+
+def initialize_mapper_v1_from_mapper_checkpoint(
+    model: MapperV1Model,
+    checkpoint_path: Path,
+    *,
+    expected_model_config: MapperV1Config,
+    expected_control_model_config: ControlDemoGlobalEncoderConfig | None,
+) -> dict[str, Any]:
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError(
+            "mapper checkpoint could not be loaded safely with weights_only=True; "
+            "use a checkpoint written by the mapper trainer"
+        ) from exc
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"mapper checkpoint must contain a mapping: {checkpoint_path}")
+    if checkpoint.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("mapper checkpoint schema version mismatch")
+    if checkpoint.get("model_config") != asdict(expected_model_config):
+        raise ValueError("mapper checkpoint model_config does not match the requested run")
+    expected_control_config = (
+        None if expected_control_model_config is None else asdict(expected_control_model_config)
+    )
+    if checkpoint.get("control_model_config") != expected_control_config:
+        raise ValueError("mapper checkpoint control_model_config does not match the requested run")
+    state = checkpoint.get("model_state_dict")
+    if not isinstance(state, Mapping):
+        raise ValueError("mapper checkpoint missing model_state_dict")
+    non_tensor_keys = [str(key) for key, value in state.items() if not isinstance(value, torch.Tensor)]
+    if non_tensor_keys:
+        raise ValueError(f"mapper checkpoint model_state_dict contains non-tensor values: {non_tensor_keys}")
+
+    load_result = model.load_state_dict(state, strict=True)
+    loaded_keys = len(state)
+    training_state = checkpoint.get("training_state")
+    checkpoint_step = None
+    if isinstance(training_state, Mapping) and isinstance(training_state.get("step"), int):
+        checkpoint_step = int(training_state["step"])
+    report = {
+        "kind": "mapper_v1_model_state",
+        "checkpoint": checkpoint_path.as_posix(),
+        "checkpoint_step": checkpoint_step,
+        "loaded_keys": loaded_keys,
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+        "optimizer_state_loaded": False,
+    }
+    del checkpoint, state
+    return report
 
 
 def _ln_close_loss(
@@ -1732,6 +1797,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--device", default=config_defaults.get("device", "auto"), choices=("auto", "cpu", "cuda", "mps"))
     parser.add_argument("--run-name", default=config_defaults.get("run_name", "mapper_v1_phase_b_teacher_forced"))
     parser.add_argument("--init-from-control-checkpoint", default=config_defaults.get("init_from_control_checkpoint"))
+    parser.add_argument("--init-from-mapper-checkpoint", default=config_defaults.get("init_from_mapper_checkpoint"))
     parser.add_argument("--eval-fraction", type=float, default=config_defaults.get("eval_fraction", 0.1))
     parser.add_argument("--eval-size", type=int, default=config_defaults.get("eval_size"))
     parser.add_argument(
@@ -1786,6 +1852,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     init_from = Path(args.init_from_control_checkpoint) if args.init_from_control_checkpoint is not None else None
+    init_from_mapper = (
+        Path(args.init_from_mapper_checkpoint)
+        if args.init_from_mapper_checkpoint is not None
+        else None
+    )
     if args.precompute_control_teacher_cache_only:
         if args.synthetic_smoke:
             raise ValueError("precompute_control_teacher_cache_only is not supported with synthetic_smoke")
@@ -1860,6 +1931,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             device_name=args.device,
             run_name=args.run_name,
             init_from_control_checkpoint=init_from,
+            init_from_mapper_checkpoint=init_from_mapper,
             eval_fraction=args.eval_fraction,
             eval_size=args.eval_size,
             final_train_eval_size=args.final_train_eval_size,

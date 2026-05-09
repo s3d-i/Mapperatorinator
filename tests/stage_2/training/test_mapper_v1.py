@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from train.stage_2.data.control_windows import ControlWindowRecord, normalize_difficulty
 from train.stage_2.data.mapper_v1_windows import (
@@ -17,12 +17,14 @@ from train.stage_2.data.mapper_v1_windows import (
     load_control_teacher_cache_entry,
 )
 from train.stage_2.features.control_v3_targets import MODEL_FEATURE_NAMES
+from train.stage_2.model_control_demo_global import ControlDemoGlobalEncoderConfig
 from train.stage_2.model_mapper_v1 import MapperV1Config, MapperV1Model
 from train.stage_2.training import mapper_v1 as mapper_v1_training
 from train.stage_2.training.mapper_v1 import (
     MapperV1PhaseBLossConfig,
     _MapperV1TokenLengthBucketBatchSampler,
     _collate_synthetic_mapper_samples,
+    initialize_mapper_v1_from_mapper_checkpoint,
     _loss_for_raw_batch,
     _synthetic_mapper_samples,
     load_run_config,
@@ -232,6 +234,51 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         self.assertEqual(list(iter(sampler)), [[1, 3], [2, 0]])
         self.assertEqual(dataset.tokenize_calls, 0)
 
+    def test_initialize_mapper_from_checkpoint_loads_model_state_only(self) -> None:
+        model_config = MapperV1Config(
+            control_dim=16,
+            d_model=16,
+            heads=4,
+            layers=1,
+            ffn_dim=32,
+            dropout=0.0,
+            max_seq_len=16,
+            state_hidden_dim=16,
+            ln_close_hidden_dim=16,
+        )
+        source = MapperV1Model(model_config)
+        with torch.no_grad():
+            for index, parameter in enumerate(source.parameters()):
+                parameter.fill_(0.01 * (index + 1))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "mapper.pt"
+            torch.save(
+                {
+                    "checkpoint_schema_version": mapper_v1_training.CHECKPOINT_SCHEMA_VERSION,
+                    "model_state_dict": source.state_dict(),
+                    "optimizer_state_dict": {"state": {"would_be_ignored": torch.ones(1)}},
+                    "model_config": model_config.__dict__,
+                    "control_model_config": None,
+                    "training_state": {"step": 1000},
+                },
+                checkpoint_path,
+            )
+            target = MapperV1Model(model_config)
+
+            report = initialize_mapper_v1_from_mapper_checkpoint(
+                target,
+                checkpoint_path,
+                expected_model_config=model_config,
+                expected_control_model_config=None,
+            )
+
+        self.assertEqual(report["kind"], "mapper_v1_model_state")
+        self.assertEqual(report["checkpoint_step"], 1000)
+        self.assertFalse(report["optimizer_state_loaded"])
+        self.assertEqual(report["loaded_keys"], len(source.state_dict()))
+        for key, value in source.state_dict().items():
+            self.assertTrue(torch.equal(target.state_dict()[key], value), key)
+
     def test_cache_only_cli_runs_precompute_without_training(self) -> None:
         precompute_result = SimpleNamespace(
             reports=[
@@ -291,6 +338,95 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         train.assert_called_once()
         self.assertTrue(train.call_args.kwargs["length_bucketed_batches"])
         self.assertEqual(train.call_args.kwargs["length_bucket_size_multiplier"], 7)
+
+    def test_main_forwards_mapper_checkpoint_init_to_training(self) -> None:
+        train_result = SimpleNamespace(
+            report_path=Path("report.json"),
+            checkpoint_path=Path("checkpoint.pt"),
+            final_loss=0.0,
+            completed_steps=0,
+        )
+        with patch.object(
+            mapper_v1_training,
+            "run_mapper_v1_phase_b_training",
+            return_value=train_result,
+            autospec=True,
+        ) as train:
+            mapper_v1_training.main(
+                [
+                    "--init-from-mapper-checkpoint",
+                    "checkpoint_step_001000.pt",
+                    "--max-steps",
+                    "1",
+                ]
+            )
+
+        train.assert_called_once()
+        self.assertEqual(train.call_args.kwargs["init_from_mapper_checkpoint"], Path("checkpoint_step_001000.pt"))
+
+    def test_mapper_checkpoint_init_skips_control_checkpoint_init(self) -> None:
+        model_config = MapperV1Config(
+            control_dim=4,
+            d_model=4,
+            heads=2,
+            layers=1,
+            ffn_dim=8,
+            dropout=0.0,
+            max_seq_len=16,
+            state_hidden_dim=8,
+            ln_close_hidden_dim=8,
+        )
+        control_model_config = ControlDemoGlobalEncoderConfig(
+            d_model=4,
+            heads=1,
+            layers=1,
+            ffn_dim=8,
+            conv_blocks=1,
+            use_global_memory=False,
+            global_fusion_start_layer=0,
+        )
+        loader = DataLoader(
+            _synthetic_mapper_samples(model_config=model_config)[:1],
+            batch_size=1,
+            collate_fn=_collate_synthetic_mapper_samples,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                mapper_v1_training,
+                "initialize_mapper_v1_from_mapper_checkpoint",
+                return_value={"kind": "mapper_v1_model_state"},
+                autospec=True,
+            ) as mapper_init:
+                with patch.object(
+                    mapper_v1_training,
+                    "initialize_global_control_demo_from_control_checkpoint",
+                    autospec=True,
+                ) as control_init:
+                    mapper_v1_training._run_training(
+                        loader=loader,
+                        train_eval_loader=loader,
+                        eval_loader=loader,
+                        output_dir=Path(temp_dir),
+                        model_config=model_config,
+                        control_model_config=control_model_config,
+                        loss_config=MapperV1PhaseBLossConfig(),
+                        max_steps=1,
+                        eval_every=1,
+                        save_every=1,
+                        log_every=None,
+                        batch_size=1,
+                        learning_rate=1e-4,
+                        weight_decay=0.0,
+                        seed=11,
+                        device_name="cpu",
+                        run_name="mapper_init_test",
+                        dataset_report={"status": "test"},
+                        init_from_control_checkpoint=Path("control.pt"),
+                        init_from_mapper_checkpoint=Path("mapper.pt"),
+                    )
+
+        mapper_init.assert_called_once()
+        control_init.assert_not_called()
 
     def test_precomputed_control_teacher_cache_feeds_phase_b_loss_without_full_inputs(self) -> None:
         record = ControlWindowRecord(
