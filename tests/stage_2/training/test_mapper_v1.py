@@ -56,6 +56,7 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         )
         self.assertIn("checkpoint_step_001250.pt", density_eos_config["init_from_mapper_checkpoint"])
         self.assertIn("plus_end.parquet", density_eos_config["index_path"])
+        self.assertIn("window_records", density_eos_config["mapper_record_cache_path"])
         self.assertGreater(density_eos_config["loss"]["lambda_density"], 0.0)
         self.assertFalse(density_eos_config["precompute_control_teacher_cache"])
 
@@ -345,6 +346,34 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         train.assert_called_once()
         self.assertTrue(train.call_args.kwargs["length_bucketed_batches"])
         self.assertEqual(train.call_args.kwargs["length_bucket_size_multiplier"], 7)
+
+    def test_main_forwards_mapper_record_cache_path_to_training(self) -> None:
+        train_result = SimpleNamespace(
+            report_path=Path("report.json"),
+            checkpoint_path=Path("checkpoint.pt"),
+            final_loss=0.0,
+            completed_steps=0,
+        )
+        with patch.object(
+            mapper_v1_training,
+            "run_mapper_v1_phase_b_training",
+            return_value=train_result,
+            autospec=True,
+        ) as train:
+            mapper_v1_training.main(
+                [
+                    "--mapper-record-cache-path",
+                    "train/artifacts/cache/stage2_mapper_v1/window_records/test.parquet",
+                    "--max-steps",
+                    "1",
+                ]
+            )
+
+        train.assert_called_once()
+        self.assertEqual(
+            train.call_args.kwargs["mapper_record_cache_path"],
+            Path("train/artifacts/cache/stage2_mapper_v1/window_records/test.parquet"),
+        )
 
     def test_main_forwards_mapper_checkpoint_init_to_training(self) -> None:
         train_result = SimpleNamespace(

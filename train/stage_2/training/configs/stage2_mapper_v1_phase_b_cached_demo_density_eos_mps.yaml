@@ -26,6 +26,7 @@ final_train_eval_size: 512
 
 num_workers: 0
 max_cached_maps: 8
+mapper_record_cache_path: train/artifacts/cache/stage2_mapper_v1/window_records/stage2_mapper_v1_phase_b_mps_cached_windows_plus_end.parquet
 length_bucketed_batches: true
 length_bucket_size_multiplier: 32
 control_teacher_cache_dir: train/artifacts/cache/stage2_mapper_v1/control_teacher_d384_l3_stride16_step002000

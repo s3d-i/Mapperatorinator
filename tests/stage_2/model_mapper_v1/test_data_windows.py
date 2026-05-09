@@ -1,9 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pandas as pd
 import torch
 
 from train.stage1_oracle.osu.hitobjects import ManiaHitObject, ManiaHitObjectKind
@@ -132,6 +134,38 @@ class MapperV1DataWindowTests(unittest.TestCase):
         )
         self.assertEqual(dataset.filter_report.num_total_windows, 2)
         self.assertEqual(dataset.filter_report.num_dropped_short_windows, 0)
+
+    def test_mapper_record_cache_reuses_minimal_record_parquet_when_metadata_matches(self) -> None:
+        records = [
+            _record("first.osu", difficulty=4.0, frame_count=500, target_start_frame=0),
+            _record("second.osu", difficulty=5.0, frame_count=900, target_start_frame=400),
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "records.parquet"
+            first = _MapperDatasetWithCountingTimepoints(records, cache_path=cache_path)
+            second = _MapperDatasetWithCountingTimepoints(records, cache_path=cache_path, fail_on_tokenize=True)
+
+            frame = pd.read_parquet(cache_path)
+            metadata = json.loads(cache_path.with_suffix(".json").read_text(encoding="utf-8"))
+
+        self.assertEqual(first.timepoint_loads, 2)
+        self.assertEqual(second.timepoint_loads, 0)
+        self.assertEqual(list(frame.columns), ["control_record_index", "target_seq_len"])
+        self.assertEqual(frame["control_record_index"].tolist(), [0, 1])
+        self.assertEqual(second.target_token_lengths, first.target_token_lengths)
+        self.assertEqual(metadata["filter_report"]["num_mapper_eligible_windows"], 2)
+
+    def test_mapper_record_cache_rebuilds_when_metadata_does_not_match(self) -> None:
+        records = [_record("first.osu", difficulty=4.0, frame_count=500, target_start_frame=0)]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "records.parquet"
+            _MapperDatasetWithCountingTimepoints(records, cache_path=cache_path)
+            changed_records = [_record("first.osu", difficulty=5.0, frame_count=500, target_start_frame=0)]
+            rebuilt = _MapperDatasetWithCountingTimepoints(changed_records, cache_path=cache_path)
+
+        self.assertEqual(rebuilt.timepoint_loads, 1)
 
     def test_mapper_dataset_pads_short_terminal_window_features(self) -> None:
         record = _record("tail.osu", difficulty=4.0, frame_count=450, target_start_frame=400)
@@ -277,6 +311,25 @@ class _MapperDatasetWithUnsupportedActions(MapperV1WindowDataset):
                     ],
                 ),
             )
+        return ()
+
+
+class _MapperDatasetWithCountingTimepoints(MapperV1WindowDataset):
+    def __init__(
+        self,
+        records: list[ControlWindowRecord],
+        *,
+        cache_path: Path,
+        fail_on_tokenize: bool = False,
+    ) -> None:
+        self.timepoint_loads = 0
+        self.fail_on_tokenize = fail_on_tokenize
+        super().__init__(control_dataset=SimpleNamespace(records=records), mapper_record_cache_path=cache_path)
+
+    def _load_timepoints(self, beatmap_path: Path) -> tuple:
+        if self.fail_on_tokenize:
+            raise AssertionError("mapper record cache hit should skip tokenizer warmup")
+        self.timepoint_loads += 1
         return ()
 
 

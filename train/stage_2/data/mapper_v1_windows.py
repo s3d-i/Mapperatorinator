@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -38,6 +40,8 @@ MAPPER_CONTEXT_FRAMES = MAPPER_WRITE_FRAMES
 DENSITY_LEVEL_TARGET_INDEX = MODEL_FEATURE_NAMES.index("density_level")
 DENSITY_CONFIDENCE_TARGET_INDEX = MODEL_FEATURE_NAMES.index("density_confidence")
 CONTROL_TEACHER_CACHE_SCHEMA_VERSION = 1
+MAPPER_V1_RECORD_CACHE_SCHEMA_VERSION = 1
+MAPPER_V1_TOKENIZER_CACHE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,7 @@ class MapperV1WindowDataset(Dataset):
         control_dataset: ControlWindowDataset | None = None,
         vocab: MapperV1Vocab | None = None,
         mapper_stride_frames: int = MAPPER_WRITE_FRAMES,
+        mapper_record_cache_path: str | Path | None = None,
         control_teacher_cache_dir: str | Path | None = None,
         require_control_teacher_cache: bool = False,
         progress: bool = False,
@@ -100,16 +105,129 @@ class MapperV1WindowDataset(Dataset):
         )
         self.vocab = MapperV1Vocab() if vocab is None else vocab
         self.mapper_stride_frames = int(mapper_stride_frames)
+        self.mapper_record_cache_path = None if mapper_record_cache_path is None else Path(mapper_record_cache_path)
         self.control_teacher_cache_dir = None if control_teacher_cache_dir is None else Path(control_teacher_cache_dir)
         self.require_control_teacher_cache = bool(require_control_teacher_cache)
         self._timepoints_by_beatmap: dict[str, tuple] = {}
-        self.records, self.filter_report = self._build_records(
-            progress=progress,
-        )
+        cached_records = self._load_cached_records(progress=progress)
+        if cached_records is None:
+            self.records, self.filter_report = self._build_records(progress=progress)
+            self._save_cached_records(progress=progress)
+        else:
+            self.records, self.filter_report = cached_records
         self.target_token_lengths = [record.target_seq_len for record in self.records]
 
     def __len__(self) -> int:
         return len(self.records)
+
+    def _load_cached_records(
+        self,
+        *,
+        progress: bool,
+    ) -> tuple[list[MapperV1WindowRecord], MapperV1WindowFilterReport] | None:
+        cache_path = self.mapper_record_cache_path
+        if cache_path is None:
+            return None
+        metadata_path = mapper_v1_record_cache_metadata_path(cache_path)
+        if not cache_path.exists() or not metadata_path.exists():
+            return None
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, Mapping):
+            return None
+        if metadata.get("validity") != self._record_cache_validity_metadata():
+            return None
+
+        import pandas as pd
+
+        frame = pd.read_parquet(cache_path)
+        expected_columns = ["control_record_index", "target_seq_len"]
+        if list(frame.columns) != expected_columns:
+            raise ValueError(f"mapper v1 record cache must contain columns {expected_columns}: {cache_path}")
+        filter_report = _mapper_v1_filter_report_from_metadata(metadata.get("filter_report"))
+        if len(frame) != filter_report.num_mapper_eligible_windows:
+            raise ValueError(
+                "mapper v1 record cache row count does not match filter_report "
+                f"({len(frame)} != {filter_report.num_mapper_eligible_windows}): {cache_path}"
+            )
+        source_records = self.control_dataset.records
+        records: list[MapperV1WindowRecord] = []
+        for row_number, row in enumerate(frame.itertuples(index=False), start=1):
+            control_record_index = _cache_positive_index(row.control_record_index, len(source_records), row_number)
+            target_seq_len = _cache_positive_int(row.target_seq_len, "target_seq_len", row_number)
+            records.append(
+                MapperV1WindowRecord(
+                    control_record_index=control_record_index,
+                    control_record=source_records[control_record_index],
+                    target_seq_len=target_seq_len,
+                )
+            )
+        if progress:
+            print(
+                "mapper_v1_window_dataset_cache status=hit "
+                f"path={cache_path.as_posix()} records={len(records)}",
+                flush=True,
+            )
+        return records, filter_report
+
+    def _save_cached_records(self, *, progress: bool) -> None:
+        cache_path = self.mapper_record_cache_path
+        if cache_path is None:
+            return
+
+        import pandas as pd
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path = mapper_v1_record_cache_metadata_path(cache_path)
+        tmp_cache_path = cache_path.with_name(f"{cache_path.name}.tmp")
+        tmp_metadata_path = metadata_path.with_name(f"{metadata_path.name}.tmp")
+        frame = pd.DataFrame(
+            {
+                "control_record_index": [record.control_record_index for record in self.records],
+                "target_seq_len": [record.target_seq_len for record in self.records],
+            }
+        )
+        metadata = {
+            "validity": self._record_cache_validity_metadata(),
+            "filter_report": asdict(self.filter_report),
+        }
+        frame.to_parquet(tmp_cache_path, index=False)
+        tmp_metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_cache_path.replace(cache_path)
+        tmp_metadata_path.replace(metadata_path)
+        if progress:
+            print(
+                "mapper_v1_window_dataset_cache status=written "
+                f"path={cache_path.as_posix()} records={len(self.records)}",
+                flush=True,
+            )
+
+    def _record_cache_validity_metadata(self) -> dict[str, Any]:
+        index_path = getattr(self.control_dataset, "index_path", None)
+        dataset_root = getattr(self.control_dataset, "dataset_root", None)
+        # The record cache assumes beatmap .osu contents are immutable for a given index.
+        # If mapper data is regenerated from edited .osu files, rebuild the source index
+        # or delete this cache so tokenization eligibility and lengths are recomputed.
+        metadata: dict[str, Any] = {
+            "schema_version": MAPPER_V1_RECORD_CACHE_SCHEMA_VERSION,
+            "tokenizer_cache_version": MAPPER_V1_TOKENIZER_CACHE_VERSION,
+            "mapper_stride_frames": int(self.mapper_stride_frames),
+            "mapper_write_ms": int(MAPPER_WRITE_MS),
+            "frame_hop_ms": int(FRAME_HOP_MS),
+            "source_window_count": len(self.control_dataset.records),
+            "control_records_sha1": mapper_v1_control_records_sha1(self.control_dataset.records),
+        }
+        if index_path is not None:
+            path = Path(index_path)
+            metadata["source_index_path"] = path.as_posix()
+            if path.exists():
+                metadata["source_index_sha1"] = _file_sha1(path)
+        if dataset_root is not None:
+            metadata["dataset_root"] = Path(dataset_root).as_posix()
+        return metadata
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         mapper_record = self.records[index]
@@ -348,6 +466,122 @@ class MapperV1WindowDataset(Dataset):
                 raise ValueError("control_v3 target slice must contain only finite values")
             slices.append(slice_tensor)
         return torch.cat(slices, dim=0).contiguous()
+
+
+def mapper_v1_record_cache_metadata_path(cache_path: str | Path) -> Path:
+    return Path(cache_path).with_suffix(".json")
+
+
+def mapper_v1_control_records_sha1(records: Sequence[ControlWindowRecord]) -> str:
+    digest = hashlib.sha1()
+    for index, record in enumerate(records):
+        if not isinstance(record, ControlWindowRecord):
+            raise TypeError(f"control dataset record {index} must be a ControlWindowRecord")
+        digest.update(
+            "\t".join(
+                (
+                    str(index),
+                    record.beatmap_path.as_posix(),
+                    record.audio_path.as_posix(),
+                    f"{float(record.difficulty):.8f}",
+                    str(int(record.frame_count)),
+                    str(int(record.target_start_frame)),
+                    "" if record.beatmap_id is None else str(int(record.beatmap_id)),
+                    "" if record.filtered_index is None else str(int(record.filtered_index)),
+                    "" if record.source_index is None else str(int(record.source_index)),
+                )
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _file_sha1(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mapper_v1_filter_report_from_metadata(payload: object) -> MapperV1WindowFilterReport:
+    if not isinstance(payload, Mapping):
+        raise ValueError("mapper v1 record cache metadata missing filter_report")
+    return MapperV1WindowFilterReport(
+        num_total_windows=_metadata_int(payload, "num_total_windows"),
+        num_mapper_eligible_windows=_metadata_int(payload, "num_mapper_eligible_windows"),
+        num_dropped_short_windows=_metadata_int(payload, "num_dropped_short_windows"),
+        num_dropped_cross_window_ln_windows=_metadata_int(payload, "num_dropped_cross_window_ln_windows"),
+        num_dropped_unsupported_action_windows=_metadata_int(payload, "num_dropped_unsupported_action_windows"),
+        drop_rate=_metadata_float(payload, "drop_rate"),
+        short_drop_rate=_metadata_float(payload, "short_drop_rate"),
+        cross_window_ln_drop_rate=_metadata_float(payload, "cross_window_ln_drop_rate"),
+        unsupported_action_drop_rate=_metadata_float(payload, "unsupported_action_drop_rate"),
+        drop_rate_by_difficulty=_metadata_float_mapping(payload, "drop_rate_by_difficulty"),
+        drop_rate_by_song=_metadata_float_mapping(payload, "drop_rate_by_song"),
+    )
+
+
+def _metadata_int(payload: Mapping[str, object], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be an integer")
+    try:
+        integer = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be an integer") from exc
+    if integer < 0:
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be non-negative")
+    return integer
+
+
+def _metadata_float(payload: Mapping[str, object], key: str) -> float:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be a number")
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be a number") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be finite")
+    return number
+
+
+def _metadata_float_mapping(payload: Mapping[str, object], key: str) -> dict[str, float]:
+    value = payload.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"mapper v1 record cache filter_report.{key} must be a mapping")
+    return {str(item_key): _metadata_float(value, str(item_key)) for item_key in value}
+
+
+def _cache_positive_index(value: object, record_count: int, row_number: int) -> int:
+    index = _cache_nonnegative_int(value, "control_record_index", row_number)
+    if index >= record_count:
+        raise ValueError(
+            f"mapper v1 record cache row {row_number} control_record_index is out of range: "
+            f"{index} >= {record_count}"
+        )
+    return index
+
+
+def _cache_positive_int(value: object, name: str, row_number: int) -> int:
+    integer = _cache_nonnegative_int(value, name, row_number)
+    if integer <= 0:
+        raise ValueError(f"mapper v1 record cache row {row_number} {name} must be positive")
+    return integer
+
+
+def _cache_nonnegative_int(value: object, name: str, row_number: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"mapper v1 record cache row {row_number} {name} must be an integer")
+    try:
+        integer = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"mapper v1 record cache row {row_number} {name} must be an integer") from exc
+    if integer < 0:
+        raise ValueError(f"mapper v1 record cache row {row_number} {name} must be non-negative")
+    return integer
 
 
 def extract_mapper_density_8s(control_v3_target_8s: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

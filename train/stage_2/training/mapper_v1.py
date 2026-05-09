@@ -85,6 +85,7 @@ RUN_CONFIG_KEYS = {
     "num_workers",
     "max_cached_maps",
     "dataset_progress",
+    "mapper_record_cache_path",
     "length_bucketed_batches",
     "length_bucket_size_multiplier",
     "control_teacher_cache_dir",
@@ -328,6 +329,7 @@ def run_mapper_v1_phase_b_training(
     num_workers: int = 0,
     max_cached_maps: int | None = None,
     dataset_progress: bool | None = None,
+    mapper_record_cache_path: Path | None = None,
     length_bucketed_batches: bool = False,
     length_bucket_size_multiplier: int = 32,
     control_teacher_cache_dir: Path | None = None,
@@ -391,6 +393,8 @@ def run_mapper_v1_phase_b_training(
     if control_teacher_cache_dir is not None:
         mapper_dataset_kwargs["control_teacher_cache_dir"] = control_teacher_cache_dir
         mapper_dataset_kwargs["require_control_teacher_cache"] = bool(require_control_teacher_cache)
+    if mapper_record_cache_path is not None:
+        mapper_dataset_kwargs["mapper_record_cache_path"] = mapper_record_cache_path
     train_source = MapperV1WindowDataset(**mapper_dataset_kwargs)
     if len(train_source) == 0:
         raise ValueError("MapperV1WindowDataset produced no training windows")
@@ -475,6 +479,9 @@ def run_mapper_v1_phase_b_training(
             "filter_report": asdict(train_source.filter_report),
             "max_cached_maps": int(getattr(train_source.control_dataset, "max_cached_maps", effective_max_cached_maps)),
             "dataset_progress": bool(effective_dataset_progress),
+            "mapper_record_cache_path": (
+                mapper_record_cache_path.as_posix() if mapper_record_cache_path is not None else None
+            ),
             "num_workers": num_workers,
             "length_bucketed_batches": bool(length_bucketed_batches),
             "length_bucket_size_multiplier": int(length_bucket_size_multiplier),
@@ -1830,6 +1837,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--num-workers", type=int, default=config_defaults.get("num_workers", 0))
     parser.add_argument("--max-cached-maps", type=int, default=config_defaults.get("max_cached_maps"))
+    parser.add_argument("--mapper-record-cache-path", default=config_defaults.get("mapper_record_cache_path"))
     parser.add_argument(
         "--dataset-progress",
         action=argparse.BooleanOptionalAction,
@@ -1961,6 +1969,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             num_workers=args.num_workers,
             max_cached_maps=args.max_cached_maps,
             dataset_progress=args.dataset_progress,
+            mapper_record_cache_path=(
+                Path(args.mapper_record_cache_path)
+                if args.mapper_record_cache_path is not None
+                else None
+            ),
             length_bucketed_batches=args.length_bucketed_batches,
             length_bucket_size_multiplier=args.length_bucket_size_multiplier,
             control_teacher_cache_dir=(
