@@ -28,6 +28,7 @@ from train.stage_2.data.mapper_v1_windows import (
     MapperV1WindowDataset,
     collate_mapper_v1_windows,
     control_teacher_cache_path,
+    is_mapper_v1_window_start_allowed,
     save_control_teacher_cache_entry,
 )
 from train.stage_2.model_control_demo_global import ControlDemoGlobalEncoder, ControlDemoGlobalEncoderConfig
@@ -907,7 +908,7 @@ def _mapper_v1_raw_control_indexed_records(
     for index, record in enumerate(records):
         if not isinstance(record, ControlWindowRecord):
             raise TypeError(f"control dataset record {index} must be a ControlWindowRecord")
-        if record.target_start_frame % mapper_stride_frames != 0:
+        if not is_mapper_v1_window_start_allowed(record, mapper_stride_frames=mapper_stride_frames):
             skipped_stride += 1
             continue
         if record.target_start_frame + MAPPER_WRITE_FRAMES > record.frame_count:

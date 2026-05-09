@@ -51,6 +51,13 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         cached_config = load_run_config("train/stage_2/training/configs/stage2_mapper_v1_phase_b_cached_demo_mps.yaml")
         self.assertTrue(cached_config["length_bucketed_batches"])
         self.assertEqual(cached_config["length_bucket_size_multiplier"], 32)
+        density_eos_config = load_run_config(
+            "train/stage_2/training/configs/stage2_mapper_v1_phase_b_cached_demo_density_eos_mps.yaml",
+        )
+        self.assertIn("checkpoint_step_001250.pt", density_eos_config["init_from_mapper_checkpoint"])
+        self.assertIn("plus_end.parquet", density_eos_config["index_path"])
+        self.assertGreater(density_eos_config["loss"]["lambda_density"], 0.0)
+        self.assertTrue(density_eos_config["precompute_control_teacher_cache"])
 
     def test_phase_b_loss_config_allows_density_enablement(self) -> None:
         config = MapperV1PhaseBLossConfig(lambda_density=0.01)
@@ -551,10 +558,17 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                 target_start_frame=0,
             ),
             ControlWindowRecord(
+                beatmap_path=Path("terminal.osu"),
+                audio_path=Path("terminal.mp3"),
+                difficulty=4.0,
+                frame_count=500,
+                target_start_frame=100,
+            ),
+            ControlWindowRecord(
                 beatmap_path=Path("stride_skip.osu"),
                 audio_path=Path("stride_skip.mp3"),
                 difficulty=4.0,
-                frame_count=500,
+                frame_count=700,
                 target_start_frame=100,
             ),
             ControlWindowRecord(
@@ -575,15 +589,20 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                 device=torch.device("cpu"),
             )
 
-            self.assertEqual(result.total_entries, 1)
-            self.assertEqual(result.computed_entries, 1)
+            self.assertEqual(result.total_entries, 2)
+            self.assertEqual(result.computed_entries, 2)
             entry = load_control_teacher_cache_entry(
                 control_teacher_cache_path(cache_dir, records[0]),
                 record=records[0],
             )
             self.assertEqual(tuple(entry["control_memory_8s"].shape), (400, 2))
-            self.assertFalse(control_teacher_cache_path(cache_dir, records[1]).exists())
+            terminal_entry = load_control_teacher_cache_entry(
+                control_teacher_cache_path(cache_dir, records[1]),
+                record=records[1],
+            )
+            self.assertEqual(tuple(terminal_entry["control_memory_8s"].shape), (400, 2))
             self.assertFalse(control_teacher_cache_path(cache_dir, records[2]).exists())
+            self.assertFalse(control_teacher_cache_path(cache_dir, records[3]).exists())
 
 
 class _TinyControlDataset:

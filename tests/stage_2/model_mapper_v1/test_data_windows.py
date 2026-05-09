@@ -116,6 +116,21 @@ class MapperV1DataWindowTests(unittest.TestCase):
         self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["3.00"], 1.0)
         self.assertEqual(dataset.filter_report.drop_rate_by_difficulty["4.00"], 0.0)
 
+    def test_mapper_dataset_keeps_non_stride_terminal_full_windows(self) -> None:
+        records = [
+            _record("stride.osu", difficulty=4.0, frame_count=700, target_start_frame=0),
+            _record("terminal.osu", difficulty=4.0, frame_count=700, target_start_frame=300),
+            _record("non_terminal.osu", difficulty=4.0, frame_count=700, target_start_frame=100),
+        ]
+
+        dataset = _MapperDatasetWithUnsupportedActions(records, unsupported_paths=set())
+
+        self.assertEqual(
+            [record.control_record.beatmap_path for record in dataset.records],
+            [Path("stride.osu"), Path("terminal.osu")],
+        )
+        self.assertEqual(dataset.filter_report.num_total_windows, 2)
+
     def test_control_teacher_cache_hit_skips_full_control_inputs_and_collates_teacher(self) -> None:
         record = _record("cached.osu", difficulty=4.0)
         control_memory = torch.arange(400 * 3, dtype=torch.float32).reshape(400, 3)
@@ -138,10 +153,14 @@ class MapperV1DataWindowTests(unittest.TestCase):
 
             self.assertTrue(torch.equal(sample["control_memory_8s"], control_memory))
             self.assertTrue(torch.equal(sample["density_teacher_8s"], density_teacher))
+            self.assertIn("density_target_8s", sample)
+            self.assertIn("density_confidence_8s", sample)
             self.assertNotIn("full_mel", sample)
             batch = collate_mapper_v1_windows([sample], pad_id=MapperV1Vocab().pad_id)
             self.assertEqual(batch["control_memory_8s"].shape, (1, 400, 3))
             self.assertEqual(batch["density_teacher_8s"].shape, (1, 400, 1))
+            self.assertEqual(batch["density_target_8s"].shape, (1, 400, 1))
+            self.assertEqual(batch["density_confidence_8s"].shape, (1, 400, 1))
             self.assertNotIn("full_mel", batch)
 
     def test_save_control_teacher_cache_entry_compacts_sliced_batch_storage(self) -> None:
@@ -193,13 +212,19 @@ def _sample(tokenized) -> dict[str, Any]:
     }
 
 
-def _record(beatmap_path: str, *, difficulty: float) -> ControlWindowRecord:
+def _record(
+    beatmap_path: str,
+    *,
+    difficulty: float,
+    frame_count: int = 400,
+    target_start_frame: int = 0,
+) -> ControlWindowRecord:
     return ControlWindowRecord(
         beatmap_path=Path(beatmap_path),
         audio_path=Path(f"{beatmap_path}.mp3"),
         difficulty=difficulty,
-        frame_count=400,
-        target_start_frame=0,
+        frame_count=frame_count,
+        target_start_frame=target_start_frame,
     )
 
 
@@ -227,6 +252,12 @@ class _RaisingControlDataset:
 
     def __getitem__(self, index: int):
         raise AssertionError("control dataset should not be read on cache hit")
+
+    def target_loader(self, record: ControlWindowRecord) -> torch.Tensor:
+        target = torch.zeros(100, len(MODEL_FEATURE_NAMES), dtype=torch.float32)
+        target[:, MODEL_FEATURE_NAMES.index("density_level")] = 0.5
+        target[:, MODEL_FEATURE_NAMES.index("density_confidence")] = 1.0
+        return target
 
 
 class _MapperDatasetWithControlTeacherCache(MapperV1WindowDataset):

@@ -159,8 +159,13 @@ class MapperV1WindowDataset(Dataset):
             "metadata": metadata,
         }
         if cache_entry is not None:
+            density_target_8s, density_confidence_8s = extract_mapper_density_8s(
+                self._load_control_v3_target_8s(record),
+            )
             sample["control_memory_8s"] = cache_entry["control_memory_8s"]
             sample["density_teacher_8s"] = cache_entry["density_teacher_8s"]
+            sample["density_target_8s"] = density_target_8s
+            sample["density_confidence_8s"] = density_confidence_8s
             return sample
 
         base_sample = self.control_dataset[mapper_record.control_record_index]
@@ -242,7 +247,7 @@ class MapperV1WindowDataset(Dataset):
             )
 
         for index, record in enumerate(self.control_dataset.records):
-            if record.target_start_frame % self.mapper_stride_frames != 0:
+            if not is_mapper_v1_window_start_allowed(record, mapper_stride_frames=self.mapper_stride_frames):
                 continue
             total_windows += 1
             difficulty_key = _difficulty_report_key(record.difficulty)
@@ -346,6 +351,14 @@ def extract_mapper_density_8s(control_v3_target_8s: torch.Tensor) -> tuple[torch
     if torch.any((density_confidence < 0.0) | (density_confidence > 1.0)):
         raise ValueError("density_confidence_8s must be in [0, 1]")
     return density_target, density_confidence
+
+
+def is_mapper_v1_window_start_allowed(record: ControlWindowRecord, *, mapper_stride_frames: int = MAPPER_WRITE_FRAMES) -> bool:
+    if mapper_stride_frames <= 0:
+        raise ValueError(f"mapper_stride_frames must be positive: {mapper_stride_frames}")
+    if int(record.target_start_frame) % int(mapper_stride_frames) == 0:
+        return True
+    return int(record.target_start_frame) + MAPPER_WRITE_FRAMES == int(record.frame_count)
 
 
 def control_teacher_cache_key(record: ControlWindowRecord) -> str:
