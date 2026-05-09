@@ -1,0 +1,21 @@
+checkpoint_path: train/artifacts/runs/stage2_mapper_v1/stage2_mapper_v1_phase_b_cached_demo_d384_l4_b4_init1000_memfix/checkpoints/checkpoint_step_000750.pt
+audio_path: mania-dataset/0/1000065/audio.mp3
+difficulty: 4.49
+output_path: train/artifacts/inference/mapper_model_v1_8swindow_1000065.osu
+device: auto
+max_tokens: 512
+temperature: 0.0
+top_p:
+seed:
+
+timing:
+  mode: constant
+  bpm: 180.0
+  offset_ms: 0.0
+  meter: 4
+
+metadata:
+  title: Mapper V1 8s Window Smoke
+  artist: Unknown
+  creator: Mapperatorinator
+  version: Stage2 mapper v1 8s window
