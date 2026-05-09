@@ -422,8 +422,12 @@ def save_control_teacher_cache_entry(
     density_teacher_8s: torch.Tensor,
 ) -> None:
     cache_path = Path(path)
-    control_memory = control_memory_8s.detach().to(device="cpu", dtype=torch.float32).contiguous()
-    density_teacher = density_teacher_8s.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    control_memory = control_memory_8s.detach().to(device="cpu", dtype=torch.float32).clone(
+        memory_format=torch.contiguous_format,
+    )
+    density_teacher = density_teacher_8s.detach().to(device="cpu", dtype=torch.float32).clone(
+        memory_format=torch.contiguous_format,
+    )
     if control_memory.ndim != 2 or int(control_memory.shape[0]) != MAPPER_DENSITY_FRAMES:
         raise ValueError(
             f"control_memory_8s must have shape [{MAPPER_DENSITY_FRAMES},D], got {tuple(control_memory.shape)}"

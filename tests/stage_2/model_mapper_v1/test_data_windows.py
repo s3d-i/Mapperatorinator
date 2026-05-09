@@ -144,6 +144,27 @@ class MapperV1DataWindowTests(unittest.TestCase):
             self.assertEqual(batch["density_teacher_8s"].shape, (1, 400, 1))
             self.assertNotIn("full_mel", batch)
 
+    def test_save_control_teacher_cache_entry_compacts_sliced_batch_storage(self) -> None:
+        record = _record("compact.osu", difficulty=4.0)
+        batched_control = torch.arange(2 * 400 * 3, dtype=torch.float32).reshape(2, 400, 3)
+        batched_density = torch.arange(2 * 400, dtype=torch.float32).reshape(2, 400, 1)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = control_teacher_cache_path(temp_dir, record)
+            save_control_teacher_cache_entry(
+                cache_path,
+                record=record,
+                control_memory_8s=batched_control[1],
+                density_teacher_8s=batched_density[1],
+            )
+
+            loaded = load_control_teacher_cache_entry(cache_path, record=record)
+
+        control_memory = loaded["control_memory_8s"]
+        density_teacher = loaded["density_teacher_8s"]
+        self.assertEqual(control_memory.untyped_storage().nbytes(), control_memory.numel() * control_memory.element_size())
+        self.assertEqual(density_teacher.untyped_storage().nbytes(), density_teacher.numel() * density_teacher.element_size())
+
 
 def _sample(tokenized) -> dict[str, Any]:
     return {
