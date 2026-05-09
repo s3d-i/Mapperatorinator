@@ -25,6 +25,8 @@ final_train_eval_size: 1024
 
 num_workers: 0
 max_cached_maps: 8
+length_bucketed_batches: true
+length_bucket_size_multiplier: 32
 control_teacher_cache_dir: train/artifacts/cache/stage2_mapper_v1/control_teacher_d384_l3_stride16_step002000
 precompute_control_teacher_cache: false
 control_teacher_precompute_batch_size: 8

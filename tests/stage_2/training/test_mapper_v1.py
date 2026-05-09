@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 from torch import nn
+from torch.utils.data import Dataset, Subset
 
 from train.stage_2.data.control_windows import ControlWindowRecord, normalize_difficulty
 from train.stage_2.data.mapper_v1_windows import (
@@ -20,6 +21,7 @@ from train.stage_2.model_mapper_v1 import MapperV1Config, MapperV1Model
 from train.stage_2.training import mapper_v1 as mapper_v1_training
 from train.stage_2.training.mapper_v1 import (
     MapperV1PhaseBLossConfig,
+    _MapperV1TokenLengthBucketBatchSampler,
     _collate_synthetic_mapper_samples,
     _loss_for_raw_batch,
     _synthetic_mapper_samples,
@@ -41,7 +43,12 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
         self.assertEqual(config["loss"]["lambda_density_teacher"], 0.0)
         self.assertEqual(config["model"]["skip_scale"], 0.0)
         self.assertEqual(config["model"]["state_prior_adapter_scale"], 0.03)
+        self.assertTrue(config["length_bucketed_batches"])
+        self.assertEqual(config["length_bucket_size_multiplier"], 32)
         self.assertIn("stage2_control_demo_global", config["init_from_control_checkpoint"])
+        cached_config = load_run_config("train/stage_2/training/configs/stage2_mapper_v1_phase_b_cached_demo_mps.yaml")
+        self.assertTrue(cached_config["length_bucketed_batches"])
+        self.assertEqual(cached_config["length_bucket_size_multiplier"], 32)
 
     def test_phase_b_loss_config_allows_density_enablement(self) -> None:
         config = MapperV1PhaseBLossConfig(lambda_density=0.01)
@@ -181,6 +188,50 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown model config keys"):
                 load_run_config(path)
 
+    def test_length_bucket_sampler_groups_by_target_tokens_without_materializing_samples(self) -> None:
+        dataset = _TargetLengthDataset([80, 5, 78, 6, 7, 82, 8, 79])
+
+        sampler = _MapperV1TokenLengthBucketBatchSampler(
+            dataset,
+            batch_size=2,
+            bucket_size_multiplier=4,
+            shuffle=False,
+            seed=1337,
+        )
+
+        self.assertEqual(list(iter(sampler)), [[1, 3], [4, 6], [2, 7], [0, 5]])
+        self.assertEqual(len(sampler), 4)
+        self.assertEqual(dataset.getitem_calls, 0)
+
+    def test_length_bucket_sampler_uses_subset_local_indices(self) -> None:
+        dataset = _TargetLengthDataset([80, 5, 78, 6, 7, 82, 8, 79])
+        subset = Subset(dataset, [5, 1, 0, 4])
+
+        sampler = _MapperV1TokenLengthBucketBatchSampler(
+            subset,
+            batch_size=2,
+            bucket_size_multiplier=2,
+            shuffle=False,
+            seed=1337,
+        )
+
+        self.assertEqual(list(iter(sampler)), [[1, 3], [2, 0]])
+        self.assertEqual(dataset.getitem_calls, 0)
+
+    def test_length_bucket_sampler_uses_record_target_seq_len_without_retokenizing(self) -> None:
+        dataset = _RecordLengthDataset([40, 10, 38, 12])
+
+        sampler = _MapperV1TokenLengthBucketBatchSampler(
+            dataset,
+            batch_size=2,
+            bucket_size_multiplier=2,
+            shuffle=False,
+            seed=1337,
+        )
+
+        self.assertEqual(list(iter(sampler)), [[1, 3], [2, 0]])
+        self.assertEqual(dataset.tokenize_calls, 0)
+
     def test_cache_only_cli_runs_precompute_without_training(self) -> None:
         precompute_result = SimpleNamespace(
             reports=[
@@ -198,6 +249,7 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                 mapper_v1_training,
                 "precompute_mapper_v1_phase_b_control_teacher_cache",
                 return_value=precompute_result,
+                autospec=True,
             ) as precompute:
                 with patch.object(mapper_v1_training, "run_mapper_v1_phase_b_training") as train:
                     mapper_v1_training.main(
@@ -209,7 +261,36 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
                     )
 
         precompute.assert_called_once()
+        self.assertNotIn("length_bucketed_batches", precompute.call_args.kwargs)
+        self.assertNotIn("length_bucket_size_multiplier", precompute.call_args.kwargs)
         train.assert_not_called()
+
+    def test_main_forwards_length_bucket_options_to_training(self) -> None:
+        train_result = SimpleNamespace(
+            report_path=Path("report.json"),
+            checkpoint_path=Path("checkpoint.pt"),
+            final_loss=0.0,
+            completed_steps=0,
+        )
+        with patch.object(
+            mapper_v1_training,
+            "run_mapper_v1_phase_b_training",
+            return_value=train_result,
+            autospec=True,
+        ) as train:
+            mapper_v1_training.main(
+                [
+                    "--length-bucketed-batches",
+                    "--length-bucket-size-multiplier",
+                    "7",
+                    "--max-steps",
+                    "1",
+                ]
+            )
+
+        train.assert_called_once()
+        self.assertTrue(train.call_args.kwargs["length_bucketed_batches"])
+        self.assertEqual(train.call_args.kwargs["length_bucket_size_multiplier"], 7)
 
     def test_precomputed_control_teacher_cache_feeds_phase_b_loss_without_full_inputs(self) -> None:
         record = ControlWindowRecord(
@@ -388,6 +469,35 @@ class _TinyControlDataset:
         target = torch.zeros(100, len(MODEL_FEATURE_NAMES), dtype=torch.float32)
         target[:, MODEL_FEATURE_NAMES.index("density_confidence")] = 1.0
         return target
+
+
+class _TargetLengthDataset(Dataset):
+    def __init__(self, target_token_lengths: list[int]) -> None:
+        self.target_token_lengths = target_token_lengths
+        self.getitem_calls = 0
+
+    def __len__(self) -> int:
+        return len(self.target_token_lengths)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        self.getitem_calls += 1
+        raise AssertionError("length bucketing must not materialize samples")
+
+
+class _RecordLengthDataset(Dataset):
+    def __init__(self, target_seq_lengths: list[int]) -> None:
+        self.records = [SimpleNamespace(target_seq_len=length) for length in target_seq_lengths]
+        self.tokenize_calls = 0
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        raise AssertionError("length bucketing must not materialize samples")
+
+    def _tokenize_record(self, record: object) -> object:
+        self.tokenize_calls += 1
+        raise AssertionError("target_seq_len should avoid retokenization")
 
 
 class _TinyMapperDataset(MapperV1WindowDataset):

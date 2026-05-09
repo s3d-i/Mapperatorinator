@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler, Subset
 
 from train.stage_2.data.control_windows import (
     ControlWindowDataset,
@@ -80,6 +80,8 @@ RUN_CONFIG_KEYS = {
     "num_workers",
     "max_cached_maps",
     "dataset_progress",
+    "length_bucketed_batches",
+    "length_bucket_size_multiplier",
     "control_teacher_cache_dir",
     "precompute_control_teacher_cache",
     "precompute_control_teacher_cache_only",
@@ -319,6 +321,8 @@ def run_mapper_v1_phase_b_training(
     num_workers: int = 0,
     max_cached_maps: int | None = None,
     dataset_progress: bool | None = None,
+    length_bucketed_batches: bool = False,
+    length_bucket_size_multiplier: int = 32,
     control_teacher_cache_dir: Path | None = None,
     precompute_control_teacher_cache: bool = False,
     control_teacher_precompute_batch_size: int | None = None,
@@ -407,15 +411,13 @@ def run_mapper_v1_phase_b_training(
     if len(eval_dataset) == 0:
         eval_dataset = train_dataset
 
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    loader = DataLoader(
+    loader = _make_mapper_v1_phase_b_train_loader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
         num_workers=num_workers,
-        collate_fn=collate_mapper_v1_windows,
+        seed=seed,
+        length_bucketed_batches=length_bucketed_batches,
+        length_bucket_size_multiplier=length_bucket_size_multiplier,
     )
     train_eval_dataset = limit_final_train_eval_dataset(
         train_dataset,
@@ -467,6 +469,8 @@ def run_mapper_v1_phase_b_training(
             "max_cached_maps": int(getattr(train_source.control_dataset, "max_cached_maps", effective_max_cached_maps)),
             "dataset_progress": bool(effective_dataset_progress),
             "num_workers": num_workers,
+            "length_bucketed_batches": bool(length_bucketed_batches),
+            "length_bucket_size_multiplier": int(length_bucket_size_multiplier),
             "control_teacher_cache_dir": (
                 control_teacher_cache_dir.as_posix() if control_teacher_cache_dir is not None else None
             ),
@@ -478,6 +482,131 @@ def run_mapper_v1_phase_b_training(
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
     )
+
+
+def _make_mapper_v1_phase_b_train_loader(
+    dataset: Dataset[Any],
+    *,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    length_bucketed_batches: bool,
+    length_bucket_size_multiplier: int,
+) -> DataLoader:
+    if not length_bucketed_batches:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            generator=generator,
+            num_workers=num_workers,
+            collate_fn=collate_mapper_v1_windows,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_sampler=_MapperV1TokenLengthBucketBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            bucket_size_multiplier=length_bucket_size_multiplier,
+            shuffle=True,
+            seed=seed,
+        ),
+        num_workers=num_workers,
+        collate_fn=collate_mapper_v1_windows,
+    )
+
+
+class _MapperV1TokenLengthBucketBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        dataset: Dataset[Any],
+        *,
+        batch_size: int,
+        bucket_size_multiplier: int,
+        shuffle: bool,
+        seed: int,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if bucket_size_multiplier <= 0:
+            raise ValueError(f"length_bucket_size_multiplier must be positive, got {bucket_size_multiplier}")
+        self.target_token_lengths = [
+            _mapper_v1_target_token_length(dataset, index)
+            for index in range(len(dataset))
+        ]
+        self.batch_size = int(batch_size)
+        self.bucket_size = int(batch_size) * int(bucket_size_multiplier)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = list(range(len(self.target_token_lengths)))
+        if self.shuffle:
+            indices = torch.randperm(len(indices), generator=generator).tolist()
+        batches = list(self._batches_for(indices))
+        if self.shuffle and len(batches) > 1:
+            order = torch.randperm(len(batches), generator=generator).tolist()
+            batches = [batches[index] for index in order]
+        self.epoch += 1
+        yield from batches
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.target_token_lengths) / self.batch_size)
+
+    def _batches_for(self, indices: Sequence[int]):
+        for start in range(0, len(indices), self.bucket_size):
+            bucket = indices[start : start + self.bucket_size]
+            bucket.sort(key=lambda index: (self.target_token_lengths[index], index))
+            for batch_start in range(0, len(bucket), self.batch_size):
+                yield bucket[batch_start : batch_start + self.batch_size]
+
+
+def _mapper_v1_target_token_length(dataset: Dataset[Any], index: int) -> int:
+    if isinstance(dataset, Subset):
+        return _mapper_v1_target_token_length(dataset.dataset, int(dataset.indices[index]))
+
+    target_token_lengths = getattr(dataset, "target_token_lengths", None)
+    if target_token_lengths is not None:
+        return _positive_int(target_token_lengths[index], "target_token_length")
+
+    records = getattr(dataset, "records", None)
+    tokenizer = getattr(dataset, "_tokenize_record", None)
+    if records is None or not callable(tokenizer):
+        raise ValueError(
+            "length-aware mapper v1 batching requires a MapperV1WindowDataset "
+            "or a dataset exposing target_token_lengths"
+        )
+    mapper_record = records[index]
+    target_seq_len = getattr(mapper_record, "target_seq_len", None)
+    if target_seq_len is not None:
+        return _positive_int(target_seq_len, "target_token_length")
+    control_record = getattr(mapper_record, "control_record", mapper_record)
+    tokenized = tokenizer(control_record)
+    seq_len = getattr(tokenized, "seq_len", None)
+    if seq_len is None:
+        target_fragment_tensor = getattr(tokenized, "target_fragment_tensor", None)
+        if not callable(target_fragment_tensor):
+            raise ValueError("tokenized mapper window does not expose seq_len or target_fragment_tensor")
+        seq_len = int(target_fragment_tensor().shape[0])
+    return _positive_int(seq_len, "target_token_length")
+
+
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"{name} tensor must contain exactly one value")
+        value = int(value.item())
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
 
 
 class _ControlTeacherPrecomputeDataset(Dataset[Any]):
@@ -1129,7 +1258,7 @@ def _loss_for_raw_batch(
     )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def metrics_for_loader(
     model: MapperV1Model,
     loader: DataLoader,
@@ -1157,6 +1286,7 @@ def metrics_for_loader(
         for key in unresolved:
             fallback_totals[key] = fallback_totals.get(key, 0.0) + float(loss_output.metrics[key]) * weight
             fallback_weights[key] = fallback_weights.get(key, 0.0) + weight
+        del loss_output
     if not (count_totals or mean_numerators or fallback_totals):
         return {"loss/total": math.nan, "loss/token": math.nan, "loss/density": 0.0}
     metrics = dict(count_totals)
@@ -1239,6 +1369,7 @@ def _run_training(
         torch.nn.utils.clip_grad_norm_((parameter for parameter in model.parameters() if parameter.requires_grad), 1.0)
         optimizer.step()
         last_train_metrics = dict(loss_output.metrics)
+        del loss_output
         completed_step = step
 
         should_eval = step == 1 or step % eval_every == 0 or step == max_steps
@@ -1615,6 +1746,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         action=argparse.BooleanOptionalAction,
         default=config_defaults.get("dataset_progress"),
     )
+    parser.add_argument(
+        "--length-bucketed-batches",
+        action=argparse.BooleanOptionalAction,
+        default=bool(config_defaults.get("length_bucketed_batches", False)),
+    )
+    parser.add_argument(
+        "--length-bucket-size-multiplier",
+        type=int,
+        default=config_defaults.get("length_bucket_size_multiplier", 32),
+    )
     parser.add_argument("--control-teacher-cache-dir", default=config_defaults.get("control_teacher_cache_dir"))
     parser.add_argument(
         "--precompute-control-teacher-cache",
@@ -1725,6 +1866,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             num_workers=args.num_workers,
             max_cached_maps=args.max_cached_maps,
             dataset_progress=args.dataset_progress,
+            length_bucketed_batches=args.length_bucketed_batches,
+            length_bucket_size_multiplier=args.length_bucket_size_multiplier,
             control_teacher_cache_dir=(
                 Path(args.control_teacher_cache_dir)
                 if args.control_teacher_cache_dir is not None

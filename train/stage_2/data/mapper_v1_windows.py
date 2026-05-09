@@ -44,6 +44,7 @@ CONTROL_TEACHER_CACHE_SCHEMA_VERSION = 1
 class MapperV1WindowRecord:
     control_record_index: int
     control_record: ControlWindowRecord
+    target_seq_len: int
 
     @property
     def write_start_frame(self) -> int:
@@ -105,6 +106,7 @@ class MapperV1WindowDataset(Dataset):
         self.records, self.filter_report = self._build_records(
             progress=progress,
         )
+        self.target_token_lengths = [record.target_seq_len for record in self.records]
 
     def __len__(self) -> int:
         return len(self.records)
@@ -253,14 +255,20 @@ class MapperV1WindowDataset(Dataset):
             valid_by_difficulty[difficulty_key] = valid_by_difficulty.get(difficulty_key, 0) + 1
             valid_by_song[song_key] = valid_by_song.get(song_key, 0) + 1
             try:
-                self._tokenize_record(record)
+                tokenized = self._tokenize_record(record)
             except UnsupportedMapperActionError:
                 dropped_unsupported_action += 1
                 _increment_drop(dropped_by_difficulty, difficulty_key)
                 _increment_drop(dropped_by_song, song_key)
                 maybe_print_progress(index)
                 continue
-            records.append(MapperV1WindowRecord(control_record_index=index, control_record=record))
+            records.append(
+                MapperV1WindowRecord(
+                    control_record_index=index,
+                    control_record=record,
+                    target_seq_len=tokenized.seq_len,
+                )
+            )
             maybe_print_progress(index)
 
         dropped = dropped_short + dropped_cross_window + dropped_unsupported_action
