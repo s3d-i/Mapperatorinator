@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import pickle
 import time
@@ -41,6 +42,7 @@ from train.stage_2.training.control import (
     DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     ControlTrainingResult,
     _atomic_torch_save,
+    _advance_training_iterator,
     _capture_rng_state,
     _copy_file_atomically,
     _infinite_loader,
@@ -48,6 +50,8 @@ from train.stage_2.training.control import (
     _json_safe,
     _metric_is_count,
     _move_batch_tensors,
+    _move_optimizer_state_to_device,
+    _restore_rng_state,
     _safe_float_div,
     _set_deterministic_seed,
     _validate_training_args,
@@ -79,6 +83,7 @@ RUN_CONFIG_KEYS = {
     "run_name",
     "init_from_control_checkpoint",
     "init_from_mapper_checkpoint",
+    "resume_from",
     "eval_fraction",
     "eval_size",
     "final_train_eval_size",
@@ -95,10 +100,13 @@ RUN_CONFIG_KEYS = {
     "require_control_teacher_cache",
     "control_teacher_cache_overwrite",
     "synthetic_smoke",
+    "mps_cleanup_every",
     "model",
     "control_model",
     "loss",
 }
+MAPPER_RESUME_TRAINING_RUNTIME_KEYS = frozenset(("mps_cleanup_every",))
+MAPPER_RESUME_DATASET_RUNTIME_KEYS = frozenset(("max_cached_maps", "num_workers", "dataset_progress"))
 MODEL_CONFIG_KEYS = {field.name for field in fields(MapperV1Config)}
 CONTROL_MODEL_CONFIG_KEYS = {field.name for field in fields(ControlDemoGlobalEncoderConfig)}
 LOSS_CONFIG_KEYS = {
@@ -181,7 +189,6 @@ class MapperV1LossOutput:
     metrics: dict[str, float]
     metric_numerators: dict[str, float]
     metric_denominators: dict[str, float]
-    model_output: MapperV1ModelOutput
 
 
 @dataclass(frozen=True)
@@ -246,6 +253,8 @@ def run_synthetic_smoke(
     seed: int = 1337,
     device_name: str = "auto",
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
+    resume_from: Path | None = None,
+    mps_cleanup_every: int | None = None,
     model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
 ) -> ControlTrainingResult:
@@ -303,6 +312,8 @@ def run_synthetic_smoke(
         },
         init_from_control_checkpoint=None,
         init_from_mapper_checkpoint=None,
+        resume_from=resume_from,
+        mps_cleanup_every=mps_cleanup_every,
     )
 
 
@@ -325,6 +336,7 @@ def run_mapper_v1_phase_b_training(
     run_name: str = "mapper_v1_phase_b_teacher_forced",
     init_from_control_checkpoint: Path | None = None,
     init_from_mapper_checkpoint: Path | None = None,
+    resume_from: Path | None = None,
     eval_fraction: float = 0.1,
     eval_size: int | None = None,
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
@@ -339,6 +351,7 @@ def run_mapper_v1_phase_b_training(
     control_teacher_precompute_batch_size: int | None = None,
     require_control_teacher_cache: bool = False,
     control_teacher_cache_overwrite: bool = False,
+    mps_cleanup_every: int | None = None,
     model_config_overrides: Mapping[str, Any] | None = None,
     control_model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
@@ -498,6 +511,8 @@ def run_mapper_v1_phase_b_training(
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
         init_from_mapper_checkpoint=init_from_mapper_checkpoint,
+        resume_from=resume_from,
+        mps_cleanup_every=mps_cleanup_every,
     )
 
 
@@ -759,6 +774,13 @@ def _release_torch_device_cache(device: torch.device) -> None:
     empty_cache = getattr(torch.mps, "empty_cache", None)
     if empty_cache is not None:
         empty_cache()
+
+
+def _cleanup_mps_training_memory(device: torch.device) -> None:
+    if device.type != "mps" or not hasattr(torch, "mps"):
+        return
+    gc.collect()
+    _release_torch_device_cache(device)
 
 
 def _compute_control_teacher_8s_for_precompute(
@@ -1216,7 +1238,6 @@ def compute_phase_b_loss(
             "loss/ln_close": max(metrics["ln_close/open_lane_count"], 1.0),
             "loss/density": max(density_weight, 1.0),
         },
-        model_output=model_output,
     )
 
 
@@ -1364,10 +1385,12 @@ def _run_training(
     dataset_report: Mapping[str, Any],
     init_from_control_checkpoint: Path | None,
     init_from_mapper_checkpoint: Path | None,
+    resume_from: Path | None = None,
     model_factory: Callable[[MapperV1Config, ControlDemoGlobalEncoder | None], MapperV1Model] | None = None,
     mapper_checkpoint_initializer: Callable[..., Mapping[str, Any]] | None = None,
     progress_label: str = "mapper_v1_phase_b",
     skip_first_eval_pass: bool = False,
+    mps_cleanup_every: int | None = None,
 ) -> ControlTrainingResult:
     _validate_training_args(
         max_steps=max_steps,
@@ -1378,6 +1401,16 @@ def _run_training(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
     )
+    if mps_cleanup_every is not None:
+        if isinstance(mps_cleanup_every, bool):
+            raise ValueError("mps_cleanup_every must be an integer step interval")
+        mps_cleanup_every = int(mps_cleanup_every)
+        if mps_cleanup_every < 0:
+            raise ValueError("mps_cleanup_every must be non-negative")
+        if mps_cleanup_every == 0:
+            mps_cleanup_every = None
+    if resume_from is not None and init_from_mapper_checkpoint is not None:
+        raise ValueError("resume_from and init_from_mapper_checkpoint cannot both be set")
     _set_deterministic_seed(seed)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = select_torch_device(device_name)
@@ -1389,7 +1422,7 @@ def _run_training(
     initialization_report: dict[str, Any] | None = None
     if control_model_config is not None:
         control_encoder = ControlDemoGlobalEncoder(control_model_config)
-        if init_from_control_checkpoint is not None and init_from_mapper_checkpoint is None:
+        if init_from_control_checkpoint is not None and init_from_mapper_checkpoint is None and resume_from is None:
             initialization_report = initialize_global_control_demo_from_control_checkpoint(
                 control_encoder,
                 init_from_control_checkpoint,
@@ -1410,6 +1443,18 @@ def _run_training(
         )
     model = model.to(device)
     optimizer = _build_mapper_v1_optimizer(model, learning_rate=learning_rate, weight_decay=weight_decay)
+    resume_config = _mapper_resume_training_config(
+        seed=seed,
+        run_name=run_name,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        eval_every=eval_every,
+        save_every=save_every,
+        skip_first_eval_pass=skip_first_eval_pass,
+        loss_config=loss_config,
+        dataset_report=dataset_report,
+        mps_cleanup_every=mps_cleanup_every,
+    )
     iterator = _infinite_loader(loader)
     history: list[dict[str, Any]] = []
     completed_step = 0
@@ -1417,9 +1462,34 @@ def _run_training(
     final_train_metrics: dict[str, float] = {}
     final_eval_metrics: dict[str, float] = {}
 
+    if resume_from is not None:
+        checkpoint = _load_mapper_resume_checkpoint(
+            resume_from,
+            expected_model_config=model_config,
+            expected_control_model_config=control_model_config,
+            expected_loss_config=loss_config,
+            expected_training_config=resume_config,
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        _move_optimizer_state_to_device(optimizer, device)
+        training_state = checkpoint["training_state"]
+        completed_step = int(training_state["step"])
+        if completed_step > max_steps:
+            raise ValueError(f"resume checkpoint step {completed_step} exceeds requested max_steps {max_steps}")
+        history = [dict(entry) for entry in checkpoint["history"]]
+        last_train_metrics = dict(training_state.get("last_train_metrics", {}))
+        final_train_metrics = dict(training_state.get("final_train_metrics", {}))
+        final_eval_metrics = dict(training_state.get("final_eval_metrics", {}))
+        raw_initialization = checkpoint.get("initialization")
+        initialization_report = dict(raw_initialization) if isinstance(raw_initialization, Mapping) else None
+        _restore_rng_state(training_state["rng_state"])
+        iterator = _advance_training_iterator(iterator, completed_step)
+        print(f"{progress_label}_resume checkpoint={resume_from} step={completed_step}/{max_steps}", flush=True)
+
     log_start_time = time.monotonic()
     log_start_step = completed_step
-    for step in range(1, max_steps + 1):
+    for step in range(completed_step + 1, max_steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_output = _loss_for_raw_batch(model, next(iterator), device=device, loss_config=loss_config)
@@ -1429,6 +1499,8 @@ def _run_training(
         last_train_metrics = dict(loss_output.metrics)
         del loss_output
         completed_step = step
+        if mps_cleanup_every is not None and step % mps_cleanup_every == 0:
+            _cleanup_mps_training_memory(device)
 
         should_eval = step == 1 or step % eval_every == 0 or step == max_steps
         if skip_first_eval_pass and step == 1 and step != max_steps:
@@ -1461,6 +1533,7 @@ def _run_training(
                 f"loss={final_eval_metrics.get('loss/total', float('nan')):.6f}",
                 flush=True,
             )
+            _cleanup_mps_training_memory(device)
         if should_save:
             _write_checkpoint_and_report(
                 output_dir=output_dir,
@@ -1488,7 +1561,10 @@ def _run_training(
                 final_eval_metrics=final_eval_metrics,
                 initialization_report=initialization_report,
                 skip_first_eval_pass=skip_first_eval_pass,
+                mps_cleanup_every=mps_cleanup_every,
+                resume_from=resume_from,
             )
+            _cleanup_mps_training_memory(device)
 
     result_metrics = final_eval_metrics or last_train_metrics
     return ControlTrainingResult(
@@ -1564,6 +1640,102 @@ def initialize_mapper_v1_from_mapper_checkpoint(
     return report
 
 
+def _mapper_resume_training_config(
+    *,
+    seed: int,
+    run_name: str,
+    learning_rate: float,
+    weight_decay: float,
+    eval_every: int,
+    save_every: int,
+    skip_first_eval_pass: bool,
+    loss_config: MapperV1PhaseBLossConfig,
+    dataset_report: Mapping[str, Any],
+    mps_cleanup_every: int | None,
+) -> dict[str, Any]:
+    return {
+        "phase": "B",
+        "seed": seed,
+        "run_name": run_name,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "eval_every": eval_every,
+        "skip_first_eval_pass": bool(skip_first_eval_pass),
+        "save_every": save_every,
+        "mps_cleanup_every": mps_cleanup_every,
+        "density_enabled": bool(loss_config.lambda_density > 0.0),
+        "dataset": _json_safe(_strict_mapper_resume_dataset_report(dataset_report)),
+    }
+
+
+def _load_mapper_resume_checkpoint(
+    resume_from: Path,
+    *,
+    expected_model_config: MapperV1Config,
+    expected_control_model_config: ControlDemoGlobalEncoderConfig | None,
+    expected_loss_config: MapperV1PhaseBLossConfig,
+    expected_training_config: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    try:
+        checkpoint = torch.load(resume_from, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError(
+            "mapper resume checkpoint could not be loaded safely with weights_only=True; "
+            "use a checkpoint written by the mapper trainer"
+        ) from exc
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"mapper resume checkpoint must contain a mapping: {resume_from}")
+    if checkpoint.get("checkpoint_schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("mapper resume checkpoint schema version mismatch")
+    if checkpoint.get("model_config") != asdict(expected_model_config):
+        raise ValueError("mapper resume checkpoint model_config does not match the requested run")
+    expected_control_config = None if expected_control_model_config is None else asdict(expected_control_model_config)
+    if checkpoint.get("control_model_config") != expected_control_config:
+        raise ValueError("mapper resume checkpoint control_model_config does not match the requested run")
+    if checkpoint.get("loss_config") != asdict(expected_loss_config):
+        raise ValueError("mapper resume checkpoint loss_config does not match the requested run")
+    if _normalized_mapper_resume_training_config(
+        checkpoint.get("training_config")
+    ) != _normalized_mapper_resume_training_config(expected_training_config):
+        raise ValueError("mapper resume checkpoint training_config does not match the requested run")
+    if not isinstance(checkpoint.get("model_state_dict"), Mapping):
+        raise ValueError("mapper resume checkpoint missing model_state_dict")
+    if "optimizer_state_dict" not in checkpoint:
+        raise ValueError("mapper resume checkpoint missing optimizer_state_dict")
+    if not isinstance(checkpoint.get("training_state"), Mapping):
+        raise ValueError("mapper resume checkpoint missing training_state")
+    if not isinstance(checkpoint.get("history"), list):
+        raise ValueError("mapper resume checkpoint history must be a list")
+    training_state = checkpoint["training_state"]
+    if not isinstance(training_state.get("step"), int) or training_state["step"] < 0:
+        raise ValueError("mapper resume checkpoint training_state.step must be a non-negative integer")
+    if "rng_state" not in training_state:
+        raise ValueError("mapper resume checkpoint missing training_state.rng_state")
+    return checkpoint
+
+
+def _normalized_mapper_resume_training_config(config: object) -> dict[str, Any]:
+    if not isinstance(config, Mapping):
+        return {}
+    normalized = {
+        key: value
+        for key, value in config.items()
+        if key not in MAPPER_RESUME_TRAINING_RUNTIME_KEYS
+    }
+    dataset = normalized.get("dataset")
+    if isinstance(dataset, Mapping):
+        normalized["dataset"] = _strict_mapper_resume_dataset_report(dataset)
+    return normalized
+
+
+def _strict_mapper_resume_dataset_report(dataset_report: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in dataset_report.items()
+        if key not in MAPPER_RESUME_DATASET_RUNTIME_KEYS
+    }
+
+
 def _ln_close_loss(
     *,
     close_logits: torch.Tensor,
@@ -1627,6 +1799,8 @@ def _write_checkpoint_and_report(
     final_eval_metrics: Mapping[str, float],
     initialization_report: Mapping[str, Any] | None,
     skip_first_eval_pass: bool,
+    mps_cleanup_every: int | None,
+    resume_from: Path | None,
 ) -> None:
     training_config = {
         "phase": "B",
@@ -1637,6 +1811,7 @@ def _write_checkpoint_and_report(
         "eval_every": eval_every,
         "skip_first_eval_pass": bool(skip_first_eval_pass),
         "save_every": save_every,
+        "mps_cleanup_every": mps_cleanup_every,
         "density_enabled": bool(loss_config.lambda_density > 0.0),
         "dataset": _json_safe(dataset_report),
     }
@@ -1660,9 +1835,11 @@ def _write_checkpoint_and_report(
             "skip_first_eval_pass": bool(skip_first_eval_pass),
             "save_every": save_every,
             "log_every": log_every,
+            "mps_cleanup_every": mps_cleanup_every,
             "learning_rate": learning_rate,
             "weight_decay": weight_decay,
             "device": str(device),
+            "resume_from": resume_from.as_posix() if resume_from is not None else None,
             "last_train_metrics": _json_metrics(last_train_metrics),
             "final_train_metrics": _json_metrics(final_train_metrics),
             "final_eval_metrics": _json_metrics(final_eval_metrics),
@@ -1683,8 +1860,10 @@ def _write_checkpoint_and_report(
         "skip_first_eval_pass": bool(skip_first_eval_pass),
         "save_every": save_every,
         "log_every": log_every,
+        "mps_cleanup_every": mps_cleanup_every,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
+        "resume_from": resume_from.as_posix() if resume_from is not None else None,
         "model_config": asdict(model_config),
         "control_model_config": None if control_model_config is None else asdict(control_model_config),
         "loss_config": asdict(loss_config),
@@ -1841,6 +2020,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--eval-every", type=int, default=config_defaults.get("eval_every", 100))
     parser.add_argument("--save-every", type=int, default=config_defaults.get("save_every"))
     parser.add_argument("--log-every", type=int, default=config_defaults.get("log_every"))
+    parser.add_argument("--mps-cleanup-every", type=int, default=config_defaults.get("mps_cleanup_every"))
     parser.add_argument("--batch-size", type=int, default=config_defaults.get("batch_size", 4))
     parser.add_argument("--learning-rate", type=float, default=config_defaults.get("learning_rate", 2e-4))
     parser.add_argument("--weight-decay", type=float, default=config_defaults.get("weight_decay", 0.01))
@@ -1849,6 +2029,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--run-name", default=config_defaults.get("run_name", "mapper_v1_phase_b_teacher_forced"))
     parser.add_argument("--init-from-control-checkpoint", default=config_defaults.get("init_from_control_checkpoint"))
     parser.add_argument("--init-from-mapper-checkpoint", default=config_defaults.get("init_from_mapper_checkpoint"))
+    parser.add_argument("--resume-from", default=config_defaults.get("resume_from"))
     parser.add_argument("--eval-fraction", type=float, default=config_defaults.get("eval_fraction", 0.1))
     parser.add_argument("--eval-size", type=int, default=config_defaults.get("eval_size"))
     parser.add_argument(
@@ -1909,6 +2090,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.init_from_mapper_checkpoint is not None
         else None
     )
+    resume_from = Path(args.resume_from) if args.resume_from is not None else None
     if args.precompute_control_teacher_cache_only:
         if args.synthetic_smoke:
             raise ValueError("precompute_control_teacher_cache_only is not supported with synthetic_smoke")
@@ -1958,6 +2140,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             seed=args.seed,
             device_name=args.device,
             final_train_eval_size=args.final_train_eval_size,
+            resume_from=resume_from,
+            mps_cleanup_every=args.mps_cleanup_every,
             model_config_overrides=model_defaults,
             loss_config_overrides=loss_defaults,
         )
@@ -1984,6 +2168,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             run_name=args.run_name,
             init_from_control_checkpoint=init_from,
             init_from_mapper_checkpoint=init_from_mapper,
+            resume_from=resume_from,
             eval_fraction=args.eval_fraction,
             eval_size=args.eval_size,
             final_train_eval_size=args.final_train_eval_size,
@@ -2006,6 +2191,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             control_teacher_precompute_batch_size=args.control_teacher_precompute_batch_size,
             require_control_teacher_cache=args.require_control_teacher_cache,
             control_teacher_cache_overwrite=args.control_teacher_cache_overwrite,
+            mps_cleanup_every=args.mps_cleanup_every,
             model_config_overrides=model_defaults,
             control_model_config_overrides=control_model_defaults,
             loss_config_overrides=loss_defaults,

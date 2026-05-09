@@ -80,6 +80,8 @@ def run_synthetic_smoke(
     device_name: str = "auto",
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
     skip_first_eval_pass: bool = True,
+    resume_from: Path | None = None,
+    mps_cleanup_every: int | None = None,
     model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
 ) -> ControlTrainingResult:
@@ -144,10 +146,12 @@ def run_synthetic_smoke(
         },
         init_from_control_checkpoint=None,
         init_from_mapper_checkpoint=None,
+        resume_from=resume_from,
         model_factory=_mapper_v2_model_factory,
         mapper_checkpoint_initializer=initialize_mapper_v2_from_mapper_checkpoint,
         progress_label="mapper_v2_phase_b",
         skip_first_eval_pass=skip_first_eval_pass,
+        mps_cleanup_every=mps_cleanup_every,
     )
 
 
@@ -170,6 +174,7 @@ def run_mapper_v2_phase_b_training(
     run_name: str = "mapper_v2_phase_b_global_teacher_forced",
     init_from_control_checkpoint: Path | None = None,
     init_from_mapper_checkpoint: Path | None = None,
+    resume_from: Path | None = None,
     eval_fraction: float = 0.1,
     eval_size: int | None = None,
     final_train_eval_size: int | None = DEFAULT_FINAL_TRAIN_EVAL_SIZE,
@@ -186,6 +191,7 @@ def run_mapper_v2_phase_b_training(
     control_teacher_cache_overwrite: bool = False,
     include_full_song_context: bool = True,
     skip_first_eval_pass: bool = True,
+    mps_cleanup_every: int | None = None,
     model_config_overrides: Mapping[str, Any] | None = None,
     control_model_config_overrides: Mapping[str, Any] | None = None,
     loss_config_overrides: Mapping[str, Any] | None = None,
@@ -351,10 +357,12 @@ def run_mapper_v2_phase_b_training(
         },
         init_from_control_checkpoint=init_from_control_checkpoint,
         init_from_mapper_checkpoint=init_from_mapper_checkpoint,
+        resume_from=resume_from,
         model_factory=_mapper_v2_model_factory,
         mapper_checkpoint_initializer=initialize_mapper_v2_from_mapper_checkpoint,
         progress_label="mapper_v2_phase_b",
         skip_first_eval_pass=skip_first_eval_pass,
+        mps_cleanup_every=mps_cleanup_every,
     )
 
 
@@ -464,6 +472,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--eval-every", type=int, default=config_defaults.get("eval_every", 100))
     parser.add_argument("--save-every", type=int, default=config_defaults.get("save_every"))
     parser.add_argument("--log-every", type=int, default=config_defaults.get("log_every"))
+    parser.add_argument("--mps-cleanup-every", type=int, default=config_defaults.get("mps_cleanup_every"))
     parser.add_argument("--batch-size", type=int, default=config_defaults.get("batch_size", 2))
     parser.add_argument("--learning-rate", type=float, default=config_defaults.get("learning_rate", 2e-4))
     parser.add_argument("--weight-decay", type=float, default=config_defaults.get("weight_decay", 0.01))
@@ -472,6 +481,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--run-name", default=config_defaults.get("run_name", "mapper_v2_phase_b_global_teacher_forced"))
     parser.add_argument("--init-from-control-checkpoint", default=config_defaults.get("init_from_control_checkpoint"))
     parser.add_argument("--init-from-mapper-checkpoint", default=config_defaults.get("init_from_mapper_checkpoint"))
+    parser.add_argument("--resume-from", default=config_defaults.get("resume_from"))
     parser.add_argument("--eval-fraction", type=float, default=config_defaults.get("eval_fraction", 0.1))
     parser.add_argument("--eval-size", type=int, default=config_defaults.get("eval_size"))
     parser.add_argument(
@@ -538,6 +548,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     init_from = Path(args.init_from_control_checkpoint) if args.init_from_control_checkpoint is not None else None
     init_from_mapper = Path(args.init_from_mapper_checkpoint) if args.init_from_mapper_checkpoint is not None else None
+    resume_from = Path(args.resume_from) if args.resume_from is not None else None
     if args.precompute_control_teacher_cache_only:
         if args.synthetic_smoke:
             raise ValueError("precompute_control_teacher_cache_only is not supported with synthetic_smoke")
@@ -584,6 +595,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             device_name=args.device,
             final_train_eval_size=args.final_train_eval_size,
             skip_first_eval_pass=args.skip_first_eval_pass,
+            resume_from=resume_from,
+            mps_cleanup_every=args.mps_cleanup_every,
             model_config_overrides=model_defaults,
             loss_config_overrides=loss_defaults,
         )
@@ -608,6 +621,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             run_name=args.run_name,
             init_from_control_checkpoint=init_from,
             init_from_mapper_checkpoint=init_from_mapper,
+            resume_from=resume_from,
             eval_fraction=args.eval_fraction,
             eval_size=args.eval_size,
             final_train_eval_size=args.final_train_eval_size,
@@ -628,6 +642,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             control_teacher_cache_overwrite=args.control_teacher_cache_overwrite,
             include_full_song_context=args.include_full_song_context,
             skip_first_eval_pass=args.skip_first_eval_pass,
+            mps_cleanup_every=args.mps_cleanup_every,
             model_config_overrides=model_defaults,
             control_model_config_overrides=control_model_defaults,
             loss_config_overrides=loss_defaults,

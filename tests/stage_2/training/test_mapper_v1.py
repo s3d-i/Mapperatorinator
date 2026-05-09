@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from importlib import import_module
@@ -463,6 +464,75 @@ class MapperV1PhaseBTrainingTests(unittest.TestCase):
 
         mapper_init.assert_called_once()
         control_init.assert_not_called()
+
+    def test_resume_continues_step_count_and_save_cadence(self) -> None:
+        model_config = MapperV1Config(
+            control_dim=8,
+            d_model=8,
+            heads=2,
+            layers=1,
+            ffn_dim=16,
+            dropout=0.0,
+            max_seq_len=16,
+            state_hidden_dim=16,
+            ln_close_hidden_dim=16,
+        )
+        samples = _synthetic_mapper_samples(model_config=model_config)[:2]
+        loader = DataLoader(
+            samples,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=_collate_synthetic_mapper_samples,
+        )
+        common_kwargs = {
+            "loader": loader,
+            "train_eval_loader": loader,
+            "eval_loader": loader,
+            "model_config": model_config,
+            "control_model_config": None,
+            "loss_config": MapperV1PhaseBLossConfig(),
+            "eval_every": 2,
+            "save_every": 2,
+            "log_every": None,
+            "batch_size": 1,
+            "learning_rate": 1e-3,
+            "weight_decay": 0.0,
+            "seed": 23,
+            "device_name": "cpu",
+            "run_name": "resume_test",
+            "dataset_report": {"status": "resume_test", "sample_count": len(samples)},
+            "init_from_control_checkpoint": None,
+            "init_from_mapper_checkpoint": None,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            first = mapper_v1_training._run_training(
+                output_dir=output_dir,
+                max_steps=2,
+                **common_kwargs,
+            )
+            resume_checkpoint = output_dir / "checkpoints" / "checkpoint_step_000002.pt"
+
+            second = mapper_v1_training._run_training(
+                output_dir=output_dir,
+                max_steps=4,
+                resume_from=resume_checkpoint,
+                mps_cleanup_every=20,
+                **common_kwargs,
+            )
+            report = json.loads(second.report_path.read_text(encoding="utf-8"))
+            resume_checkpoint_exists = resume_checkpoint.exists()
+            checkpoint_000003_exists = (output_dir / "checkpoints" / "checkpoint_step_000003.pt").exists()
+            checkpoint_000004_exists = (output_dir / "checkpoints" / "checkpoint_step_000004.pt").exists()
+
+        self.assertEqual(first.completed_steps, 2)
+        self.assertTrue(resume_checkpoint_exists)
+        self.assertFalse(checkpoint_000003_exists)
+        self.assertTrue(checkpoint_000004_exists)
+        self.assertEqual(second.completed_steps, 4)
+        self.assertEqual(report["completed_steps"], 4)
+        self.assertEqual(report["mps_cleanup_every"], 20)
+        self.assertEqual(report["resume_from"], resume_checkpoint.as_posix())
 
     def test_precomputed_control_teacher_cache_feeds_phase_b_loss_without_full_inputs(self) -> None:
         record = ControlWindowRecord(

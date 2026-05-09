@@ -37,6 +37,8 @@ class MapperV2PhaseBTrainingTests(unittest.TestCase):
         self.assertEqual(config["model"]["heads"], 12)
         self.assertEqual(config["model"]["layers"], 8)
         self.assertEqual(config["model"]["ffn_dim"], 3072)
+        self.assertEqual(config["mps_cleanup_every"], 20)
+        self.assertTrue(config["resume_from"].endswith("checkpoint.pt"))
         MapperV2Config(**config["model"])
 
     def test_main_forwards_v2_training_options(self) -> None:
