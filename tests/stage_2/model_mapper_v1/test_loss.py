@@ -60,6 +60,27 @@ class MapperV1LossTests(unittest.TestCase):
 
         self.assertTrue(torch.allclose(loss, expected))
 
+    def test_token_cross_entropy_skips_invalid_rows_before_softmax(self) -> None:
+        vocab = MapperV1Vocab()
+        logits = torch.zeros((1, 2, vocab.size), requires_grad=True)
+        target = torch.tensor([[vocab.eos_id, vocab.pad_id]])
+        target_mask = torch.tensor([[True, False]])
+        grammar_mask = torch.zeros_like(logits)
+        grammar_mask[0, 1] = -torch.inf
+
+        loss = token_cross_entropy(
+            logits,
+            target,
+            pad_id=vocab.pad_id,
+            target_mask=target_mask,
+            grammar_mask=grammar_mask,
+        )
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(logits.grad).all())
+        self.assertEqual(float(logits.grad[0, 1].abs().sum().item()), 0.0)
+
     def test_ln_close_aux_loss_uses_auto_class_balanced_bce(self) -> None:
         close_logits = torch.zeros((1, 1, 4), dtype=torch.float32)
         labels = torch.tensor([[[True, False, False, False]]])

@@ -182,15 +182,16 @@ def token_cross_entropy(
         if pad_id is not None:
             valid = valid & (target != int(pad_id))
     if not bool(valid.any()):
-        return logits.sum() * 0.0
+        return logits.reshape(-1)[:0].sum() * 0.0
 
-    safe_target = target.masked_fill(~valid, 0)
-    losses = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        safe_target.reshape(-1),
-        reduction="none",
-    ).reshape_as(target)
-    return losses[valid].mean()
+    flat_valid = valid.reshape(-1)
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_target = target.reshape(-1)
+    return F.cross_entropy(
+        flat_logits[flat_valid],
+        flat_target[flat_valid],
+        reduction="mean",
+    )
 
 
 def ln_close_focal_bce_loss(
