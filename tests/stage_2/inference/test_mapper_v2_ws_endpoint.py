@@ -299,6 +299,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(endpoint.sessions["s1"].audio_length_ms, 1_000)
             self.assertEqual(backend.prepared_audio[0]["audio_length_ms"], 1_000)
+            self.assertEqual(backend.prepared_audio[0]["difficulty"], 4.0)
             self.assertEqual(backend.iter_calls[0]["audio_length_ms"], 1_000)
             await endpoint.stop_session("s1")
 
@@ -320,6 +321,40 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(backend.prepared_audio[0]["audio_path"], Path("/tmp/song.wav"))
         self.assertEqual(backend.prepared_audio[0]["audio_length_ms"], 2_000)
+
+    async def test_reference_time_difficulty_does_not_override_audio_path_difficulty(self) -> None:
+        backend = FakeInferenceBackend()
+        endpoint = InferenceEndpoint(config=MapperV2WsConfig(token_send_interval_s=0.0), backend=backend)
+        peer = FakePeer()
+
+        await endpoint.handle_message({"control": "ready"}, peer)
+        await endpoint.handle_message(
+            {
+                "type": "audio_path",
+                "session_id": "s1",
+                "audio_path": "/tmp/song.wav",
+                "audio_length_ms": 2_000,
+                "difficulty": 5.0,
+            },
+            peer,
+        )
+        await endpoint.handle_message(
+            {
+                "type": "reference_time",
+                "session_id": "s1",
+                "ref_time_ms": 0,
+                "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+                "difficulty": 3.0,
+            },
+            peer,
+        )
+        task = endpoint.sessions["s1"].stream_task
+        assert task is not None
+        await task
+
+        self.assertEqual(endpoint.sessions["s1"].difficulty, 5.0)
+        self.assertEqual(backend.prepared_audio[0]["difficulty"], 5.0)
+        await endpoint.stop_session("s1")
 
     async def test_mapper_v2_backend_prepares_session_runtime_from_ws_audio(self) -> None:
         loader_configs = []

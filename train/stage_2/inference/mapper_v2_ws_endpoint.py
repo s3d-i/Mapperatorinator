@@ -499,6 +499,7 @@ class InferenceEndpoint:
             send_local_machine_ms=clock.local_computer_time_send_ms,
             received_local_machine_ms=clock.received_local_computer_time_ms,
             audio_length_ms=audio_length_ms,
+            difficulty=session.difficulty,
             reset_local_machine_ms=reset_local_machine_ms,
         )
 
