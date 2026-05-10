@@ -14,7 +14,7 @@ from train.stage_2.data.mapper_v1_windows import control_teacher_stacked_slices_
 from train.stage_2.features.mel import load_full_song_packed_mel_20ms
 from train.stage_2.inference.model_runtime import ModelRuntime, release_torch_cache
 from train.stage_2.model_control.context import TARGET_OFFSET_IN_CONTEXT
-from train.stage_2.model_mapper_v1.tokenizer import MAPPER_DENSITY_FRAME_MS, MAPPER_DENSITY_FRAMES
+from train.stage_2.model_mapper_v1.tokenizer import MAPPER_DENSITY_FRAME_MS, MAPPER_DENSITY_FRAMES, MAPPER_WRITE_MS
 from train.stage_2.timing.grid_fitting import GridFitter, GridFitterConfig, TimingFitResult
 from train.stage_2.timing.rendering.dense_timing_v2 import render_dense_timing_v2
 from train.stage_2.timing.schema import FittedTimingGrid, FrameTimingPrediction
@@ -25,6 +25,7 @@ DENSE_TIMING_V2_CHANNELS = 4
 DEFAULT_MAX_CONTROL_BATCH_SIZE = 12
 
 MelLoader = Callable[[str | Path], Any]
+GlobalAttentionKVCache = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
 
 class TimingProvider(Protocol):
@@ -100,10 +101,12 @@ class SessionControlCache:
     target_start_frame_tensor: torch.Tensor
     normalized_difficulty_tensor: torch.Tensor
     control_memory_8s: torch.Tensor
+    density_teacher_8s: torch.Tensor
 
     def as_model_batch(self) -> dict[str, torch.Tensor]:
         return {
             "control_memory_8s": self.control_memory_8s,
+            "density_teacher_8s": self.density_teacher_8s,
             "control_slice_start_frames": self.control_slice_start_frames,
             "target_start_frame": self.target_start_frame_tensor,
             "normalized_difficulty": self.normalized_difficulty_tensor,
@@ -120,10 +123,12 @@ class SessionControlBatchCache:
     target_start_frame_tensor: torch.Tensor
     normalized_difficulty_tensor: torch.Tensor
     control_memory_8s: torch.Tensor
+    density_teacher_8s: torch.Tensor
 
     def as_model_batch(self) -> dict[str, torch.Tensor]:
         return {
             "control_memory_8s": self.control_memory_8s,
+            "density_teacher_8s": self.density_teacher_8s,
             "control_slice_start_frames": self.control_slice_start_frames,
             "target_start_frame": self.target_start_frame_tensor,
             "normalized_difficulty": self.normalized_difficulty_tensor,
@@ -138,16 +143,53 @@ class SessionFullControlCache:
     normalized_difficulty: float
     max_batch_size: int
     control_memory_8s: torch.Tensor
+    density_teacher_8s: torch.Tensor
 
     def as_model_batch(self) -> dict[str, torch.Tensor]:
         return {
             "control_memory_8s": self.control_memory_8s,
+            "density_teacher_8s": self.density_teacher_8s,
             "target_start_frame": torch.tensor(
                 self.target_start_frames,
                 dtype=torch.long,
                 device=self.control_memory_8s.device,
             ),
         }
+
+
+@dataclass(frozen=True)
+class SessionMapperWindowCache:
+    session_id: str
+    start_ms: int
+    end_ms: int
+    target_start_frame: int
+    normalized_difficulty: float
+    target_start_frame_tensor: torch.Tensor
+    normalized_difficulty_tensor: torch.Tensor
+    projected_control_memory_8s: torch.Tensor
+    density_feature_8s: torch.Tensor
+    global_memory: torch.Tensor | None
+    global_memory_padding_mask: torch.Tensor | None
+    global_position_features: torch.Tensor | None
+    global_attention_kv_cache: GlobalAttentionKVCache | None
+
+    def as_model_batch(self) -> dict[str, Any]:
+        batch = {
+            "projected_control_memory_8s": self.projected_control_memory_8s,
+            # Mapper V2 still names this input density_teacher_8s. Runtime treats it as an inference density feature.
+            "density_teacher_8s": self.density_feature_8s,
+            "target_start_frame": self.target_start_frame_tensor,
+            "normalized_difficulty": self.normalized_difficulty_tensor,
+        }
+        if self.global_memory is not None:
+            if self.global_memory_padding_mask is None or self.global_position_features is None:
+                raise RuntimeError("global mapper window cache is incomplete")
+            batch["global_memory"] = self.global_memory
+            batch["global_memory_padding_mask"] = self.global_memory_padding_mask
+            batch["global_position_features"] = self.global_position_features
+            if self.global_attention_kv_cache is not None:
+                batch["global_attention_kv_cache"] = self.global_attention_kv_cache
+        return batch
 
 
 @dataclass
@@ -161,6 +203,7 @@ class SessionRuntime:
     control_cache: SessionControlCache | None = field(default=None, init=False)
     control_batch_cache: SessionControlBatchCache | None = field(default=None, init=False)
     full_control_cache: SessionFullControlCache | None = field(default=None, init=False)
+    mapper_window_cache: SessionMapperWindowCache | None = field(default=None, init=False)
     device: torch.device = field(init=False)
 
     def __post_init__(self) -> None:
@@ -174,7 +217,7 @@ class SessionRuntime:
         self,
         audio_path: str | Path,
         *,
-        audio_length_ms: int | None = None,
+        audio_length_ms: int,
         start_ms: int = 0,
     ) -> SessionAudioCache:
         self.reset_audio_cache()
@@ -190,10 +233,7 @@ class SessionRuntime:
         if source_frame_count <= 0:
             raise ValueError(f"packed_mel for {path} must contain at least one frame")
         padded_frame_count = max(source_frame_count, int(self.config.minimum_frame_count))
-        resolved_audio_length_ms, audio_length_source = _resolve_audio_length_ms(
-            audio_length_ms=audio_length_ms,
-            source_frame_count=source_frame_count,
-        )
+        resolved_audio_length_ms = _validate_audio_length_ms(audio_length_ms)
 
         provider = _timing_provider(self.model_runtime)
         assert self.grid_fitter is not None
@@ -220,7 +260,7 @@ class SessionRuntime:
             session_id=self.session_id,
             audio_path=path,
             audio_length_ms=resolved_audio_length_ms,
-            audio_length_source=audio_length_source,
+            audio_length_source="provided",
             full_mel=full_mel_cpu.unsqueeze(0).to(device=self.device, dtype=torch.float32),
             full_dense_timing_v2=dense_timing_cpu.unsqueeze(0).to(device=self.device, dtype=torch.float32),
             padding_mask=padding_mask,
@@ -245,6 +285,7 @@ class SessionRuntime:
         target_start_frame_tensor = batch_cache.target_start_frame_tensor[:1].contiguous()
         normalized_difficulty_tensor = batch_cache.normalized_difficulty_tensor[:1].contiguous()
         control_memory_8s = batch_cache.control_memory_8s[:1].contiguous()
+        density_teacher_8s = batch_cache.density_teacher_8s[:1].contiguous()
 
         cache = SessionControlCache(
             session_id=self.session_id,
@@ -255,6 +296,7 @@ class SessionRuntime:
             target_start_frame_tensor=target_start_frame_tensor,
             normalized_difficulty_tensor=normalized_difficulty_tensor,
             control_memory_8s=control_memory_8s,
+            density_teacher_8s=density_teacher_8s,
         )
         self.control_cache = cache
         return cache
@@ -268,6 +310,7 @@ class SessionRuntime:
         self.control_cache = None
         self.control_batch_cache = None
         self.full_control_cache = None
+        self.mapper_window_cache = None
         start_ms_tuple = _validate_start_ms_values(start_ms_values)
         effective_max_batch_size = _validate_max_batch_size(
             self.config.max_control_batch_size if max_batch_size is None else max_batch_size,
@@ -331,7 +374,7 @@ class SessionRuntime:
                 frame_count=stacked_control_batch.get("frame_count"),
                 target_start_frame=stacked_control_batch.get("target_start_frame"),
             )
-            control_memory_8s = _stacked_control_memory_8s(
+            control_memory_8s, density_teacher_8s = _stacked_control_teacher_8s(
                 control_output,
                 batch_size=batch_size,
                 slice_count=slice_count,
@@ -345,6 +388,14 @@ class SessionRuntime:
             name="control_memory_8s",
             device=self.device,
         )
+        density_teacher_8s = _as_batched_float32_device_tensor(
+            density_teacher_8s,
+            batch_size=batch_size,
+            frames=MAPPER_DENSITY_FRAMES,
+            channels=1,
+            name="density_teacher_8s",
+            device=self.device,
+        )
 
         cache = SessionControlBatchCache(
             session_id=self.session_id,
@@ -355,6 +406,7 @@ class SessionRuntime:
             target_start_frame_tensor=target_start_frame_tensor,
             normalized_difficulty_tensor=normalized_difficulty_tensor,
             control_memory_8s=control_memory_8s,
+            density_teacher_8s=density_teacher_8s,
         )
         self.control_batch_cache = cache
         return cache
@@ -373,6 +425,7 @@ class SessionRuntime:
             raise RuntimeError("audio cache must contain at least one source frame")
 
         batches: list[torch.Tensor] = []
+        density_batches: list[torch.Tensor] = []
         for start in range(0, len(start_ms_values), effective_max_batch_size):
             chunk = start_ms_values[start : start + effective_max_batch_size]
             batch_cache = self.prepare_control_batch(
@@ -380,8 +433,10 @@ class SessionRuntime:
                 max_batch_size=effective_max_batch_size,
             )
             batches.append(batch_cache.control_memory_8s)
+            density_batches.append(batch_cache.density_teacher_8s)
 
         control_memory_8s = torch.cat(batches, dim=0).contiguous()
+        density_teacher_8s = torch.cat(density_batches, dim=0).contiguous()
         target_start_frames = tuple(start_ms // MAPPER_DENSITY_FRAME_MS for start_ms in start_ms_values)
         cache = SessionFullControlCache(
             session_id=self.session_id,
@@ -390,8 +445,129 @@ class SessionRuntime:
             normalized_difficulty=float(self.config.default_normalized_difficulty),
             max_batch_size=effective_max_batch_size,
             control_memory_8s=control_memory_8s,
+            density_teacher_8s=density_teacher_8s,
         )
         self.full_control_cache = cache
+        return cache
+
+    def prepare_mapper_window(
+        self,
+        *,
+        start_ms: int = 0,
+        end_ms: int | None = None,
+    ) -> SessionMapperWindowCache:
+        start_ms = _validate_start_ms(start_ms)
+        end_ms = start_ms + MAPPER_WRITE_MS if end_ms is None else _validate_start_ms(end_ms)
+        if end_ms <= start_ms:
+            raise ValueError("mapper window end_ms must be after start_ms")
+        if end_ms - start_ms != MAPPER_WRITE_MS:
+            raise ValueError(f"mapper window span must be {MAPPER_WRITE_MS}ms")
+        if (
+            self.mapper_window_cache is not None
+            and self.mapper_window_cache.start_ms == start_ms
+            and self.mapper_window_cache.end_ms == end_ms
+        ):
+            return self.mapper_window_cache
+        if self.audio_cache is None:
+            raise RuntimeError("prepare_audio must be called before prepare_mapper_window")
+
+        if self.control_cache is None or int(self.control_cache.start_ms) != start_ms:
+            control_cache = self.prepare_control(start_ms=start_ms)
+        else:
+            control_cache = self.control_cache
+        audio_cache = self.audio_cache
+        if audio_cache is None:
+            raise RuntimeError("prepare_audio must be called before prepare_mapper_window")
+
+        mapper_model = _mapper_model(self.model_runtime)
+        control_projection = getattr(mapper_model, "control_projection", None)
+        if control_projection is None or not callable(control_projection):
+            raise TypeError("model_runtime.mapper_model must expose control_projection")
+        global_context_fn = getattr(mapper_model, "_global_context_memory", None)
+        if global_context_fn is None or not callable(global_context_fn):
+            raise TypeError("model_runtime.mapper_model must expose _global_context_memory")
+        global_attention_kv_cache_fn = getattr(mapper_model, "global_attention_kv_cache", None)
+        if global_attention_kv_cache_fn is None or not callable(global_attention_kv_cache_fn):
+            raise TypeError("model_runtime.mapper_model must expose global_attention_kv_cache")
+
+        write_start_ms_tensor = torch.tensor([start_ms], dtype=torch.long, device=self.device)
+        mapper_context_batch = {
+            **audio_cache.as_model_batch(),
+            "target_start_frame": control_cache.target_start_frame_tensor,
+        }
+        with torch.inference_mode():
+            projected_control_memory_8s = control_projection(control_cache.control_memory_8s)
+            global_memory, global_memory_padding_mask, global_position_features = global_context_fn(
+                batch=mapper_context_batch,
+                device=self.device,
+                batch_size=1,
+                write_start_ms=write_start_ms_tensor,
+            )
+            global_attention_kv_cache = (
+                _as_global_attention_kv_cache(
+                    global_attention_kv_cache_fn(global_memory),
+                    device=self.device,
+                )
+                if global_memory is not None
+                else None
+            )
+
+        projected_control_memory_8s = _as_batched_float32_device_tensor(
+            projected_control_memory_8s,
+            batch_size=1,
+            frames=MAPPER_DENSITY_FRAMES,
+            channels=None,
+            name="projected_control_memory_8s",
+            device=self.device,
+        )
+        density_feature_8s = _as_batched_float32_device_tensor(
+            control_cache.density_teacher_8s,
+            batch_size=1,
+            frames=MAPPER_DENSITY_FRAMES,
+            channels=1,
+            name="density_feature_8s",
+            device=self.device,
+        )
+        if global_memory is not None:
+            global_memory = _as_batched_float32_device_tensor(
+                global_memory,
+                batch_size=1,
+                frames=int(global_memory.shape[1]),
+                channels=None,
+                name="global_memory",
+                device=self.device,
+            )
+            if not isinstance(global_memory_padding_mask, torch.Tensor):
+                raise ValueError("global_memory_padding_mask is required when global_memory is produced")
+            global_memory_padding_mask = global_memory_padding_mask.detach().to(device=self.device, dtype=torch.bool)
+            if tuple(global_memory_padding_mask.shape) != tuple(global_memory.shape[:2]):
+                raise ValueError("global_memory_padding_mask must have shape [B,G]")
+            if not isinstance(global_position_features, torch.Tensor):
+                raise ValueError("global_position_features is required when global_memory is produced")
+            global_position_features = global_position_features.detach().to(device=self.device, dtype=torch.float32)
+            if tuple(global_position_features.shape) != (1, 4):
+                raise ValueError("global_position_features must have shape [1,4]")
+        else:
+            global_memory_padding_mask = None
+            global_position_features = None
+            global_attention_kv_cache = None
+
+        cache = SessionMapperWindowCache(
+            session_id=self.session_id,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            target_start_frame=control_cache.target_start_frame,
+            normalized_difficulty=control_cache.normalized_difficulty,
+            target_start_frame_tensor=control_cache.target_start_frame_tensor,
+            normalized_difficulty_tensor=control_cache.normalized_difficulty_tensor,
+            projected_control_memory_8s=projected_control_memory_8s,
+            density_feature_8s=density_feature_8s,
+            global_memory=global_memory,
+            global_memory_padding_mask=global_memory_padding_mask,
+            global_position_features=global_position_features,
+            global_attention_kv_cache=global_attention_kv_cache,
+        )
+        self.mapper_window_cache = cache
         return cache
 
     def _ensure_audio_cache_frame_count(self, required_frame_count: int) -> SessionAudioCache:
@@ -438,12 +614,14 @@ class SessionRuntime:
             timing_grid=cache.timing_grid,
         )
         self.audio_cache = expanded
+        self.mapper_window_cache = None
         return expanded
 
     def reset_audio_cache(self) -> None:
         self.control_cache = None
         self.control_batch_cache = None
         self.full_control_cache = None
+        self.mapper_window_cache = None
         self.audio_cache = None
         gc.collect()
         release_torch_cache(self.device)
@@ -452,6 +630,7 @@ class SessionRuntime:
         self.control_cache = None
         self.control_batch_cache = None
         self.full_control_cache = None
+        self.mapper_window_cache = None
         gc.collect()
         release_torch_cache(self.device)
 
@@ -476,6 +655,13 @@ def _control_model(model_runtime: ModelRuntime) -> torch.nn.Module:
     model = getattr(model_runtime, "control_model", None)
     if model is None or not callable(getattr(model, "forward", None)):
         raise TypeError("model_runtime must expose control_model")
+    return model
+
+
+def _mapper_model(model_runtime: ModelRuntime) -> torch.nn.Module:
+    model = getattr(model_runtime, "mapper_model", None)
+    if model is None or not callable(getattr(model, "forward", None)):
+        raise TypeError("model_runtime must expose mapper_model")
     return model
 
 
@@ -521,7 +707,41 @@ def _as_batched_float32_device_tensor(
     return tensor
 
 
-def _stacked_control_memory_8s(output: Any, *, batch_size: int, slice_count: int) -> torch.Tensor:
+def _as_global_attention_kv_cache(value: Any, *, device: torch.device) -> GlobalAttentionKVCache:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("global_attention_kv_cache must be a tuple/list of per-layer key/value tensors")
+    cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+    expected_shape: tuple[int, ...] | None = None
+    for layer_index, layer_cache in enumerate(value):
+        if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) != 2:
+            raise ValueError(f"global_attention_kv_cache layer {layer_index} must be a key/value pair")
+        key, attn_value = layer_cache
+        if not isinstance(key, torch.Tensor) or not isinstance(attn_value, torch.Tensor):
+            raise ValueError(f"global_attention_kv_cache layer {layer_index} key/value must be tensors")
+        key = key.detach().to(device=device, dtype=torch.float32).contiguous()
+        attn_value = attn_value.detach().to(device=device, dtype=torch.float32).contiguous()
+        if key.ndim != 4:
+            raise ValueError(
+                f"global_attention_kv_cache layer {layer_index} key must have shape [B,H,G,Dh], "
+                f"got {tuple(key.shape)}"
+            )
+        if tuple(attn_value.shape) != tuple(key.shape):
+            raise ValueError(
+                f"global_attention_kv_cache layer {layer_index} value must match key shape, "
+                f"got {tuple(attn_value.shape)} vs {tuple(key.shape)}"
+            )
+        if expected_shape is None:
+            expected_shape = tuple(key.shape)
+        elif tuple(key.shape) != expected_shape:
+            raise ValueError(
+                f"global_attention_kv_cache layer {layer_index} key shape must match layer 0, "
+                f"got {tuple(key.shape)} vs {expected_shape}"
+            )
+        cache.append((key, attn_value))
+    return tuple(cache)
+
+
+def _stacked_control_teacher_8s(output: Any, *, batch_size: int, slice_count: int) -> tuple[torch.Tensor, torch.Tensor]:
     memory = getattr(output, "control_memory", None)
     if not isinstance(memory, torch.Tensor) or memory.ndim != 3:
         raise ValueError("stacked control output control_memory must have shape [B*4,T,D]")
@@ -532,7 +752,7 @@ def _stacked_control_memory_8s(output: Any, *, batch_size: int, slice_count: int
     end = start + TARGET_WINDOW_LENGTH_FRAMES
     if int(memory.shape[1]) < end:
         raise ValueError(f"stacked control output memory is too short for target slice: {memory.shape[1]} < {end}")
-    return memory[:, start:end].reshape(
+    control_memory_8s = memory[:, start:end].reshape(
         int(batch_size),
         int(slice_count),
         TARGET_WINDOW_LENGTH_FRAMES,
@@ -543,19 +763,42 @@ def _stacked_control_memory_8s(output: Any, *, batch_size: int, slice_count: int
         memory.shape[-1],
     ).contiguous()
 
+    value_pred = getattr(output, "value_pred", None)
+    if not isinstance(value_pred, torch.Tensor) or value_pred.ndim != 3:
+        raise ValueError("stacked control output value_pred must have shape [B*4,100,C]")
+    if int(value_pred.shape[0]) != expected_batch:
+        raise ValueError(f"stacked control output value_pred batch must be {expected_batch}, got {value_pred.shape[0]}")
+    if int(value_pred.shape[1]) != TARGET_WINDOW_LENGTH_FRAMES:
+        raise ValueError(
+            f"stacked control output value_pred length must be {TARGET_WINDOW_LENGTH_FRAMES}, "
+            f"got {value_pred.shape[1]}"
+        )
+    if int(value_pred.shape[2]) == 1:
+        density = value_pred
+    else:
+        from train.stage_2.features.control_v3_targets import VALUE_FEATURE_NAMES
 
-def _resolve_audio_length_ms(
-    *,
-    audio_length_ms: int | None,
-    source_frame_count: int,
-) -> tuple[int, str]:
-    if audio_length_ms is not None:
-        if isinstance(audio_length_ms, bool) or not isinstance(audio_length_ms, int):
-            raise TypeError("audio_length_ms must be an integer")
-        if audio_length_ms <= 0:
-            raise ValueError("audio_length_ms must be positive")
-        return int(audio_length_ms), "provided"
-    return int(source_frame_count * MAPPER_DENSITY_FRAME_MS), "mel_frame_estimate"
+        density_index = VALUE_FEATURE_NAMES.index("density_level")
+        if int(value_pred.shape[2]) != len(VALUE_FEATURE_NAMES):
+            raise ValueError(
+                f"stacked control output value_pred channel count must be 1 or {len(VALUE_FEATURE_NAMES)}, "
+                f"got {value_pred.shape[2]}"
+            )
+        density = value_pred[:, :, density_index : density_index + 1]
+    density_teacher_8s = density.reshape(batch_size, slice_count, TARGET_WINDOW_LENGTH_FRAMES, 1).reshape(
+        int(batch_size),
+        MAPPER_DENSITY_FRAMES,
+        1,
+    ).contiguous()
+    return control_memory_8s, density_teacher_8s
+
+
+def _validate_audio_length_ms(audio_length_ms: int) -> int:
+    if isinstance(audio_length_ms, bool) or not isinstance(audio_length_ms, int):
+        raise TypeError("audio_length_ms must be an integer")
+    if audio_length_ms <= 0:
+        raise ValueError("audio_length_ms must be positive")
+    return int(audio_length_ms)
 
 
 def _validate_start_ms(start_ms: int) -> int:
@@ -593,6 +836,7 @@ __all__ = [
     "SessionControlBatchCache",
     "SessionControlCache",
     "SessionFullControlCache",
+    "SessionMapperWindowCache",
     "SessionRuntime",
     "SessionRuntimeConfig",
 ]

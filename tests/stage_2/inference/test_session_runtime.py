@@ -57,7 +57,8 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.control_cache.target_start_frame, 0)
         self.assertEqual(runtime.control_cache.control_slice_start_frames.tolist(), [[0, 100, 200, 300]])
         self.assertEqual(tuple(runtime.control_cache.control_memory_8s.shape), (1, 400, 6))
-        self.assertNotIn("density_teacher_8s", runtime.control_cache.as_model_batch())
+        self.assertEqual(tuple(runtime.control_cache.density_teacher_8s.shape), (1, 400, 1))
+        self.assertIn("density_teacher_8s", runtime.control_cache.as_model_batch())
         self.assertEqual(control_model.calls[0]["target_start_frame"], [0, 100, 200, 300])
         self.assertFalse(control_model.calls[0]["grad_enabled"])
         self.assertTrue(control_model.calls[0]["inference_mode"])
@@ -69,7 +70,7 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertIs(batch["frame_count"], cache.frame_count_tensor)
         self.assertIs(batch["source_frame_count"], cache.source_frame_count_tensor)
 
-    def test_prepare_audio_estimates_audio_length_from_mel_when_missing(self) -> None:
+    def test_prepare_audio_rejects_missing_audio_length(self) -> None:
         runtime = SessionRuntime(
             session_id="s1",
             model_runtime=_fake_model_runtime(_FakeTimingProvider(_prediction())),
@@ -78,10 +79,8 @@ class SessionRuntimeTests(unittest.TestCase):
             grid_fitter=_FakeGridFitter(),
         )
 
-        cache = runtime.prepare_audio("song.wav")
-
-        self.assertEqual(cache.audio_length_ms, 100)
-        self.assertEqual(cache.audio_length_source, "mel_frame_estimate")
+        with self.assertRaisesRegex(TypeError, "audio_length_ms"):
+            runtime.prepare_audio("song.wav", audio_length_ms=None)
 
     def test_reset_audio_cache_drops_cached_tensors(self) -> None:
         runtime = SessionRuntime(
@@ -91,7 +90,7 @@ class SessionRuntimeTests(unittest.TestCase):
             mel_loader=_fake_mel_loader(np.zeros((5, 160), dtype=np.float32)),
             grid_fitter=_FakeGridFitter(),
         )
-        runtime.prepare_audio("song.wav")
+        runtime.prepare_audio("song.wav", audio_length_ms=100)
 
         runtime.reset_audio_cache()
 
@@ -108,7 +107,7 @@ class SessionRuntimeTests(unittest.TestCase):
             grid_fitter=_FakeGridFitter(),
         )
 
-        cache = runtime.prepare_audio("song.wav", start_ms=2_000)
+        cache = runtime.prepare_audio("song.wav", audio_length_ms=9_000, start_ms=2_000)
 
         self.assertEqual(cache.padded_frame_count, 500)
         self.assertEqual(cache.padding_mask[:, 448:500].tolist()[0][:5], [False, False, True, True, True])
@@ -131,7 +130,7 @@ class SessionRuntimeTests(unittest.TestCase):
             mel_loader=_fake_mel_loader(np.zeros((500, 160), dtype=np.float32)),
             grid_fitter=fitter,
         )
-        runtime.prepare_audio("song.wav")
+        runtime.prepare_audio("song.wav", audio_length_ms=10_000)
         first_audio_cache = runtime.audio_cache
 
         control_cache = runtime.prepare_control(start_ms=1_000)
@@ -152,7 +151,7 @@ class SessionRuntimeTests(unittest.TestCase):
             mel_loader=_fake_mel_loader(np.zeros((900, 160), dtype=np.float32)),
             grid_fitter=_FakeGridFitter(),
         )
-        runtime.prepare_audio("song.wav")
+        runtime.prepare_audio("song.wav", audio_length_ms=18_000)
 
         batch_cache = runtime.prepare_control_batch(start_ms_values=(0, 8_000, 16_000))
 
@@ -160,12 +159,21 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertIsNone(runtime.control_cache)
         self.assertEqual(batch_cache.start_ms_values, (0, 8_000, 16_000))
         self.assertEqual(batch_cache.target_start_frames, (0, 400, 800))
-        self.assertEqual(batch_cache.control_slice_start_frames.tolist(), [[0, 100, 200, 300], [400, 500, 600, 700], [800, 900, 1000, 1100]])
+        self.assertEqual(
+            batch_cache.control_slice_start_frames.tolist(),
+            [[0, 100, 200, 300], [400, 500, 600, 700], [800, 900, 1000, 1100]],
+        )
         self.assertEqual(tuple(batch_cache.control_memory_8s.shape), (3, 400, 3))
+        self.assertEqual(tuple(batch_cache.density_teacher_8s.shape), (3, 400, 1))
         self.assertEqual(float(batch_cache.control_memory_8s[1, 0, 0].item()), 400.0)
         self.assertEqual(float(batch_cache.control_memory_8s[1, 100, 0].item()), 500.0)
         self.assertEqual(float(batch_cache.control_memory_8s[2, 300, 0].item()), 1100.0)
-        self.assertEqual(control_model.calls[-1]["target_start_frame"], [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100])
+        self.assertEqual(float(batch_cache.density_teacher_8s[1, 0, 0].item()), 400.0)
+        self.assertEqual(float(batch_cache.density_teacher_8s[2, 300, 0].item()), 1100.0)
+        self.assertEqual(
+            control_model.calls[-1]["target_start_frame"],
+            [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100],
+        )
 
     def test_prepare_control_batch_rejects_more_than_max(self) -> None:
         runtime = SessionRuntime(
@@ -175,7 +183,7 @@ class SessionRuntimeTests(unittest.TestCase):
             mel_loader=_fake_mel_loader(np.zeros((900, 160), dtype=np.float32)),
             grid_fitter=_FakeGridFitter(),
         )
-        runtime.prepare_audio("song.wav")
+        runtime.prepare_audio("song.wav", audio_length_ms=18_000)
 
         with self.assertRaisesRegex(ValueError, "<= 2"):
             runtime.prepare_control_batch(start_ms_values=(0, 8_000, 16_000))
@@ -189,7 +197,7 @@ class SessionRuntimeTests(unittest.TestCase):
             mel_loader=_fake_mel_loader(np.zeros((850, 160), dtype=np.float32)),
             grid_fitter=_FakeGridFitter(),
         )
-        runtime.prepare_audio("song.wav")
+        runtime.prepare_audio("song.wav", audio_length_ms=18_000)
 
         full_cache = runtime.prepare_full_control()
 
@@ -198,11 +206,65 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(full_cache.start_ms_values, (0, 8_000, 16_000))
         self.assertEqual(full_cache.target_start_frames, (0, 400, 800))
         self.assertEqual(tuple(full_cache.control_memory_8s.shape), (3, 400, 2))
+        self.assertEqual(tuple(full_cache.density_teacher_8s.shape), (3, 400, 1))
         self.assertEqual(float(full_cache.control_memory_8s[2, 0, 0].item()), 800.0)
         self.assertEqual(float(full_cache.control_memory_8s[2, 300, 0].item()), 1100.0)
+        self.assertEqual(float(full_cache.density_teacher_8s[2, 300, 0].item()), 1100.0)
         self.assertEqual(len(control_model.calls), 3)
         self.assertEqual(control_model.calls[-2]["target_start_frame"], [0, 100, 200, 300, 400, 500, 600, 700])
         self.assertEqual(control_model.calls[-1]["target_start_frame"], [800, 900, 1000, 1100])
+
+    def test_prepare_mapper_window_caches_projected_control_and_global_context(self) -> None:
+        control_model = _FakeControlModel(control_dim=3)
+        mapper_model = _FakeMapperModel(control_dim=3, d_model=5)
+        runtime = SessionRuntime(
+            session_id="s1",
+            model_runtime=_fake_model_runtime(
+                _FakeTimingProvider(_prediction()),
+                control_model=control_model,
+                mapper_model=mapper_model,
+            ),
+            config=SessionRuntimeConfig(minimum_frame_count=4),
+            mel_loader=_fake_mel_loader(np.zeros((500, 160), dtype=np.float32)),
+            grid_fitter=_FakeGridFitter(),
+        )
+        runtime.prepare_audio("song.wav", audio_length_ms=10_000)
+
+        window_cache = runtime.prepare_mapper_window(start_ms=0)
+        reused = runtime.prepare_mapper_window(start_ms=0)
+
+        self.assertIs(runtime.mapper_window_cache, window_cache)
+        self.assertIs(reused, window_cache)
+        self.assertEqual(window_cache.start_ms, 0)
+        self.assertEqual(window_cache.end_ms, 8_000)
+        self.assertEqual(window_cache.target_start_frame, 0)
+        self.assertEqual(tuple(window_cache.projected_control_memory_8s.shape), (1, 400, 5))
+        self.assertEqual(tuple(window_cache.density_feature_8s.shape), (1, 400, 1))
+        self.assertEqual(tuple(window_cache.global_memory.shape), (1, 7, 5))
+        self.assertEqual(tuple(window_cache.global_memory_padding_mask.shape), (1, 7))
+        self.assertEqual(tuple(window_cache.global_position_features.shape), (1, 4))
+        self.assertIsNotNone(window_cache.global_attention_kv_cache)
+        assert window_cache.global_attention_kv_cache is not None
+        self.assertEqual(len(window_cache.global_attention_kv_cache), 2)
+        self.assertEqual(tuple(window_cache.global_attention_kv_cache[0][0].shape), (1, 1, 7, 5))
+        self.assertEqual(tuple(window_cache.global_attention_kv_cache[0][1].shape), (1, 1, 7, 5))
+        self.assertEqual(len(mapper_model.global_calls), 1)
+        self.assertEqual(len(mapper_model.kv_calls), 1)
+        self.assertFalse(mapper_model.global_calls[0]["grad_enabled"])
+        self.assertTrue(mapper_model.global_calls[0]["inference_mode"])
+        self.assertFalse(mapper_model.kv_calls[0]["grad_enabled"])
+        self.assertTrue(mapper_model.kv_calls[0]["inference_mode"])
+        self.assertEqual(mapper_model.global_calls[0]["target_start_frame"], [0])
+
+        batch = window_cache.as_model_batch()
+        self.assertIn("projected_control_memory_8s", batch)
+        self.assertIn("density_teacher_8s", batch)
+        self.assertIn("global_memory", batch)
+        self.assertIn("global_attention_kv_cache", batch)
+        self.assertNotIn("control_memory_8s", batch)
+
+        runtime.prepare_control(start_ms=1_000)
+        self.assertIsNone(runtime.mapper_window_cache)
 
     def test_prepare_control_requires_audio_cache(self) -> None:
         runtime = SessionRuntime(
@@ -224,7 +286,7 @@ class SessionRuntimeTests(unittest.TestCase):
             mel_loader=_fake_mel_loader(np.zeros((5, 160), dtype=np.float32)),
             grid_fitter=_FakeGridFitter(),
         )
-        runtime.prepare_audio("song.wav")
+        runtime.prepare_audio("song.wav", audio_length_ms=100)
 
         with self.assertRaisesRegex(ValueError, "divisible"):
             runtime.prepare_control(start_ms=21)
@@ -239,7 +301,7 @@ class SessionRuntimeTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "packed_mel"):
-            runtime.prepare_audio("song.wav")
+            runtime.prepare_audio("song.wav", audio_length_ms=100)
 
 
 def _prediction(*, frame_count: int = 512, source_path: Path | str = "song.wav") -> FrameTimingPrediction:
@@ -264,11 +326,17 @@ def _fake_mel_loader(mel: np.ndarray):
     return load
 
 
-def _fake_model_runtime(provider: _FakeTimingProvider, *, control_model: torch.nn.Module | None = None) -> SimpleNamespace:
+def _fake_model_runtime(
+    provider: _FakeTimingProvider,
+    *,
+    control_model: torch.nn.Module | None = None,
+    mapper_model: torch.nn.Module | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         device=torch.device("cpu"),
         beatthis_provider=provider,
         control_model=_FakeControlModel() if control_model is None else control_model,
+        mapper_model=_FakeMapperModel() if mapper_model is None else mapper_model,
     )
 
 
@@ -324,6 +392,55 @@ class _FakeControlModel(torch.nn.Module):
         control_memory[:, :, 0] = start_values.reshape(batch_size, 1)
         value_pred = start_values.reshape(batch_size, 1, 1).expand(batch_size, 100, 1).to(dtype=context_mel.dtype)
         return SimpleNamespace(control_memory=control_memory, value_pred=value_pred)
+
+
+class _FakeMapperModel(torch.nn.Module):
+    def __init__(self, *, control_dim: int = 4, d_model: int = 4) -> None:
+        super().__init__()
+        self.control_projection = torch.nn.Linear(control_dim, d_model, bias=False)
+        with torch.no_grad():
+            self.control_projection.weight.zero_()
+            for index in range(min(control_dim, d_model)):
+                self.control_projection.weight[index, index] = 1.0
+        self.d_model = int(d_model)
+        self.global_calls: list[dict[str, object]] = []
+        self.kv_calls: list[dict[str, object]] = []
+
+    def _global_context_memory(
+        self,
+        *,
+        batch: dict[str, torch.Tensor],
+        device: torch.device,
+        batch_size: int,
+        write_start_ms: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del write_start_ms
+        target_start_frame = batch["target_start_frame"]
+        self.global_calls.append(
+            {
+                "target_start_frame": [int(value) for value in target_start_frame.detach().cpu().reshape(-1).tolist()],
+                "grad_enabled": torch.is_grad_enabled(),
+                "inference_mode": torch.is_inference_mode_enabled(),
+            },
+        )
+        memory = torch.ones(batch_size, 7, self.d_model, dtype=torch.float32, device=device)
+        padding_mask = torch.zeros(batch_size, 7, dtype=torch.bool, device=device)
+        position_features = torch.tensor([[0.0, 0.5, 1.0, 1.5]], dtype=torch.float32, device=device).expand(
+            batch_size,
+            -1,
+        )
+        return memory, padding_mask, position_features
+
+    def global_attention_kv_cache(self, global_memory: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        self.kv_calls.append(
+            {
+                "grad_enabled": torch.is_grad_enabled(),
+                "inference_mode": torch.is_inference_mode_enabled(),
+            },
+        )
+        key = global_memory.reshape(global_memory.shape[0], 1, global_memory.shape[1], global_memory.shape[2])
+        value = key + 1.0
+        return ((key, value), (key + 2.0, value + 2.0))
 
 
 class _FakeGridFitter:
