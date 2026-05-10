@@ -105,6 +105,98 @@ class MapperV2ModelTests(unittest.TestCase):
         self.assertEqual(tuple(first_value.shape), tuple(first_key.shape))
         self.assertTrue(torch.allclose(base.logits_final, cached.logits_final, atol=1e-6, rtol=1e-6))
 
+    def test_incremental_decode_matches_cached_full_forward_logits(self) -> None:
+        torch.manual_seed(31)
+        vocab = MapperV1Vocab()
+        model = MapperV2Model(_small_config(vocab), vocab=vocab)
+        model.eval()
+        batch = _batch(vocab)
+        state_dict_keys = tuple(model.state_dict().keys())
+
+        with torch.no_grad():
+            base = model(**batch)
+            assert base.global_memory is not None
+            assert base.global_memory_padding_mask is not None
+            assert base.global_position_features is not None
+
+            cached_batch = _clone_batch(batch)
+            cached_batch["projected_control_memory_8s"] = model.control_projection(
+                cached_batch.pop("control_memory_8s"),
+            )
+            cached_batch["global_memory"] = base.global_memory
+            cached_batch["global_memory_padding_mask"] = base.global_memory_padding_mask
+            cached_batch["global_position_features"] = base.global_position_features
+            cached_batch["global_attention_kv_cache"] = model.global_attention_kv_cache(base.global_memory)
+            for key in ("full_mel", "full_dense_timing_v2", "padding_mask", "frame_count", "source_frame_count"):
+                cached_batch.pop(key)
+            full = model(**cached_batch)
+
+            decode_state = model.create_empty_decode_state(
+                batch_size=int(cached_batch["decoder_input_tokens"].shape[0]),
+                device=cached_batch["decoder_input_tokens"].device,
+            )
+            for step in range(int(cached_batch["decoder_input_tokens"].shape[1])):
+                output = model.incremental_decode_next_token(
+                    decode_state=decode_state,
+                    decoder_input_token=cached_batch["decoder_input_tokens"][:, step],
+                    current_ms=cached_batch["target_fragment_states"]["current_ms"][:, step],
+                    open_mask=cached_batch["target_fragment_states"]["open_mask"][:, step],
+                    open_start_ms=cached_batch["target_fragment_states"]["open_start_ms"][:, step],
+                    open_age_ms=cached_batch["target_fragment_states"]["open_age_ms"][:, step],
+                    write_start_ms=cached_batch["write_start_ms"],
+                    write_end_ms=cached_batch["write_end_ms"],
+                    is_full_chart_start=cached_batch["is_full_chart_start"],
+                    is_full_chart_end=cached_batch["is_full_chart_end"],
+                    ln_carry_in=cached_batch["ln_carry_in"],
+                    ln_carry_out=cached_batch["ln_carry_out"],
+                    density_teacher_8s=cached_batch["density_teacher_8s"],
+                    projected_control_memory_8s=cached_batch["projected_control_memory_8s"],
+                    normalized_difficulty=cached_batch["normalized_difficulty"],
+                    global_memory=cached_batch["global_memory"],
+                    global_memory_padding_mask=cached_batch["global_memory_padding_mask"],
+                    global_position_features=cached_batch["global_position_features"],
+                    global_attention_kv_cache=cached_batch["global_attention_kv_cache"],
+                )
+
+                self.assertTrue(
+                    torch.allclose(output.logits_final, full.logits_final[:, step], atol=1e-5, rtol=1e-5),
+                    msg=f"incremental logits mismatch at step {step}",
+                )
+                self.assertTrue(torch.allclose(output.base_logits, full.base_logits[:, step], atol=1e-5, rtol=1e-5))
+                self.assertTrue(
+                    torch.allclose(output.state_prior_bias, full.state_prior_bias[:, step], atol=1e-6, rtol=1e-6)
+                )
+                self.assertTrue(
+                    torch.allclose(
+                        output.ln_close_event_bias,
+                        full.ln_close_event_bias[:, step],
+                        atol=1e-6,
+                        rtol=1e-6,
+                    )
+                )
+                self.assertTrue(
+                    torch.allclose(
+                        output.ln_close_time_shift_bias,
+                        full.ln_close_time_shift_bias[:, step],
+                        atol=1e-6,
+                        rtol=1e-6,
+                    )
+                )
+
+                decode_state = output.decode_state
+                expected_cache_shape = (
+                    1,
+                    model.config.heads,
+                    step + 1,
+                    model.config.d_model // model.config.heads,
+                )
+                self.assertEqual(decode_state.sequence_length, step + 1)
+                for layer_cache in decode_state.self_attention_kv_cache:
+                    self.assertEqual(tuple(layer_cache.key.shape), expected_cache_shape)
+                    self.assertEqual(tuple(layer_cache.value.shape), expected_cache_shape)
+
+        self.assertEqual(tuple(model.state_dict().keys()), state_dict_keys)
+
     def test_reuses_v1_teacher_forced_loss_targets(self) -> None:
         torch.manual_seed(13)
         vocab = MapperV1Vocab()

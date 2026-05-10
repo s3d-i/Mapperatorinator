@@ -79,6 +79,7 @@ class MapperV2WsConfig:
     max_tokens: int = 512
     temperature: float = 0.0
     top_p: float | None = None
+    use_incremental_mapper_decode: bool = True
     time_shift_length_penalty_alpha: float = 0.0
     seed: int | None = None
     reset_after_audio_end_ms: int = 2_000
@@ -304,6 +305,7 @@ class MapperV2InferenceBackend:
             ln_carry_out=carry_out,
             is_full_chart_start=is_full_chart_start,
             is_full_chart_end=is_full_chart_end,
+            use_incremental_decode=bool(self.config.use_incremental_mapper_decode),
             time_shift_length_penalty_alpha=float(self.config.time_shift_length_penalty_alpha),
         )
         generated = grammar_constrained_window_generation(
@@ -604,6 +606,7 @@ def _mapper_v2_logits_fn(
     ln_carry_out: LNCarryState,
     is_full_chart_start: bool,
     is_full_chart_end: bool,
+    use_incremental_decode: bool,
     time_shift_length_penalty_alpha: float,
 ):
     time_shift_penalty = _time_shift_length_penalty_tensors(
@@ -611,8 +614,25 @@ def _mapper_v2_logits_fn(
         alpha=time_shift_length_penalty_alpha,
         device=device,
     )
+    incremental_decode = (
+        bool(use_incremental_decode)
+        and hasattr(model, "create_empty_decode_state")
+        and hasattr(model, "incremental_decode_next_token")
+    )
+    decode_state: Any | None = None
+    decoded_prefix_tokens: tuple[int, ...] = ()
+    last_incremental_logits: torch.Tensor | None = None
+    write_start_ms_tensor = torch.tensor([ln_carry_in.current_ms], dtype=torch.long, device=device)
+    write_end_ms_tensor: torch.Tensor | None = None
+    full_start_tensor = torch.tensor([bool(is_full_chart_start)], dtype=torch.bool, device=device)
+    full_end_tensor = torch.tensor([bool(is_full_chart_end)], dtype=torch.bool, device=device)
+    difficulty_tensor = torch.tensor([float(normalized_difficulty)], dtype=torch.float32, device=device)
+    carry_in_batch = _carry_state_batch(ln_carry_in, device=device)
+    carry_out_batch = _carry_state_batch(ln_carry_out, device=device)
 
     def logits_fn(step: MapperGenerationStep) -> torch.Tensor:
+        nonlocal decode_state, decoded_prefix_tokens, last_incremental_logits, write_end_ms_tensor
+
         decoder_input_tokens = step.decoder_input_tokens.to(device=device, dtype=torch.long).unsqueeze(0)
         states = _target_fragment_state_batch(
             generated_tokens=step.generated_tokens,
@@ -623,6 +643,54 @@ def _mapper_v2_logits_fn(
             ln_carry_out=ln_carry_out,
             device=device,
         )
+        write_end_ms_tensor = torch.tensor([step.write_end_ms], dtype=torch.long, device=device)
+        if incremental_decode:
+            prefix_tokens = tuple(int(token) for token in step.decoder_input_tokens.reshape(-1).tolist())
+            if not prefix_tokens:
+                raise RuntimeError("mapper decoder prefix cannot be empty")
+            if decode_state is None or prefix_tokens[: len(decoded_prefix_tokens)] != decoded_prefix_tokens:
+                decode_state = model.create_empty_decode_state(batch_size=1, device=device)
+                decoded_prefix_tokens = ()
+                last_incremental_logits = None
+            if len(prefix_tokens) < len(decoded_prefix_tokens):
+                decode_state = model.create_empty_decode_state(batch_size=1, device=device)
+                decoded_prefix_tokens = ()
+                last_incremental_logits = None
+            for position in range(len(decoded_prefix_tokens), len(prefix_tokens)):
+                with torch.inference_mode():
+                    output = model.incremental_decode_next_token(
+                        decode_state=decode_state,
+                        decoder_input_token=decoder_input_tokens[:, position],
+                        current_ms=states["current_ms"][:, position],
+                        open_mask=states["open_mask"][:, position],
+                        open_start_ms=states["open_start_ms"][:, position],
+                        open_age_ms=states["open_age_ms"][:, position],
+                        write_start_ms=write_start_ms_tensor,
+                        write_end_ms=write_end_ms_tensor,
+                        is_full_chart_start=full_start_tensor,
+                        is_full_chart_end=full_end_tensor,
+                        ln_carry_in=carry_in_batch,
+                        ln_carry_out=carry_out_batch,
+                        density_teacher_8s=control_batch["density_teacher_8s"],
+                        control_memory_8s=control_batch.get("control_memory_8s"),
+                        projected_control_memory_8s=control_batch.get("projected_control_memory_8s"),
+                        normalized_difficulty=difficulty_tensor,
+                        global_memory=control_batch.get("global_memory"),
+                        global_memory_padding_mask=control_batch.get("global_memory_padding_mask"),
+                        global_position_features=control_batch.get("global_position_features"),
+                        global_attention_kv_cache=control_batch.get("global_attention_kv_cache"),
+                        position=position,
+                    )
+                decode_state = output.decode_state
+                last_incremental_logits = output.logits_final[0].detach()
+            decoded_prefix_tokens = prefix_tokens
+            if last_incremental_logits is None:
+                raise RuntimeError("incremental mapper decode did not produce logits")
+            return _apply_time_shift_length_penalty(
+                last_incremental_logits,
+                time_shift_penalty=time_shift_penalty,
+            )
+
         current_ms = states["current_ms"]
         target_tokens = torch.full_like(decoder_input_tokens, vocab.pad_id)
         at_write_end = current_ms == int(step.write_end_ms)
@@ -634,13 +702,13 @@ def _mapper_v2_logits_fn(
             "target_fragment_tokens": target_tokens,
             "target_fragment_mask": torch.ones_like(decoder_input_tokens, dtype=torch.bool),
             "target_fragment_states": states,
-            "ln_carry_in": _carry_state_batch(ln_carry_in, device=device),
-            "ln_carry_out": _carry_state_batch(ln_carry_out, device=device),
-            "write_start_ms": torch.tensor([step.write_start_ms], dtype=torch.long, device=device),
-            "write_end_ms": torch.tensor([step.write_end_ms], dtype=torch.long, device=device),
-            "is_full_chart_start": torch.tensor([bool(is_full_chart_start)], dtype=torch.bool, device=device),
-            "is_full_chart_end": torch.tensor([bool(is_full_chart_end)], dtype=torch.bool, device=device),
-            "normalized_difficulty": torch.tensor([float(normalized_difficulty)], dtype=torch.float32, device=device),
+            "ln_carry_in": carry_in_batch,
+            "ln_carry_out": carry_out_batch,
+            "write_start_ms": write_start_ms_tensor,
+            "write_end_ms": write_end_ms_tensor,
+            "is_full_chart_start": full_start_tensor,
+            "is_full_chart_end": full_end_tensor,
+            "normalized_difficulty": difficulty_tensor,
         }
         with torch.inference_mode():
             output = model(batch)

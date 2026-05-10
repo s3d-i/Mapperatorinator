@@ -20,6 +20,7 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     ProtocolError,
     ReferenceClock,
     _apply_time_shift_length_penalty,
+    _mapper_v2_logits_fn,
     _time_shift_length_penalty_scalar,
     _time_shift_length_penalty_tensors,
     audio_end_reset_local_machine_ms,
@@ -35,6 +36,8 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     ws_status_log_payload,
 )
 from train.stage_2.data.control_windows import normalize_difficulty
+from train.stage_2.model_mapper_v1.generation import MapperGenerationStep
+from train.stage_2.model_mapper_v1.replay import empty_ln_carry_state
 from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
 
 
@@ -47,6 +50,27 @@ class FakePeer:
 
     async def send_json(self, payload: dict) -> None:
         self.messages.append(dict(payload))
+
+
+class FakeIncrementalMapperModel:
+    def __init__(self, vocab_size: int) -> None:
+        self.vocab_size = int(vocab_size)
+        self.calls: list[tuple[int, int]] = []
+
+    def create_empty_decode_state(self, *, batch_size: int, device: torch.device):
+        del batch_size, device
+        return SimpleNamespace(steps=0)
+
+    def incremental_decode_next_token(self, *, decode_state, decoder_input_token, position: int, **kwargs):
+        del kwargs
+        token_id = int(decoder_input_token.reshape(-1)[0].item())
+        self.calls.append((int(position), token_id))
+        logits = torch.zeros((1, self.vocab_size), dtype=torch.float32)
+        logits[0, token_id] = 1.0
+        return SimpleNamespace(
+            decode_state=SimpleNamespace(steps=int(getattr(decode_state, "steps", 0)) + 1),
+            logits_final=logits,
+        )
 
 
 class MapperV2WsProtocolTests(unittest.TestCase):
@@ -185,6 +209,63 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(float(adjusted[ts_50].item()), -0.1 * math.log(5.0))
         self.assertAlmostEqual(float(adjusted[ts_200].item()), -0.5 * math.log(20.0))
         self.assertAlmostEqual(float(adjusted[ts_1000].item()), -0.5 * math.log(100.0))
+
+    def test_mapper_v2_logits_fn_incremental_decode_appends_only_new_prefix_token(self) -> None:
+        vocab = MapperV1Vocab()
+        model = FakeIncrementalMapperModel(vocab.size)
+        ln_carry_in = empty_ln_carry_state(0)
+        ln_carry_out = empty_ln_carry_state(8000)
+        control_batch = {
+            "density_teacher_8s": torch.zeros((1, 400, 1), dtype=torch.float32),
+            "projected_control_memory_8s": torch.zeros((1, 400, 16), dtype=torch.float32),
+        }
+        logits_fn = _mapper_v2_logits_fn(
+            model=model,
+            vocab=vocab,
+            device=torch.device("cpu"),
+            normalized_difficulty=0.0,
+            audio_batch={},
+            control_batch=control_batch,
+            ln_carry_in=ln_carry_in,
+            ln_carry_out=ln_carry_out,
+            is_full_chart_start=True,
+            is_full_chart_end=False,
+            use_incremental_decode=True,
+            time_shift_length_penalty_alpha=0.0,
+        )
+
+        logits_fn(
+            MapperGenerationStep(
+                decoder_input_tokens=torch.tensor([vocab.bos_id], dtype=torch.long),
+                generated_tokens=(),
+                state=ln_carry_in,
+                valid_token_mask=torch.ones(vocab.size, dtype=torch.bool),
+                token_index=0,
+                write_start_ms=0,
+                write_end_ms=8000,
+                ln_carry_in=ln_carry_in,
+                ln_carry_out=ln_carry_out,
+            ),
+        )
+        logits = logits_fn(
+            MapperGenerationStep(
+                decoder_input_tokens=torch.tensor(
+                    [vocab.bos_id, vocab.time_shift_token_id(10)],
+                    dtype=torch.long,
+                ),
+                generated_tokens=(vocab.time_shift_token_id(10),),
+                state=empty_ln_carry_state(10),
+                valid_token_mask=torch.ones(vocab.size, dtype=torch.bool),
+                token_index=1,
+                write_start_ms=0,
+                write_end_ms=8000,
+                ln_carry_in=ln_carry_in,
+                ln_carry_out=ln_carry_out,
+            ),
+        )
+
+        self.assertEqual(model.calls, [(0, vocab.bos_id), (1, vocab.time_shift_token_id(10))])
+        self.assertEqual(int(torch.argmax(logits).item()), vocab.time_shift_token_id(10))
 
 
 class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
