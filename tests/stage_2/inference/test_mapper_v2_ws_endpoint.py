@@ -5,10 +5,10 @@ from datetime import datetime
 from pathlib import Path
 
 from train.stage_2.inference.mapper_v2_ws_endpoint import (
+    DatasetHitObjectBackend,
     DecoderWindow,
     InferenceEndpoint,
     MapperV2WsConfig,
-    PlaceholderMapperV2Backend,
     ProtocolError,
     ReferenceClock,
     audio_end_reset_local_machine_ms,
@@ -134,8 +134,8 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_reference_time_starts_hitobject_token_stream(self) -> None:
-        config = MapperV2WsConfig(token_send_interval_s=0.0, placeholder_token_count=3)
-        endpoint = InferenceEndpoint(config=config, backend=PlaceholderMapperV2Backend(config))
+        config = MapperV2WsConfig(token_send_interval_s=0.0)
+        endpoint = InferenceEndpoint(config=config, backend=DatasetHitObjectBackend(config))
         peer = FakePeer()
 
         await endpoint.handle_message({"type": "ready", "control": "ready"}, peer)
@@ -161,11 +161,14 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         assert task is not None
         await task
 
-        self.assertEqual([message["type"] for message in peer.messages], ["hitobject_tokens"] * 3)
+        self.assertEqual([message["type"] for message in peer.messages], ["hitobject_tokens"] * 3_188)
         self.assertTrue(all(message["session_id"] == "s1" for message in peer.messages))
+        self.assertTrue(all(set(message) == {"type", "session_id", "token"} for message in peer.messages))
         self.assertTrue(all(isinstance(message["token"][0], int) for message in peer.messages))
         self.assertTrue(all(isinstance(message["token"][1], int) for message in peer.messages))
-        self.assertTrue(all(set(message) == {"type", "session_id", "token"} for message in peer.messages))
+        self.assertTrue(any(message["token"][1] < 60_000 for message in peer.messages))
+        self.assertTrue(any(60_000 <= message["token"][1] < 120_000 for message in peer.messages))
+        self.assertTrue(any(message["token"][1] >= 120_000 for message in peer.messages))
         await endpoint.stop_session("s1")
 
     async def test_reference_time_requires_audio_length_or_readable_audio_file(self) -> None:
@@ -189,21 +192,18 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 peer,
             )
 
-    async def test_stub_hitobject_stream_is_bounded_to_decoder_window(self) -> None:
-        config = MapperV2WsConfig(
-            token_send_interval_s=0.0,
-            placeholder_token_count=16,
-            stub_first_hitobject_offset_ms=250,
-            stub_hitobject_spacing_ms=500,
-        )
-        backend = PlaceholderMapperV2Backend(config)
+    async def test_real_hitobject_stream_splits_selected_dataset_map_into_three_batches(self) -> None:
+        config = MapperV2WsConfig(token_send_interval_s=0.0)
+        backend = DatasetHitObjectBackend(config)
 
-        stream = backend.stub_hitobject_stream(DecoderWindow(start_ms=8_000, end_ms=16_000))
+        stream = backend.real_hitobject_batches()
 
-        self.assertEqual(len(stream), 16)
-        self.assertEqual(stream[0].ms_in_ref_audio, 8_250)
-        self.assertEqual(stream[-1].ms_in_ref_audio, 15_750)
-        self.assertEqual([item.lane for item in stream[:4]], [0, 1, 2, 3])
+        self.assertEqual(len(stream), 3)
+        self.assertTrue(all(stream))
+        self.assertTrue(all(token.ms_in_ref_audio < 60_000 for token in stream[0]))
+        self.assertTrue(all(60_000 <= token.ms_in_ref_audio < 120_000 for token in stream[1]))
+        self.assertTrue(all(token.ms_in_ref_audio >= 120_000 for token in stream[2]))
+        self.assertEqual(sum(len(batch) for batch in stream), 3_188)
 
     def test_hitobject_token_manifest_matches_full_mapper_event_vocab(self) -> None:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -220,8 +220,8 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["event_token_id_range"], [min(vocab.event_token_ids), max(vocab.event_token_ids)])
 
     async def test_stop_cancels_stream_and_resets_session(self) -> None:
-        config = MapperV2WsConfig(token_send_interval_s=1.0, placeholder_token_count=100)
-        endpoint = InferenceEndpoint(config=config, backend=PlaceholderMapperV2Backend(config))
+        config = MapperV2WsConfig(token_send_interval_s=1.0)
+        endpoint = InferenceEndpoint(config=config, backend=DatasetHitObjectBackend(config))
         peer = FakePeer()
 
         await endpoint.handle_message({"type": "ready", "control": "ready"}, peer)
@@ -251,11 +251,10 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_wall_clock_resets_session_after_audio_end_grace(self) -> None:
         config = MapperV2WsConfig(
             token_send_interval_s=0.0,
-            placeholder_token_count=1,
             reset_after_audio_end_ms=20,
             wall_clock_check_interval_s=0.01,
         )
-        endpoint = InferenceEndpoint(config=config, backend=PlaceholderMapperV2Backend(config))
+        endpoint = InferenceEndpoint(config=config, backend=DatasetHitObjectBackend(config))
         peer = FakePeer()
         now_ms = local_computer_time_ms_since_midnight()
 

@@ -13,13 +13,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from train.stage_2.model_mapper_v1.tokenizer import MAPPER_WRITE_MS
-from train.stage_2.model_mapper_v1.vocab import LaneAction, MapperV1Vocab
+from train.stage1_oracle.osu.hitobjects import parse_mania_hit_objects
+from train.stage_2.model_mapper_v1.tokenizer import MAPPER_WRITE_MS, hitobjects_to_mapper_timepoints
+from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
 
 
 PULSEFIELD_WS_URL = "ws://localhost:8765"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8765
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_HITOBJECT_BEATMAP_PATH = Path(
+    "mania-dataset/0/1047817/Camellia - Arche (-mint-) [drago vs. mint's apeiron].osu",
+)
+HITOBJECT_CHUNK_BOUNDARIES_MS = (60_000, 120_000)
 
 
 class ProtocolError(ValueError):
@@ -37,10 +43,8 @@ class MapperV2WsConfig:
     port: int = DEFAULT_PORT
     decoder_window_ms: int = MAPPER_WRITE_MS
     decoder_lead_ms: int = 2_000
-    token_send_interval_s: float = 0.02
-    placeholder_token_count: int = 16
-    stub_first_hitobject_offset_ms: int = 250
-    stub_hitobject_spacing_ms: int = 500
+    token_send_interval_s: float = 5.0
+    hitobject_beatmap_path: str | Path = DEFAULT_HITOBJECT_BEATMAP_PATH
     reset_after_audio_end_ms: int = 2_000
     wall_clock_check_interval_s: float = 0.05
 
@@ -59,11 +63,10 @@ class DecoderWindow:
 
 
 @dataclass(frozen=True)
-class StubHitObjectToken:
+class HitObjectToken:
     token_id: int
     token_name: str
     ms_in_ref_audio: int
-    lane: int
     actions: tuple[str, ...]
 
     def message_token(self) -> list[int]:
@@ -92,23 +95,20 @@ def session_status(session: SessionState | None) -> str:
     return "audio_preparing"
 
 
-class PlaceholderMapperV2Backend:
-    """Mapper V2 inference placeholder behind the local WebSocket contract."""
-
+class DatasetHitObjectBackend:
     def __init__(self, config: MapperV2WsConfig) -> None:
         self.config = config
         self.vocab = MapperV1Vocab()
         self.models_ready = False
+        self._hitobject_tokens: tuple[HitObjectToken, ...] | None = None
 
     async def startup(self) -> None:
-        # Placeholder for the real Stage 2 Mapper V2 train/model loading script.
+        self._load_hitobject_tokens()
         self.models_ready = True
 
     async def prepare_audio(self, *, session_id: str, audio_path: Path) -> None:
         del session_id, audio_path
-        # Placeholder for mel, timing, and control feature calculation.
-        # Keep this bounded for the local protocol demo; the real path should
-        # run feature/model work off the websocket receive loop.
+        self._load_hitobject_tokens()
         await asyncio.sleep(0)
 
     async def iter_hitobject_tokens(
@@ -116,47 +116,54 @@ class PlaceholderMapperV2Backend:
         *,
         session_id: str,
         audio_path: Path,
-        window: DecoderWindow,
-    ) -> AsyncIterator[StubHitObjectToken]:
+    ) -> AsyncIterator[HitObjectToken]:
         del session_id, audio_path
-        for hitobject in self.stub_hitobject_stream(window):
-            yield hitobject
-            await asyncio.sleep(self.config.token_send_interval_s)
+        batches = self.real_hitobject_batches()
+        for index, batch in enumerate(batches):
+            for token in batch:
+                yield token
+            if index + 1 < len(batches):
+                await asyncio.sleep(max(0.0, float(self.config.token_send_interval_s)))
 
-    def stub_hitobject_stream(self, window: DecoderWindow) -> list[StubHitObjectToken]:
-        """Small deterministic test stream for Pulsefield app integration."""
-        count = max(0, int(self.config.placeholder_token_count))
-        spacing_ms = max(10, int(self.config.stub_hitobject_spacing_ms))
-        first_offset_ms = max(0, int(self.config.stub_first_hitobject_offset_ms))
-        result: list[StubHitObjectToken] = []
-        for index in range(count):
-            token_ms = window.start_ms + first_offset_ms + index * spacing_ms
-            if token_ms >= window.end_ms:
-                break
-            lane = index % 4
-            actions = [LaneAction.NONE] * 4
-            actions[lane] = LaneAction.TAP
-            token_id = self.vocab.encode_event(tuple(actions))
-            result.append(
-                StubHitObjectToken(
-                    token_id=int(token_id),
+    def real_hitobject_batches(self) -> list[tuple[HitObjectToken, ...]]:
+        tokens = self._load_hitobject_tokens()
+        first_boundary_ms, second_boundary_ms = HITOBJECT_CHUNK_BOUNDARIES_MS
+        return [
+            tuple(token for token in tokens if token.ms_in_ref_audio < first_boundary_ms),
+            tuple(token for token in tokens if first_boundary_ms <= token.ms_in_ref_audio < second_boundary_ms),
+            tuple(token for token in tokens if token.ms_in_ref_audio >= second_boundary_ms),
+        ]
+
+    def _load_hitobject_tokens(self) -> tuple[HitObjectToken, ...]:
+        if self._hitobject_tokens is not None:
+            return self._hitobject_tokens
+
+        beatmap_path = _resolve_hitobject_beatmap_path(self.config.hitobject_beatmap_path)
+        hitobjects = parse_mania_hit_objects(beatmap_path, expected_key_count=4)
+        timepoints = hitobjects_to_mapper_timepoints(hitobjects)
+        tokens: list[HitObjectToken] = []
+        for timepoint in timepoints:
+            token_id = int(self.vocab.encode_event(timepoint.lane_actions))
+            tokens.append(
+                HitObjectToken(
+                    token_id=token_id,
                     token_name=self.vocab.token_name(token_id),
-                    ms_in_ref_audio=int(token_ms),
-                    lane=lane,
-                    actions=tuple(action.value for action in actions),
+                    ms_in_ref_audio=int(timepoint.time_ms),
+                    actions=tuple(action.value for action in timepoint.lane_actions),
                 ),
             )
-        return result
+        self._hitobject_tokens = tuple(tokens)
+        return self._hitobject_tokens
 
 
 @dataclass
 class InferenceEndpoint:
     config: MapperV2WsConfig = field(default_factory=MapperV2WsConfig)
-    backend: PlaceholderMapperV2Backend | None = None
+    backend: DatasetHitObjectBackend | None = None
 
     def __post_init__(self) -> None:
         if self.backend is None:
-            self.backend = PlaceholderMapperV2Backend(self.config)
+            self.backend = DatasetHitObjectBackend(self.config)
         self.sessions: dict[str, SessionState] = {}
         self._startup_lock = asyncio.Lock()
 
@@ -302,10 +309,10 @@ class InferenceEndpoint:
     async def _stream_tokens(self, session: SessionState, window: DecoderWindow, peer: JsonPeer) -> None:
         assert self.backend is not None
         assert session.audio_path is not None
+        del window
         async for hitobject in self.backend.iter_hitobject_tokens(
             session_id=session.session_id,
             audio_path=session.audio_path,
-            window=window,
         ):
             if self.sessions.get(session.session_id) is not session:
                 return
@@ -316,6 +323,16 @@ class InferenceEndpoint:
                     "token": hitobject.message_token(),
                 },
             )
+
+
+def _resolve_hitobject_beatmap_path(path: str | Path) -> Path:
+    beatmap_path = Path(path).expanduser()
+    if beatmap_path.is_absolute():
+        return beatmap_path
+    cwd_path = Path.cwd() / beatmap_path
+    if cwd_path.is_file():
+        return cwd_path
+    return REPOSITORY_ROOT / beatmap_path
 
 
 def parse_json_message(raw_message: str | bytes | Mapping[str, Any]) -> Mapping[str, Any]:
