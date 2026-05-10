@@ -1,18 +1,26 @@
 import asyncio
 import json
+import tempfile
 import unittest
+import wave
+from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from train.stage_2.inference.mapper_v2_ws_endpoint import (
-    DatasetHitObjectBackend,
     DecoderWindow,
+    HitObjectToken,
     InferenceEndpoint,
+    MapperV2InferenceBackend,
     MapperV2WsConfig,
     ProtocolError,
     ReferenceClock,
     audio_end_reset_local_machine_ms,
+    audio_path_from_message,
     choose_decoder_window,
+    clamp_decoder_window_to_audio,
+    difficulty_from_message,
     infer_message_type,
     local_machine_ms_reached,
     local_computer_time_ms_since_midnight,
@@ -20,6 +28,7 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     reference_clock_from_message,
     ws_status_log_payload,
 )
+from train.stage_2.data.control_windows import normalize_difficulty
 from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
 
 
@@ -44,9 +53,11 @@ class MapperV2WsProtocolTests(unittest.TestCase):
 
     def test_infer_message_type_accepts_control_fallbacks(self) -> None:
         self.assertEqual(infer_message_type({"type": "audio_path"}), "audio_path")
+        self.assertEqual(infer_message_type({"type": "audio"}), "audio")
         self.assertEqual(infer_message_type({"control": "ready"}), "ready")
         self.assertEqual(infer_message_type({"control": "end_session"}), "stop")
         self.assertEqual(infer_message_type({"session_id": "s1", "audio_path": "/tmp/song.wav"}), "audio_path")
+        self.assertEqual(infer_message_type({"session_id": "s1", "audio": {"path": "/tmp/song.wav"}}), "audio_path")
         self.assertEqual(
             infer_message_type(
                 {
@@ -57,6 +68,17 @@ class MapperV2WsProtocolTests(unittest.TestCase):
             ),
             "reference_time",
         )
+
+    def test_audio_path_from_message_accepts_audio_alias(self) -> None:
+        self.assertEqual(audio_path_from_message({"audio_path": "/tmp/a.wav"}), "/tmp/a.wav")
+        self.assertEqual(audio_path_from_message({"audio": "/tmp/b.wav"}), "/tmp/b.wav")
+        self.assertEqual(audio_path_from_message({"audio": {"path": "/tmp/c.wav"}}), "/tmp/c.wav")
+
+    def test_difficulty_from_message_validates_supported_mapper_range(self) -> None:
+        self.assertEqual(difficulty_from_message({}, default=4.0), 4.0)
+        self.assertEqual(difficulty_from_message({"difficulty": 5.0}, default=4.0), 5.0)
+        with self.assertRaisesRegex(ProtocolError, "difficulty"):
+            difficulty_from_message({"difficulty": 7.0}, default=4.0)
 
     def test_local_time_ms_uses_local_time_of_day(self) -> None:
         value = local_computer_time_ms_since_midnight(datetime(2026, 5, 10, 1, 2, 3, 456_000))
@@ -122,10 +144,24 @@ class MapperV2WsProtocolTests(unittest.TestCase):
 
         self.assertEqual(window, DecoderWindow(start_ms=0, end_ms=8_000))
 
+    def test_clamp_decoder_window_keeps_reference_window_inside_audio(self) -> None:
+        config = MapperV2WsConfig(decoder_window_ms=8_000)
+
+        window = clamp_decoder_window_to_audio(
+            DecoderWindow(start_ms=24_000, end_ms=32_000),
+            audio_length_ms=18_500,
+            config=config,
+        )
+
+        self.assertEqual(window, DecoderWindow(start_ms=16_000, end_ms=24_000))
+
 
 class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_audio_path_requires_ready(self) -> None:
-        endpoint = InferenceEndpoint(config=MapperV2WsConfig(token_send_interval_s=0.0))
+        endpoint = InferenceEndpoint(
+            config=MapperV2WsConfig(token_send_interval_s=0.0),
+            backend=FakeInferenceBackend(),
+        )
 
         with self.assertRaisesRegex(ProtocolError, "send ready"):
             await endpoint.handle_message(
@@ -135,7 +171,13 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reference_time_starts_hitobject_token_stream(self) -> None:
         config = MapperV2WsConfig(token_send_interval_s=0.0)
-        endpoint = InferenceEndpoint(config=config, backend=DatasetHitObjectBackend(config))
+        backend = FakeInferenceBackend(
+            tokens=(
+                HitObjectToken(10, "EVENT_A", 1_240, ("tap", "none", "none", "none")),
+                HitObjectToken(11, "EVENT_B", 1_500, ("none", "tap", "none", "none")),
+            ),
+        )
+        endpoint = InferenceEndpoint(config=config, backend=backend)
         peer = FakePeer()
 
         await endpoint.handle_message({"type": "ready", "control": "ready"}, peer)
@@ -145,6 +187,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "session_id": "s1",
                 "audio_path": "/Users/ken/audio/song1.wav",
                 "audio_length_ms": 180_000,
+                "difficulty": 5.0,
             },
             peer,
         )
@@ -161,27 +204,55 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         assert task is not None
         await task
 
-        self.assertEqual([message["type"] for message in peer.messages], ["hitobject_tokens"] * 3_188)
+        self.assertEqual([message["type"] for message in peer.messages], ["hitobject_tokens"] * 2)
         self.assertTrue(all(message["session_id"] == "s1" for message in peer.messages))
         self.assertTrue(all(set(message) == {"type", "session_id", "token"} for message in peer.messages))
-        self.assertTrue(all(isinstance(message["token"][0], int) for message in peer.messages))
-        self.assertTrue(all(isinstance(message["token"][1], int) for message in peer.messages))
-        self.assertTrue(any(message["token"][1] < 60_000 for message in peer.messages))
-        self.assertTrue(any(60_000 <= message["token"][1] < 120_000 for message in peer.messages))
-        self.assertTrue(any(message["token"][1] >= 120_000 for message in peer.messages))
+        self.assertEqual([message["token"] for message in peer.messages], [[10, 1_240], [11, 1_500]])
+        self.assertEqual(
+            backend.prepared_audio,
+            [
+                {
+                    "session_id": "s1",
+                    "audio_path": Path("/Users/ken/audio/song1.wav"),
+                    "audio_length_ms": 180_000,
+                    "difficulty": 5.0,
+                },
+            ],
+        )
+        self.assertEqual(len(backend.iter_calls), 1)
+        self.assertEqual(backend.iter_calls[0]["audio_path"], Path("/Users/ken/audio/song1.wav"))
+        self.assertEqual(backend.iter_calls[0]["audio_length_ms"], 180_000)
+        self.assertIsInstance(backend.iter_calls[0]["window"], DecoderWindow)
         await endpoint.stop_session("s1")
 
-    async def test_reference_time_requires_audio_length_or_readable_audio_file(self) -> None:
-        endpoint = InferenceEndpoint(config=MapperV2WsConfig(token_send_interval_s=0.0))
+    async def test_audio_path_requires_length_or_readable_audio_file(self) -> None:
+        endpoint = InferenceEndpoint(
+            config=MapperV2WsConfig(token_send_interval_s=0.0),
+            backend=FakeInferenceBackend(),
+        )
         peer = FakePeer()
 
         await endpoint.handle_message({"type": "ready", "control": "ready"}, peer)
-        await endpoint.handle_message(
-            {"type": "audio_path", "session_id": "s1", "audio_path": "/tmp/nonexistent-song.wav"},
-            peer,
-        )
-
         with self.assertRaisesRegex(ProtocolError, "audio_length_ms"):
+            await endpoint.handle_message(
+                {"type": "audio_path", "session_id": "s1", "audio_path": "/tmp/nonexistent-song.wav"},
+                peer,
+            )
+
+    async def test_audio_path_file_duration_allows_reference_time_without_message_length(self) -> None:
+        backend = FakeInferenceBackend()
+        endpoint = InferenceEndpoint(config=MapperV2WsConfig(token_send_interval_s=0.0), backend=backend)
+        peer = FakePeer()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "song.wav"
+            _write_silent_wav(audio_path, duration_ms=1_000)
+
+            await endpoint.handle_message({"type": "ready", "control": "ready"}, peer)
+            await endpoint.handle_message(
+                {"type": "audio_path", "session_id": "s1", "audio_path": str(audio_path)},
+                peer,
+            )
             await endpoint.handle_message(
                 {
                     "type": "reference_time",
@@ -191,19 +262,73 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 },
                 peer,
             )
+            task = endpoint.sessions["s1"].stream_task
+            assert task is not None
+            await task
 
-    async def test_real_hitobject_stream_splits_selected_dataset_map_into_three_batches(self) -> None:
-        config = MapperV2WsConfig(token_send_interval_s=0.0)
-        backend = DatasetHitObjectBackend(config)
+            self.assertEqual(endpoint.sessions["s1"].audio_length_ms, 1_000)
+            self.assertEqual(backend.prepared_audio[0]["audio_length_ms"], 1_000)
+            self.assertEqual(backend.iter_calls[0]["audio_length_ms"], 1_000)
+            await endpoint.stop_session("s1")
 
-        stream = backend.real_hitobject_batches()
+    async def test_audio_message_alias_prepares_ws_audio(self) -> None:
+        backend = FakeInferenceBackend()
+        endpoint = InferenceEndpoint(config=MapperV2WsConfig(token_send_interval_s=0.0), backend=backend)
+        peer = FakePeer()
 
-        self.assertEqual(len(stream), 3)
-        self.assertTrue(all(stream))
-        self.assertTrue(all(token.ms_in_ref_audio < 60_000 for token in stream[0]))
-        self.assertTrue(all(60_000 <= token.ms_in_ref_audio < 120_000 for token in stream[1]))
-        self.assertTrue(all(token.ms_in_ref_audio >= 120_000 for token in stream[2]))
-        self.assertEqual(sum(len(batch) for batch in stream), 3_188)
+        await endpoint.handle_message({"control": "ready"}, peer)
+        await endpoint.handle_message(
+            {
+                "type": "audio",
+                "session_id": "s1",
+                "audio": {"path": "/tmp/song.wav"},
+                "audio_length_ms": 2_000,
+            },
+            peer,
+        )
+
+        self.assertEqual(backend.prepared_audio[0]["audio_path"], Path("/tmp/song.wav"))
+        self.assertEqual(backend.prepared_audio[0]["audio_length_ms"], 2_000)
+
+    async def test_mapper_v2_backend_prepares_session_runtime_from_ws_audio(self) -> None:
+        loader_configs = []
+        created = []
+        fake_session = FakeSessionRuntime()
+
+        def runtime_loader(config):
+            loader_configs.append(config)
+            return SimpleNamespace(device="cpu", vocab=MapperV1Vocab(), mapper_model=None)
+
+        def session_factory(session_id, model_runtime, config):
+            created.append((session_id, model_runtime, config))
+            return fake_session
+
+        config = MapperV2WsConfig(
+            mapper_checkpoint_path="mapper.pt",
+            control_checkpoint_path="control.pt",
+            device="cpu",
+            token_send_interval_s=0.0,
+        )
+        backend = MapperV2InferenceBackend(
+            config,
+            runtime_loader=runtime_loader,
+            session_runtime_factory=session_factory,
+        )
+
+        await backend.startup()
+        await backend.prepare_audio(
+            session_id="s1",
+            audio_path=Path("/tmp/song.wav"),
+            audio_length_ms=1_234,
+            difficulty=5.0,
+        )
+
+        self.assertTrue(backend.models_ready)
+        self.assertEqual(loader_configs[0].mapper_checkpoint_path, Path.cwd() / "mapper.pt")
+        self.assertEqual(loader_configs[0].control_checkpoint_path, Path.cwd() / "control.pt")
+        self.assertEqual(created[0][0], "s1")
+        self.assertAlmostEqual(created[0][2].default_normalized_difficulty, normalize_difficulty(5.0))
+        self.assertEqual(fake_session.prepare_audio_calls, [(Path("/tmp/song.wav"), 1_234, 0)])
 
     def test_hitobject_token_manifest_matches_full_mapper_event_vocab(self) -> None:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -221,7 +346,8 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_cancels_stream_and_resets_session(self) -> None:
         config = MapperV2WsConfig(token_send_interval_s=1.0)
-        endpoint = InferenceEndpoint(config=config, backend=DatasetHitObjectBackend(config))
+        backend = FakeInferenceBackend(block_after_first=True)
+        endpoint = InferenceEndpoint(config=config, backend=backend)
         peer = FakePeer()
 
         await endpoint.handle_message({"type": "ready", "control": "ready"}, peer)
@@ -247,6 +373,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         await endpoint.handle_message({"type": "stop", "session_id": "s1", "control": "end_session"}, peer)
 
         self.assertNotIn("s1", endpoint.sessions)
+        self.assertEqual(backend.reset_sessions, ["s1"])
 
     async def test_wall_clock_resets_session_after_audio_end_grace(self) -> None:
         config = MapperV2WsConfig(
@@ -254,7 +381,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
             reset_after_audio_end_ms=20,
             wall_clock_check_interval_s=0.01,
         )
-        endpoint = InferenceEndpoint(config=config, backend=DatasetHitObjectBackend(config))
+        endpoint = InferenceEndpoint(config=config, backend=FakeInferenceBackend())
         peer = FakePeer()
         now_ms = local_computer_time_ms_since_midnight()
 
@@ -279,6 +406,95 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.2)
 
         self.assertNotIn("s1", endpoint.sessions)
+
+
+class FakeInferenceBackend:
+    def __init__(
+        self,
+        *,
+        tokens: tuple[HitObjectToken, ...] | None = None,
+        block_after_first: bool = False,
+    ) -> None:
+        self.models_ready = False
+        self.tokens = (
+            HitObjectToken(10, "EVENT_A", 0, ("tap", "none", "none", "none")),
+        ) if tokens is None else tokens
+        self.block_after_first = bool(block_after_first)
+        self.prepared_audio: list[dict[str, object]] = []
+        self.iter_calls: list[dict[str, object]] = []
+        self.reset_sessions: list[str] = []
+
+    async def startup(self) -> None:
+        self.models_ready = True
+
+    async def prepare_audio(
+        self,
+        *,
+        session_id: str,
+        audio_path: Path,
+        audio_length_ms: int,
+        difficulty: float | None,
+    ) -> None:
+        self.prepared_audio.append(
+            {
+                "session_id": session_id,
+                "audio_path": audio_path,
+                "audio_length_ms": audio_length_ms,
+                "difficulty": difficulty,
+            },
+        )
+        await asyncio.sleep(0)
+
+    async def iter_hitobject_tokens(
+        self,
+        *,
+        session_id: str,
+        audio_path: Path,
+        audio_length_ms: int,
+        window: DecoderWindow,
+    ) -> AsyncIterator[HitObjectToken]:
+        self.iter_calls.append(
+            {
+                "session_id": session_id,
+                "audio_path": audio_path,
+                "audio_length_ms": audio_length_ms,
+                "window": window,
+            },
+        )
+        for index, token in enumerate(self.tokens):
+            yield token
+            if index == 0 and self.block_after_first:
+                await asyncio.sleep(10)
+
+    async def reset_session(self, session_id: str) -> None:
+        self.reset_sessions.append(session_id)
+
+
+class FakeSessionRuntime:
+    def __init__(self) -> None:
+        self.prepare_audio_calls: list[tuple[Path, int, int]] = []
+
+    def prepare_audio(
+        self,
+        audio_path: str | Path,
+        *,
+        audio_length_ms: int,
+        start_ms: int = 0,
+    ) -> SimpleNamespace:
+        self.prepare_audio_calls.append((Path(audio_path), audio_length_ms, start_ms))
+        return SimpleNamespace(audio_length_ms=audio_length_ms)
+
+    def reset_audio_cache(self) -> None:
+        pass
+
+
+def _write_silent_wav(path: Path, *, duration_ms: int, sample_rate: int = 8_000) -> None:
+    frame_count = int(round(sample_rate * duration_ms / 1000.0))
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes(b"\x00\x00" * frame_count)
 
 
 if __name__ == "__main__":
