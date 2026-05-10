@@ -46,6 +46,10 @@ DEFAULT_CONTROL_CHECKPOINT_PATH = Path(
     "train/artifacts/runs/stage2_control_demo/"
     "stage2_control_demo_global_d384_l3_stride16_b6/checkpoints/checkpoint_step_002000.pt",
 )
+TIME_SHIFT_LENGTH_PENALTY_LOG_BASE_MS = 10
+TIME_SHIFT_LENGTH_PENALTY_START_MS = 50
+TIME_SHIFT_LENGTH_PENALTY_FULL_MS = 200
+TIME_SHIFT_LENGTH_PENALTY_START_SCALAR = 0.1
 
 
 class ProtocolError(ValueError):
@@ -75,6 +79,7 @@ class MapperV2WsConfig:
     max_tokens: int = 512
     temperature: float = 0.0
     top_p: float | None = None
+    time_shift_length_penalty_alpha: float = 0.0
     seed: int | None = None
     reset_after_audio_end_ms: int = 2_000
     wall_clock_check_interval_s: float = 0.05
@@ -299,6 +304,7 @@ class MapperV2InferenceBackend:
             ln_carry_out=carry_out,
             is_full_chart_start=is_full_chart_start,
             is_full_chart_end=is_full_chart_end,
+            time_shift_length_penalty_alpha=float(self.config.time_shift_length_penalty_alpha),
         )
         generated = grammar_constrained_window_generation(
             vocab=vocab,
@@ -597,7 +603,14 @@ def _mapper_v2_logits_fn(
     ln_carry_out: LNCarryState,
     is_full_chart_start: bool,
     is_full_chart_end: bool,
+    time_shift_length_penalty_alpha: float,
 ):
+    time_shift_penalty = _time_shift_length_penalty_tensors(
+        vocab,
+        alpha=time_shift_length_penalty_alpha,
+        device=device,
+    )
+
     def logits_fn(step: MapperGenerationStep) -> torch.Tensor:
         decoder_input_tokens = step.decoder_input_tokens.to(device=device, dtype=torch.long).unsqueeze(0)
         states = _target_fragment_state_batch(
@@ -630,9 +643,68 @@ def _mapper_v2_logits_fn(
         }
         with torch.inference_mode():
             output = model(batch)
-        return output.logits_final[0, -1].detach()
+        logits = output.logits_final[0, -1].detach()
+        return _apply_time_shift_length_penalty(logits, time_shift_penalty=time_shift_penalty)
 
     return logits_fn
+
+
+def _time_shift_length_penalty_tensors(
+    vocab: MapperV1Vocab,
+    *,
+    alpha: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    alpha = float(alpha)
+    if alpha < 0.0:
+        raise ValueError(f"time_shift_length_penalty_alpha must be non-negative, got {alpha}")
+    if alpha == 0.0:
+        return None
+
+    token_ids: list[int] = []
+    penalties: list[float] = []
+    for token_id in vocab.time_shift_token_ids:
+        delta_ms = vocab.time_shift_value(token_id)
+        scalar = _time_shift_length_penalty_scalar(delta_ms, max_scalar=alpha)
+        penalty = scalar * math.log(float(delta_ms) / float(TIME_SHIFT_LENGTH_PENALTY_LOG_BASE_MS))
+        if penalty <= 0.0:
+            continue
+        token_ids.append(int(token_id))
+        penalties.append(float(penalty))
+    if not token_ids:
+        return None
+    return (
+        torch.tensor(token_ids, dtype=torch.long, device=device),
+        torch.tensor(penalties, dtype=torch.float32, device=device),
+    )
+
+
+def _time_shift_length_penalty_scalar(delta_ms: int, *, max_scalar: float) -> float:
+    delta_ms = int(delta_ms)
+    max_scalar = float(max_scalar)
+    if delta_ms < TIME_SHIFT_LENGTH_PENALTY_START_MS:
+        return 0.0
+    if delta_ms >= TIME_SHIFT_LENGTH_PENALTY_FULL_MS:
+        return max_scalar
+    start_scalar = min(TIME_SHIFT_LENGTH_PENALTY_START_SCALAR, max_scalar)
+    ramp = (
+        (float(delta_ms) - float(TIME_SHIFT_LENGTH_PENALTY_START_MS))
+        / (float(TIME_SHIFT_LENGTH_PENALTY_FULL_MS) - float(TIME_SHIFT_LENGTH_PENALTY_START_MS))
+    )
+    return start_scalar + ramp * (max_scalar - start_scalar)
+
+
+def _apply_time_shift_length_penalty(
+    logits: torch.Tensor,
+    *,
+    time_shift_penalty: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    if time_shift_penalty is None:
+        return logits
+    token_ids, penalties = time_shift_penalty
+    adjusted = logits.clone()
+    adjusted[token_ids] -= penalties.to(dtype=adjusted.dtype)
+    return adjusted
 
 
 def _target_fragment_state_batch(

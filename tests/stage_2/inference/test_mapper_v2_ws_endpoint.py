@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import tempfile
 import unittest
 import wave
@@ -7,6 +8,8 @@ from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+import torch
 
 from train.stage_2.inference.mapper_v2_ws_endpoint import (
     DecoderWindow,
@@ -16,6 +19,9 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     MapperV2WsConfig,
     ProtocolError,
     ReferenceClock,
+    _apply_time_shift_length_penalty,
+    _time_shift_length_penalty_scalar,
+    _time_shift_length_penalty_tensors,
     audio_end_reset_local_machine_ms,
     audio_path_from_message,
     choose_decoder_window,
@@ -154,6 +160,31 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(window, DecoderWindow(start_ms=16_000, end_ms=24_000))
+
+    def test_time_shift_length_penalty_ramps_from_ts_50_to_ts_200(self) -> None:
+        vocab = MapperV1Vocab()
+        logits = torch.zeros(vocab.size, dtype=torch.float32)
+        ts_40 = vocab.time_shift_token_id(40)
+        ts_50 = vocab.time_shift_token_id(50)
+        ts_1000 = vocab.time_shift_token_id(1000)
+        ts_200 = vocab.time_shift_token_id(200)
+        event_id = vocab.event_token_ids[0]
+        logits[event_id] = 4.0
+
+        penalty = _time_shift_length_penalty_tensors(
+            vocab,
+            alpha=0.5,
+            device=torch.device("cpu"),
+        )
+        adjusted = _apply_time_shift_length_penalty(logits, time_shift_penalty=penalty)
+
+        self.assertAlmostEqual(_time_shift_length_penalty_scalar(50, max_scalar=0.5), 0.1)
+        self.assertAlmostEqual(_time_shift_length_penalty_scalar(200, max_scalar=0.5), 0.5)
+        self.assertAlmostEqual(float(adjusted[ts_40].item()), 0.0)
+        self.assertAlmostEqual(float(adjusted[event_id].item()), 4.0)
+        self.assertAlmostEqual(float(adjusted[ts_50].item()), -0.1 * math.log(5.0))
+        self.assertAlmostEqual(float(adjusted[ts_200].item()), -0.5 * math.log(20.0))
+        self.assertAlmostEqual(float(adjusted[ts_1000].item()), -0.5 * math.log(100.0))
 
 
 class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
