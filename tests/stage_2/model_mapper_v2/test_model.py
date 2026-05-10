@@ -45,6 +45,66 @@ class MapperV2ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "full_mel"):
             model(**batch)
 
+    def test_forward_reuses_precomputed_window_context(self) -> None:
+        torch.manual_seed(12)
+        vocab = MapperV1Vocab()
+        model = MapperV2Model(_small_config(vocab), vocab=vocab)
+        model.eval()
+        batch = _batch(vocab)
+
+        with torch.no_grad():
+            base = model(**batch)
+            cached_batch = _clone_batch(batch)
+            cached_batch["projected_control_memory_8s"] = model.control_projection(
+                cached_batch.pop("control_memory_8s"),
+            )
+            assert base.global_memory is not None
+            assert base.global_memory_padding_mask is not None
+            assert base.global_position_features is not None
+            cached_batch["global_memory"] = base.global_memory
+            cached_batch["global_memory_padding_mask"] = base.global_memory_padding_mask
+            cached_batch["global_position_features"] = base.global_position_features
+            for key in ("full_mel", "full_dense_timing_v2", "padding_mask", "frame_count", "source_frame_count"):
+                cached_batch.pop(key)
+            cached = model(**cached_batch)
+
+        self.assertTrue(torch.allclose(base.logits_final, cached.logits_final, atol=1e-6, rtol=1e-6))
+        assert cached.global_memory is not None
+        self.assertTrue(torch.allclose(cached.global_memory, cached_batch["global_memory"], atol=0.0, rtol=0.0))
+
+    def test_forward_reuses_precomputed_global_attention_kv_cache(self) -> None:
+        torch.manual_seed(14)
+        vocab = MapperV1Vocab()
+        model = MapperV2Model(_small_config(vocab), vocab=vocab)
+        model.eval()
+        batch = _batch(vocab)
+
+        with torch.no_grad():
+            base = model(**batch)
+            assert base.global_memory is not None
+            assert base.global_memory_padding_mask is not None
+            assert base.global_position_features is not None
+
+            cached_batch = _clone_batch(batch)
+            cached_batch["projected_control_memory_8s"] = model.control_projection(
+                cached_batch.pop("control_memory_8s"),
+            )
+            cached_batch["global_memory"] = base.global_memory
+            cached_batch["global_memory_padding_mask"] = base.global_memory_padding_mask
+            cached_batch["global_position_features"] = base.global_position_features
+            cached_batch["global_attention_kv_cache"] = model.global_attention_kv_cache(base.global_memory)
+            for key in ("full_mel", "full_dense_timing_v2", "padding_mask", "frame_count", "source_frame_count"):
+                cached_batch.pop(key)
+            cached = model(**cached_batch)
+
+        first_key, first_value = cached_batch["global_attention_kv_cache"][0]
+        self.assertEqual(
+            tuple(first_key.shape),
+            (1, model.config.heads, base.global_memory.shape[1], model.config.d_model // model.config.heads),
+        )
+        self.assertEqual(tuple(first_value.shape), tuple(first_key.shape))
+        self.assertTrue(torch.allclose(base.logits_final, cached.logits_final, atol=1e-6, rtol=1e-6))
+
     def test_reuses_v1_teacher_forced_loss_targets(self) -> None:
         torch.manual_seed(13)
         vocab = MapperV1Vocab()

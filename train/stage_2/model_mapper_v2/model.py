@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from train.stage_2.model_control_demo_global.model import (
     ControlDemoGlobalEncoderConfig,
@@ -113,11 +114,17 @@ class MapperV2Model(MapperV1Model):
             maybe_control_memory = batch.get("control_memory_8s")
             if isinstance(maybe_control_memory, torch.Tensor):
                 control_memory_8s = maybe_control_memory
+        projected_control_memory_8s = batch.get("projected_control_memory_8s")
+        if projected_control_memory_8s is not None and not isinstance(projected_control_memory_8s, torch.Tensor):
+            raise ValueError("projected_control_memory_8s must be a torch.Tensor")
+        if projected_control_memory_8s is not None and control_memory_8s is not None:
+            raise ValueError("projected_control_memory_8s cannot be supplied with control_memory_8s")
         if density_teacher_8s is None:
             maybe_density_teacher = batch.get("density_teacher_8s")
             if isinstance(maybe_density_teacher, torch.Tensor):
                 density_teacher_8s = maybe_density_teacher
-        if (control_memory_8s is None) != (density_teacher_8s is None):
+        has_control_context = control_memory_8s is not None or projected_control_memory_8s is not None
+        if has_control_context != (density_teacher_8s is not None):
             raise ValueError("control_memory_8s and density_teacher_8s must be supplied together")
         if isinstance(batch.get("control_memory_padding_mask_8s"), torch.Tensor):
             raise ValueError("control_memory_padding_mask_8s is not supported in Phase B; supply full 8s control memory")
@@ -187,25 +194,43 @@ class MapperV2Model(MapperV1Model):
             valid_input_mask=valid_input_mask,
         )
 
-        if control_memory_8s is None:
+        if control_memory_8s is None and projected_control_memory_8s is None:
             control_memory_8s, density_teacher_8s = self._control_teacher_8s(batch)
-        control_memory_8s = control_memory_8s.detach().to(device=decoder_input.device, dtype=torch.float32)
         density_teacher_8s = density_teacher_8s.detach().to(device=decoder_input.device, dtype=torch.float32)
-        if control_memory_8s.ndim != 3 or int(control_memory_8s.shape[1]) != MAPPER_DENSITY_FRAMES:
-            raise ValueError(f"control_memory_8s must have shape [B,{MAPPER_DENSITY_FRAMES},D]")
-        if int(control_memory_8s.shape[-1]) != self.config.control_dim:
-            raise ValueError(
-                f"control_memory_8s last dim must match config.control_dim={self.config.control_dim}, "
-                f"got {control_memory_8s.shape[-1]}"
-            )
+        if projected_control_memory_8s is None:
+            assert control_memory_8s is not None
+            control_memory_8s = control_memory_8s.detach().to(device=decoder_input.device, dtype=torch.float32)
+            if control_memory_8s.ndim != 3 or int(control_memory_8s.shape[1]) != MAPPER_DENSITY_FRAMES:
+                raise ValueError(f"control_memory_8s must have shape [B,{MAPPER_DENSITY_FRAMES},D]")
+            if int(control_memory_8s.shape[-1]) != self.config.control_dim:
+                raise ValueError(
+                    f"control_memory_8s last dim must match config.control_dim={self.config.control_dim}, "
+                    f"got {control_memory_8s.shape[-1]}"
+                )
+            control_memory = self.control_projection(control_memory_8s)
+        else:
+            control_memory = projected_control_memory_8s.detach().to(device=decoder_input.device, dtype=torch.float32)
+            if control_memory.ndim != 3 or int(control_memory.shape[1]) != MAPPER_DENSITY_FRAMES:
+                raise ValueError(f"projected_control_memory_8s must have shape [B,{MAPPER_DENSITY_FRAMES},D]")
+            if int(control_memory.shape[-1]) != self.config.d_model:
+                raise ValueError(
+                    f"projected_control_memory_8s last dim must match config.d_model={self.config.d_model}, "
+                    f"got {control_memory.shape[-1]}"
+                )
         if tuple(density_teacher_8s.shape) != (decoder_input.shape[0], MAPPER_DENSITY_FRAMES, 1):
             raise ValueError(f"density_teacher_8s must have shape [B,{MAPPER_DENSITY_FRAMES},1]")
-        control_memory = self.control_projection(control_memory_8s)
         global_memory, global_memory_padding_mask, global_position_features = self._global_context_memory(
             batch=batch,
             device=device,
             batch_size=int(decoder_input.shape[0]),
             write_start_ms=write_start_ms,
+        )
+        global_attention_kv_cache = _precomputed_global_attention_kv_cache(
+            batch=batch,
+            device=device,
+            batch_size=int(decoder_input.shape[0]),
+            global_memory=global_memory,
+            config=self.config,
         )
 
         decoder_hidden, base_logits = self._decode_with_global_context(
@@ -219,6 +244,7 @@ class MapperV2Model(MapperV1Model):
             global_memory=global_memory,
             global_memory_padding_mask=global_memory_padding_mask,
             global_position_features=global_position_features,
+            global_attention_kv_cache=global_attention_kv_cache,
         )
         remaining_ms = (write_end_ms.reshape(-1, 1) - current_ms).clamp_min(0)
         state_prior = self.state_prior_adapter(
@@ -298,6 +324,7 @@ class MapperV2Model(MapperV1Model):
         global_memory: torch.Tensor | None,
         global_memory_padding_mask: torch.Tensor | None,
         global_position_features: torch.Tensor | None,
+        global_attention_kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, steps = tokens.shape
         if steps > self.config.max_seq_len:
@@ -341,10 +368,27 @@ class MapperV2Model(MapperV1Model):
                     input_padding_mask=input_padding_mask,
                     global_memory=global_memory,
                     global_memory_padding_mask=global_memory_padding_mask,
+                    global_attention_kv=None
+                    if global_attention_kv_cache is None
+                    else global_attention_kv_cache[layer_index],
                 )
         decoder_hidden = self.output_norm(hidden)
         base_logits = self.output_head(decoder_hidden)
         return decoder_hidden, base_logits
+
+    def global_attention_kv_cache(
+        self,
+        global_memory: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        if not self.config.use_global_context:
+            raise ValueError("global attention K/V cache requires global context to be enabled")
+        if global_memory.ndim != 3:
+            raise ValueError(f"global_memory must have shape [B,G,D], got {tuple(global_memory.shape)}")
+        if int(global_memory.shape[-1]) != self.config.d_model:
+            raise ValueError(f"global_memory last dim must be {self.config.d_model}, got {global_memory.shape[-1]}")
+        device = self.global_cross_attention_layers[0].gate_logit.device
+        memory = global_memory.detach().to(device=device, dtype=torch.float32)
+        return tuple(block.global_attention_kv_cache(memory) for block in self.global_cross_attention_layers)
 
     def _global_context_memory(
         self,
@@ -358,6 +402,14 @@ class MapperV2Model(MapperV1Model):
             return None, None, None
         if self.global_encoder is None:
             raise ValueError("global context is enabled but global_encoder is missing")
+        cached = _precomputed_global_context_memory(
+            batch=batch,
+            device=device,
+            batch_size=batch_size,
+            config=self.config,
+        )
+        if cached is not None:
+            return cached
         full_mel = _require_tensor(batch, "full_mel", ndim=3).to(device=device, dtype=torch.float32)
         full_dense_timing_v2 = _require_tensor(batch, "full_dense_timing_v2", ndim=3).to(device=device, dtype=torch.float32)
         padding_mask = _require_tensor(batch, "padding_mask", ndim=2).to(device=device, dtype=torch.bool)
@@ -431,17 +483,84 @@ class _MapperGlobalCrossAttentionBlock(nn.Module):
         input_padding_mask: torch.Tensor | None,
         global_memory: torch.Tensor,
         global_memory_padding_mask: torch.Tensor,
+        global_attention_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        memory = self.memory_norm(global_memory)
-        cross, _ = self.cross_attn(
-            query=self.query_norm(hidden),
-            key=memory,
-            value=memory,
-            key_padding_mask=global_memory_padding_mask,
-            need_weights=False,
-        )
+        query = self.query_norm(hidden)
+        if global_attention_kv is None:
+            memory = self.memory_norm(global_memory)
+            cross, _ = self.cross_attn(
+                query=query,
+                key=memory,
+                value=memory,
+                key_padding_mask=global_memory_padding_mask,
+                need_weights=False,
+            )
+        else:
+            cross = self._cached_cross_attention(
+                query=query,
+                global_attention_kv=global_attention_kv,
+                global_memory_padding_mask=global_memory_padding_mask,
+            )
         hidden = hidden + torch.sigmoid(self.gate_logit).to(dtype=hidden.dtype) * self.dropout(cross)
         return _mask_hidden(hidden, input_padding_mask)
+
+    def global_attention_kv_cache(self, global_memory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        memory = self.memory_norm(global_memory.detach().to(device=self.gate_logit.device, dtype=torch.float32))
+        _, key_weight, value_weight = self.cross_attn.in_proj_weight.chunk(3, dim=0)
+        in_proj_bias = self.cross_attn.in_proj_bias
+        if in_proj_bias is None:
+            key_bias = value_bias = None
+        else:
+            _, key_bias, value_bias = in_proj_bias.chunk(3, dim=0)
+        key = _attention_projection_to_heads(
+            F.linear(memory, key_weight, key_bias),
+            heads=self.cross_attn.num_heads,
+        )
+        value = _attention_projection_to_heads(
+            F.linear(memory, value_weight, value_bias),
+            heads=self.cross_attn.num_heads,
+        )
+        return key.detach().contiguous(), value.detach().contiguous()
+
+    def _cached_cross_attention(
+        self,
+        *,
+        query: torch.Tensor,
+        global_attention_kv: tuple[torch.Tensor, torch.Tensor],
+        global_memory_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        key, value = global_attention_kv
+        batch_size, steps, d_model = query.shape
+        heads = int(self.cross_attn.num_heads)
+        head_dim = d_model // heads
+        expected_shape = (batch_size, heads, int(global_memory_padding_mask.shape[1]), head_dim)
+        if tuple(key.shape) != expected_shape:
+            raise ValueError(f"global attention key cache must have shape {expected_shape}, got {tuple(key.shape)}")
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(f"global attention value cache must have shape {expected_shape}, got {tuple(value.shape)}")
+
+        query_weight = self.cross_attn.in_proj_weight[:d_model]
+        in_proj_bias = self.cross_attn.in_proj_bias
+        query_bias = None if in_proj_bias is None else in_proj_bias[:d_model]
+        projected_query = _attention_projection_to_heads(
+            F.linear(query, query_weight, query_bias),
+            heads=heads,
+        )
+        attention_mask = _global_key_padding_attention_mask(
+            global_memory_padding_mask,
+            dtype=projected_query.dtype,
+            device=projected_query.device,
+        )
+        attention = F.scaled_dot_product_attention(
+            projected_query,
+            key.to(device=projected_query.device, dtype=projected_query.dtype),
+            value.to(device=projected_query.device, dtype=projected_query.dtype),
+            attn_mask=attention_mask,
+            dropout_p=float(self.cross_attn.dropout) if self.training else 0.0,
+            is_causal=False,
+        )
+        attention = attention.transpose(1, 2).contiguous().view(batch_size, steps, d_model)
+        return self.cross_attn.out_proj(attention)
 
 
 def _global_encoder_config(config: MapperV2Config) -> ControlDemoGlobalEncoderConfig:
@@ -476,6 +595,114 @@ def _target_start_frame(
     if value.dtype == torch.bool or value.dtype.is_floating_point or value.dtype.is_complex:
         raise ValueError("target_start_frame must be an integer tensor")
     return value.to(device=device, dtype=torch.long)
+
+
+def _precomputed_global_context_memory(
+    *,
+    batch: Mapping[str, Any],
+    device: torch.device,
+    batch_size: int,
+    config: MapperV2Config,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    global_memory = batch.get("global_memory")
+    if global_memory is None:
+        return None
+    if not isinstance(global_memory, torch.Tensor):
+        raise ValueError("global_memory must be a torch.Tensor")
+    global_padding_mask = batch.get("global_memory_padding_mask")
+    if not isinstance(global_padding_mask, torch.Tensor):
+        raise ValueError("global_memory_padding_mask is required when global_memory is supplied")
+    global_position_features = batch.get("global_position_features")
+    if not isinstance(global_position_features, torch.Tensor):
+        raise ValueError("global_position_features is required when global_memory is supplied")
+
+    memory = global_memory.detach().to(device=device, dtype=torch.float32)
+    padding_mask = global_padding_mask.detach().to(device=device, dtype=torch.bool)
+    position_features = global_position_features.detach().to(device=device, dtype=torch.float32)
+    if memory.ndim != 3:
+        raise ValueError(f"global_memory must have shape [B,G,D], got {tuple(memory.shape)}")
+    if int(memory.shape[0]) != int(batch_size):
+        raise ValueError(f"global_memory batch must be {batch_size}, got {memory.shape[0]}")
+    if int(memory.shape[-1]) != int(config.d_model):
+        raise ValueError(f"global_memory last dim must be {config.d_model}, got {memory.shape[-1]}")
+    if tuple(padding_mask.shape) != tuple(memory.shape[:2]):
+        raise ValueError("global_memory_padding_mask must have shape [B,G]")
+    if tuple(position_features.shape) != (int(batch_size), GLOBAL_POSITION_FEATURES):
+        raise ValueError(
+            f"global_position_features must have shape [{batch_size},{GLOBAL_POSITION_FEATURES}], "
+            f"got {tuple(position_features.shape)}"
+        )
+    return memory, padding_mask, position_features
+
+
+def _precomputed_global_attention_kv_cache(
+    *,
+    batch: Mapping[str, Any],
+    device: torch.device,
+    batch_size: int,
+    global_memory: torch.Tensor | None,
+    config: MapperV2Config,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
+    raw_cache = batch.get("global_attention_kv_cache")
+    if raw_cache is None:
+        return None
+    if global_memory is None:
+        raise ValueError("global_memory is required when global_attention_kv_cache is supplied")
+    if not isinstance(raw_cache, (tuple, list)):
+        raise ValueError("global_attention_kv_cache must be a tuple/list of per-layer key/value tensors")
+    if len(raw_cache) != config.layers:
+        raise ValueError(f"global_attention_kv_cache must contain {config.layers} layers, got {len(raw_cache)}")
+    if config.d_model % config.heads != 0:
+        raise ValueError("config.d_model must be divisible by config.heads")
+
+    head_dim = config.d_model // config.heads
+    source_steps = int(global_memory.shape[1])
+    expected_shape = (int(batch_size), int(config.heads), source_steps, head_dim)
+    cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_index, layer_cache in enumerate(raw_cache):
+        if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) != 2:
+            raise ValueError(f"global_attention_kv_cache layer {layer_index} must be a key/value pair")
+        key, value = layer_cache
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            raise ValueError(f"global_attention_kv_cache layer {layer_index} key/value must be tensors")
+        key = key.detach().to(device=device, dtype=torch.float32)
+        value = value.detach().to(device=device, dtype=torch.float32)
+        if tuple(key.shape) != expected_shape:
+            raise ValueError(
+                f"global_attention_kv_cache layer {layer_index} key must have shape {expected_shape}, "
+                f"got {tuple(key.shape)}"
+            )
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"global_attention_kv_cache layer {layer_index} value must have shape {expected_shape}, "
+                f"got {tuple(value.shape)}"
+            )
+        cache.append((key.contiguous(), value.contiguous()))
+    return tuple(cache)
+
+
+def _attention_projection_to_heads(projection: torch.Tensor, *, heads: int) -> torch.Tensor:
+    if projection.ndim != 3:
+        raise ValueError(f"attention projection must have shape [B,S,D], got {tuple(projection.shape)}")
+    if projection.shape[-1] % int(heads) != 0:
+        raise ValueError("attention projection width must be divisible by head count")
+    batch_size, steps, width = projection.shape
+    head_dim = int(width) // int(heads)
+    return projection.view(batch_size, steps, int(heads), head_dim).transpose(1, 2).contiguous()
+
+
+def _global_key_padding_attention_mask(
+    padding_mask: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if padding_mask.ndim != 2:
+        raise ValueError(f"global_memory_padding_mask must have shape [B,G], got {tuple(padding_mask.shape)}")
+    if padding_mask.dtype != torch.bool:
+        raise ValueError("global_memory_padding_mask must be bool")
+    mask = padding_mask.to(device=device, dtype=torch.bool).reshape(padding_mask.shape[0], 1, 1, padding_mask.shape[1])
+    return torch.zeros(mask.shape, dtype=dtype, device=device).masked_fill(mask, float("-inf"))
 
 
 def _global_position_features(
