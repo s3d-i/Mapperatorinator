@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import errno
 import hashlib
 import json
 import math
@@ -46,13 +47,14 @@ DEFAULT_CONTROL_CHECKPOINT_PATH = Path(
     "train/artifacts/runs/stage2_control_demo/"
     "stage2_control_demo_global_d384_l3_stride16_b6/checkpoints/checkpoint_step_002000.pt",
 )
-TIME_SHIFT_LENGTH_PENALTY_LOG_BASE_MS = 10
-TIME_SHIFT_LENGTH_PENALTY_START_MS = 50
-TIME_SHIFT_LENGTH_PENALTY_FULL_MS = 200
-TIME_SHIFT_LENGTH_PENALTY_START_SCALAR = 0.1
+DEFAULT_TIME_SHIFT_LENGTH_PENALTY = 5.2
 
 
 class ProtocolError(ValueError):
+    pass
+
+
+class PeerDisconnected(ConnectionError):
     pass
 
 
@@ -80,7 +82,7 @@ class MapperV2WsConfig:
     temperature: float = 0.0
     top_p: float | None = None
     use_incremental_mapper_decode: bool = True
-    time_shift_length_penalty_alpha: float = 0.0
+    time_shift_length_penalty_alpha: float = DEFAULT_TIME_SHIFT_LENGTH_PENALTY
     seed: int | None = None
     reset_after_audio_end_ms: int = 2_000
     wall_clock_check_interval_s: float = 0.05
@@ -237,18 +239,24 @@ class MapperV2InferenceBackend:
         session_runtime = self._session_runtimes.get(session_id)
         if session_runtime is None:
             raise RuntimeError(f"session audio has not been prepared: {session_id}")
-        generated = await asyncio.to_thread(
-            self._generate_window,
-            session_id,
-            session_runtime,
-            window,
-            audio_length_ms,
-        )
-        for token in _hitobject_tokens_from_generated(generated, self._vocab()):
-            yield token
-            interval = max(0.0, float(self.config.token_send_interval_s))
-            if interval:
-                await asyncio.sleep(interval)
+        starting_window = clamp_decoder_window_to_audio(window, audio_length_ms=audio_length_ms, config=self.config)
+        for decode_window in decoder_windows_until_audio_end(
+            starting_window,
+            audio_length_ms=audio_length_ms,
+            config=self.config,
+        ):
+            generated = await asyncio.to_thread(
+                self._generate_window,
+                session_id,
+                session_runtime,
+                decode_window,
+                audio_length_ms,
+            )
+            for token in _hitobject_tokens_from_generated(generated, self._vocab()):
+                yield token
+                interval = max(0.0, float(self.config.token_send_interval_s))
+                if interval:
+                    await asyncio.sleep(interval)
 
     async def reset_session(self, session_id: str) -> None:
         session_runtime = self._session_runtimes.pop(session_id, None)
@@ -545,9 +553,20 @@ class InferenceEndpoint:
                         "token": hitobject.message_token(),
                     },
                 )
+        except PeerDisconnected:
+            return
         except Exception as exc:
+            if _is_expected_socket_disconnect(exc):
+                return
             if self.sessions.get(session.session_id) is session:
-                await peer.send_json({"type": "error", "session_id": session.session_id, "error": str(exc)})
+                try:
+                    await peer.send_json({"type": "error", "session_id": session.session_id, "error": str(exc)})
+                except PeerDisconnected:
+                    return
+                except Exception as send_exc:
+                    if _is_expected_socket_disconnect(send_exc):
+                        return
+                    raise
 
 
 def _default_session_runtime_factory(
@@ -736,37 +755,13 @@ def _time_shift_length_penalty_tensors(
     if alpha == 0.0:
         return None
 
-    token_ids: list[int] = []
-    penalties: list[float] = []
-    for token_id in vocab.time_shift_token_ids:
-        delta_ms = vocab.time_shift_value(token_id)
-        scalar = _time_shift_length_penalty_scalar(delta_ms, max_scalar=alpha)
-        penalty = scalar * math.log(float(delta_ms) / float(TIME_SHIFT_LENGTH_PENALTY_LOG_BASE_MS))
-        if penalty <= 0.0:
-            continue
-        token_ids.append(int(token_id))
-        penalties.append(float(penalty))
+    token_ids = [int(token_id) for token_id in vocab.time_shift_token_ids]
     if not token_ids:
         return None
     return (
         torch.tensor(token_ids, dtype=torch.long, device=device),
-        torch.tensor(penalties, dtype=torch.float32, device=device),
+        torch.full((len(token_ids),), alpha, dtype=torch.float32, device=device),
     )
-
-
-def _time_shift_length_penalty_scalar(delta_ms: int, *, max_scalar: float) -> float:
-    delta_ms = int(delta_ms)
-    max_scalar = float(max_scalar)
-    if delta_ms < TIME_SHIFT_LENGTH_PENALTY_START_MS:
-        return 0.0
-    if delta_ms >= TIME_SHIFT_LENGTH_PENALTY_FULL_MS:
-        return max_scalar
-    start_scalar = min(TIME_SHIFT_LENGTH_PENALTY_START_SCALAR, max_scalar)
-    ramp = (
-        (float(delta_ms) - float(TIME_SHIFT_LENGTH_PENALTY_START_MS))
-        / (float(TIME_SHIFT_LENGTH_PENALTY_FULL_MS) - float(TIME_SHIFT_LENGTH_PENALTY_START_MS))
-    )
-    return start_scalar + ramp * (max_scalar - start_scalar)
 
 
 def _apply_time_shift_length_penalty(
@@ -844,6 +839,8 @@ def parse_json_message(raw_message: str | bytes | Mapping[str, Any]) -> Mapping[
 def infer_message_type(message: Mapping[str, Any]) -> str:
     raw_type = message.get("type")
     if isinstance(raw_type, str) and raw_type:
+        if raw_type == "reference_ms":
+            return "reference_time"
         return raw_type
     control = message.get("control")
     if control == "ready":
@@ -852,7 +849,9 @@ def infer_message_type(message: Mapping[str, Any]) -> str:
         return "stop"
     if "audio_path" in message or "audio" in message:
         return "audio_path"
-    has_reference_audio_ms = "ref_time_ms" in message or "reference_audio_ms" in message
+    has_reference_audio_ms = (
+        "ref_time_ms" in message or "reference_audio_ms" in message or "reference_ms" in message
+    )
     has_send_local_machine_ms = "local_computer_time_send_ms" in message or "send_local_machine_ms" in message
     if has_reference_audio_ms and has_send_local_machine_ms:
         return "reference_time"
@@ -882,7 +881,7 @@ def audio_path_from_message(message: Mapping[str, Any]) -> str | None:
 
 def reference_clock_from_message(message: Mapping[str, Any]) -> ReferenceClock:
     return ReferenceClock(
-        ref_time_ms=_required_int_alias(message, "ref_time_ms", "reference_audio_ms"),
+        ref_time_ms=_required_int_alias(message, "ref_time_ms", "reference_audio_ms", "reference_ms"),
         local_computer_time_send_ms=_required_int_alias(
             message,
             "local_computer_time_send_ms",
@@ -899,7 +898,7 @@ def choose_decoder_window(clock: ReferenceClock, config: MapperV2WsConfig) -> De
     window_ms = int(config.decoder_window_ms)
     if window_ms <= 0:
         raise ValueError("decoder_window_ms must be positive")
-    start_ms = (target_ms // window_ms) * window_ms
+    start_ms = ((target_ms + window_ms - 1) // window_ms) * window_ms
     return DecoderWindow(start_ms=start_ms, end_ms=start_ms + window_ms)
 
 
@@ -916,6 +915,28 @@ def clamp_decoder_window_to_audio(
     if int(window.start_ms) <= latest_start_ms:
         return window
     return DecoderWindow(start_ms=latest_start_ms, end_ms=latest_start_ms + window_ms)
+
+
+def decoder_windows_until_audio_end(
+    window: DecoderWindow,
+    *,
+    audio_length_ms: int,
+    config: MapperV2WsConfig,
+) -> tuple[DecoderWindow, ...]:
+    window_ms = int(config.decoder_window_ms)
+    if window_ms <= 0:
+        raise ValueError("decoder_window_ms must be positive")
+    start_ms = int(window.start_ms)
+    end_ms = int(window.end_ms)
+    if end_ms - start_ms != window_ms:
+        raise ValueError("decoder window span does not match config.decoder_window_ms")
+    latest_start_ms = (max(1, int(audio_length_ms)) - 1) // window_ms * window_ms
+    if start_ms > latest_start_ms:
+        start_ms = latest_start_ms
+    return tuple(
+        DecoderWindow(start_ms=current_start_ms, end_ms=current_start_ms + window_ms)
+        for current_start_ms in range(start_ms, latest_start_ms + 1, window_ms)
+    )
 
 
 def local_computer_time_ms_since_midnight(now: datetime | None = None) -> int:
@@ -1086,6 +1107,43 @@ async def _cancel_task(task: asyncio.Task[None] | None) -> None:
         pass
 
 
+_EXPECTED_SOCKET_DISCONNECT_ERRNOS = {
+    errno.ECONNABORTED,
+    errno.ECONNRESET,
+    errno.ENOTCONN,
+    errno.EPIPE,
+    errno.ETIMEDOUT,
+}
+
+
+def _is_expected_socket_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, (asyncio.IncompleteReadError, ConnectionError)):
+        return True
+    if isinstance(exc, OSError) and exc.errno in _EXPECTED_SOCKET_DISCONNECT_ERRNOS:
+        return True
+    return False
+
+
+async def _drain_writer(writer: asyncio.StreamWriter) -> None:
+    if writer.is_closing():
+        raise PeerDisconnected("websocket peer disconnected")
+    try:
+        await writer.drain()
+    except Exception as exc:
+        if _is_expected_socket_disconnect(exc):
+            raise PeerDisconnected("websocket peer disconnected") from exc
+        raise
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception as exc:
+        if not _is_expected_socket_disconnect(exc):
+            raise
+
+
 class _WebSocketPeer:
     def __init__(self, writer: asyncio.StreamWriter) -> None:
         self._writer = writer
@@ -1094,8 +1152,13 @@ class _WebSocketPeer:
     async def send_json(self, payload: Mapping[str, Any]) -> None:
         data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         async with self._send_lock:
-            self._writer.write(_encode_server_text_frame(data))
-            await self._writer.drain()
+            try:
+                self._writer.write(_encode_server_text_frame(data))
+                await _drain_writer(self._writer)
+            except Exception as exc:
+                if _is_expected_socket_disconnect(exc):
+                    raise PeerDisconnected("websocket peer disconnected") from exc
+                raise
 
 
 async def serve_forever(endpoint: InferenceEndpoint | None = None) -> None:
@@ -1119,7 +1182,11 @@ async def _handle_websocket_client(
 ) -> None:
     peer = _WebSocketPeer(writer)
     try:
-        await _accept_websocket_handshake(reader, writer)
+        try:
+            await _accept_websocket_handshake(reader, writer)
+        except ProtocolError as exc:
+            await _send_http_error(writer, status=400, reason="Bad Request", body=str(exc))
+            return
         while True:
             message = await _read_client_text_frame(reader, writer)
             if message is None:
@@ -1128,9 +1195,13 @@ async def _handle_websocket_client(
                 await endpoint.handle_message(message, peer)
             except ProtocolError as exc:
                 await peer.send_json({"type": "error", "error": str(exc)})
+            except PeerDisconnected:
+                return
+    except Exception as exc:
+        if not _is_expected_socket_disconnect(exc):
+            raise
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await _close_writer(writer)
 
 
 async def _accept_websocket_handshake(
@@ -1163,7 +1234,28 @@ async def _accept_websocket_handshake(
             "\r\n"
         ).encode("ascii"),
     )
-    await writer.drain()
+    await _drain_writer(writer)
+
+
+async def _send_http_error(
+    writer: asyncio.StreamWriter,
+    *,
+    status: int,
+    reason: str,
+    body: str,
+) -> None:
+    body_bytes = body.encode("utf-8", errors="replace")
+    writer.write(
+        (
+            f"HTTP/1.1 {int(status)} {reason}\r\n"
+            "Connection: close\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body_bytes)}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        + body_bytes,
+    )
+    await _drain_writer(writer)
 
 
 async def _read_client_text_frame(
@@ -1187,11 +1279,11 @@ async def _read_client_text_frame(
 
         if opcode == 0x8:
             writer.write(b"\x88\x00")
-            await writer.drain()
+            await _drain_writer(writer)
             return None
         if opcode == 0x9:
             writer.write(_encode_server_frame(payload, opcode=0xA))
-            await writer.drain()
+            await _drain_writer(writer)
             continue
         if opcode != 0x1:
             raise ProtocolError(f"unsupported websocket opcode: {opcode}")
@@ -1215,8 +1307,27 @@ def _encode_server_frame(payload: bytes, *, opcode: int) -> bytes:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=f"Run Mapper V2 local WS endpoint at {PULSEFIELD_WS_URL}.")
-    parser.parse_args(argv)
-    asyncio.run(serve_forever())
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--device", default="mps")
+    parser.add_argument("--beatthis-device", default=None)
+    parser.add_argument("--difficulty", type=float, default=4.0)
+    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--mapper-checkpoint-path", type=Path, default=DEFAULT_MAPPER_CHECKPOINT_PATH)
+    parser.add_argument("--control-checkpoint-path", type=Path, default=DEFAULT_CONTROL_CHECKPOINT_PATH)
+    args = parser.parse_args(argv)
+
+    config = MapperV2WsConfig(
+        host=args.host,
+        port=args.port,
+        mapper_checkpoint_path=args.mapper_checkpoint_path,
+        control_checkpoint_path=args.control_checkpoint_path,
+        device=args.device,
+        beatthis_device=args.beatthis_device,
+        default_difficulty=float(args.difficulty),
+        max_tokens=int(args.max_tokens),
+    )
+    asyncio.run(serve_forever(InferenceEndpoint(config=config)))
     return 0
 
 

@@ -1,6 +1,6 @@
 import asyncio
+import errno
 import json
-import math
 import tempfile
 import unittest
 import wave
@@ -20,13 +20,14 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     ProtocolError,
     ReferenceClock,
     _apply_time_shift_length_penalty,
+    _handle_websocket_client,
     _mapper_v2_logits_fn,
-    _time_shift_length_penalty_scalar,
     _time_shift_length_penalty_tensors,
     audio_end_reset_local_machine_ms,
     audio_path_from_message,
     choose_decoder_window,
     clamp_decoder_window_to_audio,
+    decoder_windows_until_audio_end,
     difficulty_from_message,
     infer_message_type,
     local_machine_ms_reached,
@@ -36,7 +37,7 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     ws_status_log_payload,
 )
 from train.stage_2.data.control_windows import normalize_difficulty
-from train.stage_2.model_mapper_v1.generation import MapperGenerationStep
+from train.stage_2.model_mapper_v1.generation import MapperGeneratedWindow, MapperGenerationStep
 from train.stage_2.model_mapper_v1.replay import empty_ln_carry_state
 from train.stage_2.model_mapper_v1.vocab import MapperV1Vocab
 
@@ -50,6 +51,12 @@ class FakePeer:
 
     async def send_json(self, payload: dict) -> None:
         self.messages.append(dict(payload))
+
+
+class DisconnectingPeer:
+    async def send_json(self, payload: dict) -> None:
+        del payload
+        raise OSError(errno.ENOTCONN, "Socket is not connected")
 
 
 class FakeIncrementalMapperModel:
@@ -85,6 +92,7 @@ class MapperV2WsProtocolTests(unittest.TestCase):
     def test_infer_message_type_accepts_control_fallbacks(self) -> None:
         self.assertEqual(infer_message_type({"type": "audio_path"}), "audio_path")
         self.assertEqual(infer_message_type({"type": "audio"}), "audio")
+        self.assertEqual(infer_message_type({"type": "reference_ms"}), "reference_time")
         self.assertEqual(infer_message_type({"control": "ready"}), "ready")
         self.assertEqual(infer_message_type({"control": "end_session"}), "stop")
         self.assertEqual(infer_message_type({"session_id": "s1", "audio_path": "/tmp/song.wav"}), "audio_path")
@@ -93,7 +101,7 @@ class MapperV2WsProtocolTests(unittest.TestCase):
             infer_message_type(
                 {
                     "session_id": "s1",
-                    "reference_audio_ms": 100,
+                    "reference_ms": 100,
                     "send_local_machine_ms": 200,
                 },
             ),
@@ -120,7 +128,7 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         clock = reference_clock_from_message(
             {
                 "session_id": "s1",
-                "reference_audio_ms": 1_000,
+                "reference_ms": 1_000,
                 "send_local_machine_ms": 50_000,
             },
         )
@@ -161,7 +169,7 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         self.assertEqual(payload["reference_audio_ms"], 1_234)
         self.assertEqual(payload["reset_local_machine_ms"], 90_000)
 
-    def test_choose_decoder_window_adds_elapsed_time_and_lead(self) -> None:
+    def test_choose_decoder_window_rounds_up_to_later_control_window(self) -> None:
         clock = ReferenceClock(
             ref_time_ms=1_234,
             local_computer_time_send_ms=10_000,
@@ -173,7 +181,21 @@ class MapperV2WsProtocolTests(unittest.TestCase):
             MapperV2WsConfig(decoder_window_ms=8_000, decoder_lead_ms=2_000),
         )
 
-        self.assertEqual(window, DecoderWindow(start_ms=0, end_ms=8_000))
+        self.assertEqual(window, DecoderWindow(start_ms=8_000, end_ms=16_000))
+
+    def test_choose_decoder_window_keeps_exact_later_boundary(self) -> None:
+        clock = ReferenceClock(
+            ref_time_ms=5_500,
+            local_computer_time_send_ms=10_000,
+            received_local_computer_time_ms=10_500,
+        )
+
+        window = choose_decoder_window(
+            clock,
+            MapperV2WsConfig(decoder_window_ms=8_000, decoder_lead_ms=2_000),
+        )
+
+        self.assertEqual(window, DecoderWindow(start_ms=8_000, end_ms=16_000))
 
     def test_clamp_decoder_window_keeps_reference_window_inside_audio(self) -> None:
         config = MapperV2WsConfig(decoder_window_ms=8_000)
@@ -186,10 +208,26 @@ class MapperV2WsProtocolTests(unittest.TestCase):
 
         self.assertEqual(window, DecoderWindow(start_ms=16_000, end_ms=24_000))
 
-    def test_time_shift_length_penalty_ramps_from_ts_50_to_ts_200(self) -> None:
+    def test_decoder_windows_continue_from_selected_window_until_audio_end(self) -> None:
+        config = MapperV2WsConfig(decoder_window_ms=8_000)
+
+        windows = decoder_windows_until_audio_end(
+            DecoderWindow(start_ms=8_000, end_ms=16_000),
+            audio_length_ms=18_500,
+            config=config,
+        )
+
+        self.assertEqual(
+            windows,
+            (
+                DecoderWindow(start_ms=8_000, end_ms=16_000),
+                DecoderWindow(start_ms=16_000, end_ms=24_000),
+            ),
+        )
+
+    def test_time_shift_length_penalty_applies_flat_scalar_to_all_ts_tokens(self) -> None:
         vocab = MapperV1Vocab()
         logits = torch.zeros(vocab.size, dtype=torch.float32)
-        ts_40 = vocab.time_shift_token_id(40)
         ts_50 = vocab.time_shift_token_id(50)
         ts_1000 = vocab.time_shift_token_id(1000)
         ts_200 = vocab.time_shift_token_id(200)
@@ -203,13 +241,10 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         )
         adjusted = _apply_time_shift_length_penalty(logits, time_shift_penalty=penalty)
 
-        self.assertAlmostEqual(_time_shift_length_penalty_scalar(50, max_scalar=0.5), 0.1)
-        self.assertAlmostEqual(_time_shift_length_penalty_scalar(200, max_scalar=0.5), 0.5)
-        self.assertAlmostEqual(float(adjusted[ts_40].item()), 0.0)
         self.assertAlmostEqual(float(adjusted[event_id].item()), 4.0)
-        self.assertAlmostEqual(float(adjusted[ts_50].item()), -0.1 * math.log(5.0))
-        self.assertAlmostEqual(float(adjusted[ts_200].item()), -0.5 * math.log(20.0))
-        self.assertAlmostEqual(float(adjusted[ts_1000].item()), -0.5 * math.log(100.0))
+        self.assertAlmostEqual(float(adjusted[ts_50].item()), -0.5)
+        self.assertAlmostEqual(float(adjusted[ts_200].item()), -0.5)
+        self.assertAlmostEqual(float(adjusted[ts_1000].item()), -0.5)
 
     def test_mapper_v2_logits_fn_incremental_decode_appends_only_new_prefix_token(self) -> None:
         vocab = MapperV1Vocab()
@@ -341,6 +376,73 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.iter_calls[0]["audio_length_ms"], 180_000)
         self.assertIsInstance(backend.iter_calls[0]["window"], DecoderWindow)
         await endpoint.stop_session("s1")
+
+    async def test_stream_token_socket_disconnect_finishes_task_quietly(self) -> None:
+        config = MapperV2WsConfig(token_send_interval_s=0.0)
+        endpoint = InferenceEndpoint(config=config, backend=FakeInferenceBackend())
+
+        await endpoint.handle_message({"type": "ready", "control": "ready"}, FakePeer())
+        await endpoint.handle_message(
+            {
+                "type": "audio_path",
+                "session_id": "s1",
+                "audio_path": "/Users/ken/audio/song1.wav",
+                "audio_length_ms": 180_000,
+            },
+            FakePeer(),
+        )
+        await endpoint.handle_message(
+            {
+                "type": "reference_time",
+                "session_id": "s1",
+                "ref_time_ms": 1_234,
+                "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+            },
+            DisconnectingPeer(),
+        )
+        task = endpoint.sessions["s1"].stream_task
+        assert task is not None
+        await task
+
+        self.assertFalse(task.cancelled())
+        self.assertIsNone(task.exception())
+        await endpoint.stop_session("s1")
+
+    async def test_raw_tcp_disconnect_before_websocket_handshake_is_ignored(self) -> None:
+        endpoint = InferenceEndpoint(
+            config=MapperV2WsConfig(token_send_interval_s=0.0),
+            backend=FakeInferenceBackend(),
+        )
+        errors: list[BaseException] = []
+        handler_tasks: list[asyncio.Task] = []
+
+        async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            handler_tasks.append(task)
+            try:
+                await _handle_websocket_client(endpoint, reader, writer)
+            except BaseException as exc:
+                errors.append(exc)
+
+        server = await asyncio.start_server(handle_client, host="127.0.0.1", port=0)
+        try:
+            assert server.sockets is not None
+            host, port = server.sockets[0].getsockname()[:2]
+            _reader, writer = await asyncio.open_connection(host, port)
+            writer.close()
+            await writer.wait_closed()
+            for _ in range(20):
+                if handler_tasks:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(handler_tasks)
+            await asyncio.wait_for(asyncio.gather(*handler_tasks), timeout=1.0)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(errors, [])
 
     async def test_audio_path_requires_length_or_readable_audio_file(self) -> None:
         endpoint = InferenceEndpoint(
@@ -482,6 +584,34 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(created[0][2].default_normalized_difficulty, normalize_difficulty(5.0))
         self.assertEqual(fake_session.prepare_audio_calls, [(Path("/tmp/song.wav"), 1_234, 0)])
 
+    async def test_mapper_v2_backend_streams_selected_window_through_music_end(self) -> None:
+        backend = StreamingMapperBackend(
+            MapperV2WsConfig(
+                decoder_window_ms=8_000,
+                token_send_interval_s=0.0,
+            ),
+        )
+        session_runtime = FakeSessionRuntime()
+        backend._session_runtimes["s1"] = session_runtime
+
+        tokens = []
+        async for token in backend.iter_hitobject_tokens(
+            session_id="s1",
+            audio_path=Path("/tmp/song.wav"),
+            audio_length_ms=18_500,
+            window=DecoderWindow(start_ms=8_000, end_ms=16_000),
+        ):
+            tokens.append(token)
+
+        self.assertEqual(
+            backend.generated_windows,
+            [
+                DecoderWindow(start_ms=8_000, end_ms=16_000),
+                DecoderWindow(start_ms=16_000, end_ms=24_000),
+            ],
+        )
+        self.assertEqual([token.ms_in_ref_audio for token in tokens], [8_000, 16_000])
+
     def test_hitobject_token_manifest_matches_full_mapper_event_vocab(self) -> None:
         manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
         mapping = manifest["event_token_id_to_lane_action"]
@@ -620,6 +750,41 @@ class FakeInferenceBackend:
 
     async def reset_session(self, session_id: str) -> None:
         self.reset_sessions.append(session_id)
+
+
+class StreamingMapperBackend(MapperV2InferenceBackend):
+    def __init__(self, config: MapperV2WsConfig) -> None:
+        super().__init__(config)
+        self.vocab = MapperV1Vocab()
+        self.generated_windows: list[DecoderWindow] = []
+
+    def _vocab(self) -> MapperV1Vocab:
+        return self.vocab
+
+    def _generate_window(
+        self,
+        session_id: str,
+        session_runtime: object,
+        window: DecoderWindow,
+        audio_length_ms: int,
+    ) -> MapperGeneratedWindow:
+        del session_id, session_runtime, audio_length_ms
+        self.generated_windows.append(window)
+        event_token = int(self.vocab.event_token_ids[0])
+        state_before = empty_ln_carry_state(int(window.start_ms))
+        return MapperGeneratedWindow(
+            write_start_ms=int(window.start_ms),
+            write_end_ms=int(window.end_ms),
+            ln_carry_in=state_before,
+            ln_carry_out=empty_ln_carry_state(int(window.end_ms)),
+            tokens=[event_token],
+            states_before=[state_before],
+            states_after=[state_before],
+            terminal_state=empty_ln_carry_state(int(window.end_ms)),
+            completed=True,
+            dead_end=False,
+            max_tokens_exceeded=False,
+        )
 
 
 class FakeSessionRuntime:
