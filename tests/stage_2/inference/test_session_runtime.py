@@ -230,8 +230,8 @@ class SessionRuntimeTests(unittest.TestCase):
         )
         runtime.prepare_audio("song.wav", audio_length_ms=10_000)
 
-        window_cache = runtime.prepare_mapper_window(start_ms=0)
-        reused = runtime.prepare_mapper_window(start_ms=0)
+        window_cache = runtime.prepare_mapper_window(start_ms=0, include_control_attention_kv_cache=True)
+        reused = runtime.prepare_mapper_window(start_ms=0, include_control_attention_kv_cache=True)
 
         self.assertIs(runtime.mapper_window_cache, window_cache)
         self.assertIs(reused, window_cache)
@@ -248,23 +248,53 @@ class SessionRuntimeTests(unittest.TestCase):
         self.assertEqual(len(window_cache.global_attention_kv_cache), 2)
         self.assertEqual(tuple(window_cache.global_attention_kv_cache[0][0].shape), (1, 1, 7, 5))
         self.assertEqual(tuple(window_cache.global_attention_kv_cache[0][1].shape), (1, 1, 7, 5))
+        self.assertIsNotNone(window_cache.control_attention_kv_cache)
+        assert window_cache.control_attention_kv_cache is not None
+        self.assertEqual(len(window_cache.control_attention_kv_cache), 2)
+        self.assertEqual(tuple(window_cache.control_attention_kv_cache[0][0].shape), (1, 1, 400, 5))
+        self.assertEqual(tuple(window_cache.control_attention_kv_cache[0][1].shape), (1, 1, 400, 5))
         self.assertEqual(len(mapper_model.global_calls), 1)
         self.assertEqual(len(mapper_model.kv_calls), 1)
+        self.assertEqual(len(mapper_model.control_kv_calls), 1)
         self.assertFalse(mapper_model.global_calls[0]["grad_enabled"])
         self.assertTrue(mapper_model.global_calls[0]["inference_mode"])
         self.assertFalse(mapper_model.kv_calls[0]["grad_enabled"])
         self.assertTrue(mapper_model.kv_calls[0]["inference_mode"])
+        self.assertFalse(mapper_model.control_kv_calls[0]["grad_enabled"])
+        self.assertTrue(mapper_model.control_kv_calls[0]["inference_mode"])
         self.assertEqual(mapper_model.global_calls[0]["target_start_frame"], [0])
 
         batch = window_cache.as_model_batch()
         self.assertIn("projected_control_memory_8s", batch)
         self.assertIn("density_teacher_8s", batch)
+        self.assertIn("control_attention_kv_cache", batch)
         self.assertIn("global_memory", batch)
         self.assertIn("global_attention_kv_cache", batch)
         self.assertNotIn("control_memory_8s", batch)
 
         runtime.prepare_control(start_ms=1_000)
         self.assertIsNone(runtime.mapper_window_cache)
+
+    def test_prepare_mapper_window_can_skip_control_attention_cache(self) -> None:
+        mapper_model = _FakeMapperModel(control_dim=3, d_model=5)
+        mapper_model.control_attention_kv_cache = None  # type: ignore[method-assign]
+        runtime = SessionRuntime(
+            session_id="s1",
+            model_runtime=_fake_model_runtime(
+                _FakeTimingProvider(_prediction()),
+                control_model=_FakeControlModel(control_dim=3),
+                mapper_model=mapper_model,
+            ),
+            config=SessionRuntimeConfig(minimum_frame_count=4),
+            mel_loader=_fake_mel_loader(np.zeros((500, 160), dtype=np.float32)),
+            grid_fitter=_FakeGridFitter(),
+        )
+        runtime.prepare_audio("song.wav", audio_length_ms=10_000)
+
+        window_cache = runtime.prepare_mapper_window(start_ms=0, include_control_attention_kv_cache=False)
+
+        self.assertIsNone(window_cache.control_attention_kv_cache)
+        self.assertNotIn("control_attention_kv_cache", window_cache.as_model_batch())
 
     def test_prepare_control_requires_audio_cache(self) -> None:
         runtime = SessionRuntime(
@@ -405,6 +435,7 @@ class _FakeMapperModel(torch.nn.Module):
         self.d_model = int(d_model)
         self.global_calls: list[dict[str, object]] = []
         self.kv_calls: list[dict[str, object]] = []
+        self.control_kv_calls: list[dict[str, object]] = []
 
     def _global_context_memory(
         self,
@@ -439,6 +470,25 @@ class _FakeMapperModel(torch.nn.Module):
             },
         )
         key = global_memory.reshape(global_memory.shape[0], 1, global_memory.shape[1], global_memory.shape[2])
+        value = key + 1.0
+        return ((key, value), (key + 2.0, value + 2.0))
+
+    def control_attention_kv_cache(
+        self,
+        projected_control_memory_8s: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        self.control_kv_calls.append(
+            {
+                "grad_enabled": torch.is_grad_enabled(),
+                "inference_mode": torch.is_inference_mode_enabled(),
+            },
+        )
+        key = projected_control_memory_8s.reshape(
+            projected_control_memory_8s.shape[0],
+            1,
+            projected_control_memory_8s.shape[1],
+            projected_control_memory_8s.shape[2],
+        )
         value = key + 1.0
         return ((key, value), (key + 2.0, value + 2.0))
 

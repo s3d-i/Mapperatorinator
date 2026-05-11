@@ -424,6 +424,29 @@ class MapperV2Model(MapperV1Model):
         memory = global_memory.detach().to(device=device, dtype=torch.float32)
         return tuple(block.global_attention_kv_cache(memory) for block in self.global_cross_attention_layers)
 
+    def control_attention_kv_cache(
+        self,
+        projected_control_memory_8s: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        if projected_control_memory_8s.ndim != 3:
+            raise ValueError(
+                f"projected_control_memory_8s must have shape [B,{MAPPER_DENSITY_FRAMES},D], "
+                f"got {tuple(projected_control_memory_8s.shape)}"
+            )
+        if int(projected_control_memory_8s.shape[1]) != MAPPER_DENSITY_FRAMES:
+            raise ValueError(
+                f"projected_control_memory_8s must have {MAPPER_DENSITY_FRAMES} frames, "
+                f"got {projected_control_memory_8s.shape[1]}"
+            )
+        if int(projected_control_memory_8s.shape[-1]) != self.config.d_model:
+            raise ValueError(
+                f"projected_control_memory_8s last dim must be {self.config.d_model}, "
+                f"got {projected_control_memory_8s.shape[-1]}"
+            )
+        device = self.position.device
+        memory = projected_control_memory_8s.detach().to(device=device, dtype=torch.float32)
+        return tuple(_transformer_decoder_control_attention_kv_cache(layer, memory) for layer in self.decoder_layers)
+
     def create_empty_decode_state(
         self,
         *,
@@ -474,6 +497,7 @@ class MapperV2Model(MapperV1Model):
         density_teacher_8s: torch.Tensor,
         control_memory_8s: torch.Tensor | None = None,
         projected_control_memory_8s: torch.Tensor | None = None,
+        control_attention_kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
         difficulty: torch.Tensor | None = None,
         normalized_difficulty: torch.Tensor | None = None,
         global_memory: torch.Tensor | None = None,
@@ -601,6 +625,14 @@ class MapperV2Model(MapperV1Model):
                     f"got {control_memory.shape[-1]}"
                 )
 
+        control_attention_kv = _precomputed_control_attention_kv_cache(
+            control_attention_kv_cache=control_attention_kv_cache,
+            device=device,
+            batch_size=batch_size,
+            control_memory=control_memory,
+            config=self.config,
+        )
+
         if global_position_features is not None:
             if not isinstance(global_position_features, torch.Tensor):
                 raise ValueError("global_position_features must be a torch.Tensor")
@@ -649,6 +681,7 @@ class MapperV2Model(MapperV1Model):
             global_memory_padding_mask=global_memory_padding_mask,
             global_position_features=global_position_features,
             global_attention_kv_cache=global_attention_kv,
+            control_attention_kv_cache=control_attention_kv,
         )
         decoder_hidden = self.output_norm(hidden)
         base_logits = self.output_head(decoder_hidden)
@@ -724,6 +757,7 @@ class MapperV2Model(MapperV1Model):
         global_memory_padding_mask: torch.Tensor | None,
         global_position_features: torch.Tensor | None,
         global_attention_kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None,
+        control_attention_kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None,
     ) -> tuple[torch.Tensor, list[MapperV2SelfAttentionKVCache]]:
         token_hidden = self.token_embedding(token)
         position_hidden = self.position[:, position_index : position_index + 1]
@@ -747,6 +781,9 @@ class MapperV2Model(MapperV1Model):
                 hidden=hidden,
                 memory=control_memory,
                 self_attention_kv=decode_state.self_attention_kv_cache[layer_index],
+                control_attention_kv=None
+                if control_attention_kv_cache is None
+                else control_attention_kv_cache[layer_index],
             )
             next_layer_caches.append(layer_cache)
             if global_memory is not None:
@@ -942,6 +979,7 @@ def _incremental_transformer_decoder_layer_step(
     hidden: torch.Tensor,
     memory: torch.Tensor,
     self_attention_kv: MapperV2SelfAttentionKVCache,
+    control_attention_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, MapperV2SelfAttentionKVCache]:
     if getattr(layer.self_attn, "batch_first", False) is not True:
         raise ValueError("incremental decode requires batch_first decoder self-attention")
@@ -952,7 +990,16 @@ def _incremental_transformer_decoder_layer_step(
             self_attention_kv=self_attention_kv,
         )
         hidden = hidden + self_attn
-        hidden = hidden + layer._mha_block(layer.norm2(hidden), memory, None, None, False)
+        cross_query = layer.norm2(hidden)
+        if control_attention_kv is None:
+            cross_attn = layer._mha_block(cross_query, memory, None, None, False)
+        else:
+            cross_attn = _cached_control_cross_attention_step(
+                layer,
+                query=cross_query,
+                control_attention_kv=control_attention_kv,
+            )
+        hidden = hidden + cross_attn
         hidden = hidden + layer._ff_block(layer.norm3(hidden))
         return hidden, updated_cache
 
@@ -962,9 +1009,99 @@ def _incremental_transformer_decoder_layer_step(
         self_attention_kv=self_attention_kv,
     )
     hidden = layer.norm1(hidden + self_attn)
-    hidden = layer.norm2(hidden + layer._mha_block(hidden, memory, None, None, False))
+    if control_attention_kv is None:
+        cross_attn = layer._mha_block(hidden, memory, None, None, False)
+    else:
+        cross_attn = _cached_control_cross_attention_step(
+            layer,
+            query=hidden,
+            control_attention_kv=control_attention_kv,
+        )
+    hidden = layer.norm2(hidden + cross_attn)
     hidden = layer.norm3(hidden + layer._ff_block(hidden))
     return hidden, updated_cache
+
+
+def _transformer_decoder_control_attention_kv_cache(
+    layer: nn.TransformerDecoderLayer,
+    memory: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cross_attn = layer.multihead_attn
+    if getattr(cross_attn, "batch_first", False) is not True:
+        raise ValueError("control attention K/V cache requires batch_first decoder cross-attention")
+    if cross_attn.in_proj_weight is None:
+        raise ValueError("control attention K/V cache requires packed cross-attention projection weights")
+    if memory.ndim != 3:
+        raise ValueError(f"control memory must have shape [B,T,D], got {tuple(memory.shape)}")
+    batch_size, source_steps, d_model = memory.shape
+    heads = int(cross_attn.num_heads)
+    if d_model % heads != 0:
+        raise ValueError("control attention embed dim must be divisible by head count")
+    if int(cross_attn.embed_dim) != int(d_model):
+        raise ValueError(f"control attention embed dim must be {cross_attn.embed_dim}, got {d_model}")
+
+    _, key_weight, value_weight = cross_attn.in_proj_weight.chunk(3, dim=0)
+    in_proj_bias = cross_attn.in_proj_bias
+    if in_proj_bias is None:
+        key_bias = value_bias = None
+    else:
+        _, key_bias, value_bias = in_proj_bias.chunk(3, dim=0)
+    key = _attention_projection_to_heads(
+        F.linear(memory, key_weight, key_bias),
+        heads=heads,
+    )
+    value = _attention_projection_to_heads(
+        F.linear(memory, value_weight, value_bias),
+        heads=heads,
+    )
+    expected_steps = int(source_steps)
+    if int(key.shape[2]) != expected_steps or int(value.shape[2]) != expected_steps:
+        raise ValueError("control attention K/V cache source length mismatch")
+    return key.detach().contiguous(), value.detach().contiguous()
+
+
+def _cached_control_cross_attention_step(
+    layer: nn.TransformerDecoderLayer,
+    *,
+    query: torch.Tensor,
+    control_attention_kv: tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    cross_attn = layer.multihead_attn
+    if cross_attn.in_proj_weight is None:
+        raise ValueError("cached control cross-attention requires packed projection weights")
+    batch_size, steps, d_model = query.shape
+    if steps != 1:
+        raise ValueError(f"cached control cross-attention query must have one step, got {steps}")
+    heads = int(cross_attn.num_heads)
+    if d_model % heads != 0:
+        raise ValueError("control cross-attention embed dim must be divisible by head count")
+    head_dim = d_model // heads
+    key, value = control_attention_kv
+    expected_prefix = (batch_size, heads)
+    if key.ndim != 4 or tuple(key.shape[:2]) != expected_prefix or int(key.shape[-1]) != head_dim:
+        raise ValueError(
+            f"control attention key cache must have shape [B,{heads},T,{head_dim}], got {tuple(key.shape)}"
+        )
+    if tuple(value.shape) != tuple(key.shape):
+        raise ValueError(f"control attention value cache must match key cache shape, got {tuple(value.shape)}")
+
+    query_weight = cross_attn.in_proj_weight[:d_model]
+    in_proj_bias = cross_attn.in_proj_bias
+    query_bias = None if in_proj_bias is None else in_proj_bias[:d_model]
+    projected_query = _attention_projection_to_heads(
+        F.linear(query, query_weight, query_bias),
+        heads=heads,
+    )
+    attention = F.scaled_dot_product_attention(
+        projected_query,
+        key.to(device=projected_query.device, dtype=projected_query.dtype),
+        value.to(device=projected_query.device, dtype=projected_query.dtype),
+        attn_mask=None,
+        dropout_p=float(cross_attn.dropout) if layer.training else 0.0,
+        is_causal=False,
+    )
+    attention = attention.transpose(1, 2).contiguous().view(batch_size, steps, d_model)
+    return layer.dropout2(cross_attn.out_proj(attention))
 
 
 def _incremental_self_attention_step(
@@ -1099,6 +1236,52 @@ def _precomputed_global_context_memory(
             f"got {tuple(position_features.shape)}"
         )
     return memory, padding_mask, position_features
+
+
+def _precomputed_control_attention_kv_cache(
+    *,
+    control_attention_kv_cache: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None,
+    device: torch.device,
+    batch_size: int,
+    control_memory: torch.Tensor,
+    config: MapperV2Config,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...] | None:
+    if control_attention_kv_cache is None:
+        return None
+    if not isinstance(control_attention_kv_cache, (tuple, list)):
+        raise ValueError("control_attention_kv_cache must be a tuple/list of per-layer key/value tensors")
+    if len(control_attention_kv_cache) != config.layers:
+        raise ValueError(
+            f"control_attention_kv_cache must contain {config.layers} layers, "
+            f"got {len(control_attention_kv_cache)}"
+        )
+    if config.d_model % config.heads != 0:
+        raise ValueError("config.d_model must be divisible by config.heads")
+
+    head_dim = config.d_model // config.heads
+    source_steps = int(control_memory.shape[1])
+    expected_shape = (int(batch_size), int(config.heads), source_steps, head_dim)
+    cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_index, layer_cache in enumerate(control_attention_kv_cache):
+        if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) != 2:
+            raise ValueError(f"control_attention_kv_cache layer {layer_index} must be a key/value pair")
+        key, value = layer_cache
+        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+            raise ValueError(f"control_attention_kv_cache layer {layer_index} key/value must be tensors")
+        key = key.detach().to(device=device, dtype=torch.float32)
+        value = value.detach().to(device=device, dtype=torch.float32)
+        if tuple(key.shape) != expected_shape:
+            raise ValueError(
+                f"control_attention_kv_cache layer {layer_index} key must have shape {expected_shape}, "
+                f"got {tuple(key.shape)}"
+            )
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"control_attention_kv_cache layer {layer_index} value must have shape {expected_shape}, "
+                f"got {tuple(value.shape)}"
+            )
+        cache.append((key.contiguous(), value.contiguous()))
+    return tuple(cache)
 
 
 def _precomputed_global_attention_kv_cache(

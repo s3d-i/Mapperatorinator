@@ -89,6 +89,9 @@ class MapperV2ModelTests(unittest.TestCase):
             cached_batch["projected_control_memory_8s"] = model.control_projection(
                 cached_batch.pop("control_memory_8s"),
             )
+            cached_batch["control_attention_kv_cache"] = model.control_attention_kv_cache(
+                cached_batch["projected_control_memory_8s"],
+            )
             cached_batch["global_memory"] = base.global_memory
             cached_batch["global_memory_padding_mask"] = base.global_memory_padding_mask
             cached_batch["global_position_features"] = base.global_position_features
@@ -123,6 +126,9 @@ class MapperV2ModelTests(unittest.TestCase):
             cached_batch["projected_control_memory_8s"] = model.control_projection(
                 cached_batch.pop("control_memory_8s"),
             )
+            cached_batch["control_attention_kv_cache"] = model.control_attention_kv_cache(
+                cached_batch["projected_control_memory_8s"],
+            )
             cached_batch["global_memory"] = base.global_memory
             cached_batch["global_memory_padding_mask"] = base.global_memory_padding_mask
             cached_batch["global_position_features"] = base.global_position_features
@@ -151,6 +157,7 @@ class MapperV2ModelTests(unittest.TestCase):
                     ln_carry_out=cached_batch["ln_carry_out"],
                     density_teacher_8s=cached_batch["density_teacher_8s"],
                     projected_control_memory_8s=cached_batch["projected_control_memory_8s"],
+                    control_attention_kv_cache=cached_batch["control_attention_kv_cache"],
                     normalized_difficulty=cached_batch["normalized_difficulty"],
                     global_memory=cached_batch["global_memory"],
                     global_memory_padding_mask=cached_batch["global_memory_padding_mask"],
@@ -196,6 +203,12 @@ class MapperV2ModelTests(unittest.TestCase):
                     self.assertEqual(tuple(layer_cache.value.shape), expected_cache_shape)
 
         self.assertEqual(tuple(model.state_dict().keys()), state_dict_keys)
+        control_key, control_value = cached_batch["control_attention_kv_cache"][0]
+        self.assertEqual(
+            tuple(control_key.shape),
+            (1, model.config.heads, 400, model.config.d_model // model.config.heads),
+        )
+        self.assertEqual(tuple(control_value.shape), tuple(control_key.shape))
 
     def test_reuses_v1_teacher_forced_loss_targets(self) -> None:
         torch.manual_seed(13)

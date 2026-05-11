@@ -26,6 +26,7 @@ DEFAULT_MAX_CONTROL_BATCH_SIZE = 12
 
 MelLoader = Callable[[str | Path], Any]
 GlobalAttentionKVCache = tuple[tuple[torch.Tensor, torch.Tensor], ...]
+ControlAttentionKVCache = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
 
 class TimingProvider(Protocol):
@@ -172,6 +173,7 @@ class SessionMapperWindowCache:
     global_memory_padding_mask: torch.Tensor | None
     global_position_features: torch.Tensor | None
     global_attention_kv_cache: GlobalAttentionKVCache | None
+    control_attention_kv_cache: ControlAttentionKVCache | None
 
     def as_model_batch(self) -> dict[str, Any]:
         batch = {
@@ -181,6 +183,8 @@ class SessionMapperWindowCache:
             "target_start_frame": self.target_start_frame_tensor,
             "normalized_difficulty": self.normalized_difficulty_tensor,
         }
+        if self.control_attention_kv_cache is not None:
+            batch["control_attention_kv_cache"] = self.control_attention_kv_cache
         if self.global_memory is not None:
             if self.global_memory_padding_mask is None or self.global_position_features is None:
                 raise RuntimeError("global mapper window cache is incomplete")
@@ -278,6 +282,14 @@ class SessionRuntime:
         return self.audio_cache
 
     def prepare_control(self, *, start_ms: int = 0) -> SessionControlCache:
+        start_ms = _validate_start_ms(start_ms)
+        full_control_cache = self._control_cache_from_full(start_ms)
+        if full_control_cache is not None:
+            self.control_batch_cache = None
+            self.mapper_window_cache = None
+            self.control_cache = full_control_cache
+            return full_control_cache
+
         batch_cache = self.prepare_control_batch(start_ms_values=(start_ms,))
         start_ms = batch_cache.start_ms_values[0]
         target_start_frame = batch_cache.target_start_frames[0]
@@ -455,9 +467,11 @@ class SessionRuntime:
         *,
         start_ms: int = 0,
         end_ms: int | None = None,
+        include_control_attention_kv_cache: bool = False,
     ) -> SessionMapperWindowCache:
         start_ms = _validate_start_ms(start_ms)
         end_ms = start_ms + MAPPER_WRITE_MS if end_ms is None else _validate_start_ms(end_ms)
+        include_control_attention_kv_cache = bool(include_control_attention_kv_cache)
         if end_ms <= start_ms:
             raise ValueError("mapper window end_ms must be after start_ms")
         if end_ms - start_ms != MAPPER_WRITE_MS:
@@ -466,6 +480,10 @@ class SessionRuntime:
             self.mapper_window_cache is not None
             and self.mapper_window_cache.start_ms == start_ms
             and self.mapper_window_cache.end_ms == end_ms
+            and (
+                not include_control_attention_kv_cache
+                or self.mapper_window_cache.control_attention_kv_cache is not None
+            )
         ):
             return self.mapper_window_cache
         if self.audio_cache is None:
@@ -489,6 +507,11 @@ class SessionRuntime:
         global_attention_kv_cache_fn = getattr(mapper_model, "global_attention_kv_cache", None)
         if global_attention_kv_cache_fn is None or not callable(global_attention_kv_cache_fn):
             raise TypeError("model_runtime.mapper_model must expose global_attention_kv_cache")
+        control_attention_kv_cache_fn = None
+        if include_control_attention_kv_cache:
+            control_attention_kv_cache_fn = getattr(mapper_model, "control_attention_kv_cache", None)
+            if control_attention_kv_cache_fn is None or not callable(control_attention_kv_cache_fn):
+                raise TypeError("model_runtime.mapper_model must expose control_attention_kv_cache")
 
         write_start_ms_tensor = torch.tensor([start_ms], dtype=torch.long, device=self.device)
         mapper_context_batch = {
@@ -497,6 +520,14 @@ class SessionRuntime:
         }
         with torch.inference_mode():
             projected_control_memory_8s = control_projection(control_cache.control_memory_8s)
+            control_attention_kv_cache = (
+                _as_control_attention_kv_cache(
+                    control_attention_kv_cache_fn(projected_control_memory_8s),
+                    device=self.device,
+                )
+                if control_attention_kv_cache_fn is not None
+                else None
+            )
             global_memory, global_memory_padding_mask, global_position_features = global_context_fn(
                 batch=mapper_context_batch,
                 device=self.device,
@@ -566,6 +597,7 @@ class SessionRuntime:
             global_memory_padding_mask=global_memory_padding_mask,
             global_position_features=global_position_features,
             global_attention_kv_cache=global_attention_kv_cache,
+            control_attention_kv_cache=control_attention_kv_cache,
         )
         self.mapper_window_cache = cache
         return cache
@@ -633,6 +665,38 @@ class SessionRuntime:
         self.mapper_window_cache = None
         gc.collect()
         release_torch_cache(self.device)
+
+    def _control_cache_from_full(self, start_ms: int) -> SessionControlCache | None:
+        full_cache = self.full_control_cache
+        if full_cache is None:
+            return None
+        try:
+            index = full_cache.start_ms_values.index(int(start_ms))
+        except ValueError:
+            return None
+        target_start_frame = int(full_cache.target_start_frames[index])
+        control_slice_start_frames = torch.tensor(
+            [[target_start_frame + offset for offset in range(0, MAPPER_DENSITY_FRAMES, TARGET_WINDOW_LENGTH_FRAMES)]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        target_start_frame_tensor = torch.tensor([target_start_frame], dtype=torch.long, device=self.device)
+        normalized_difficulty_tensor = torch.tensor(
+            [float(full_cache.normalized_difficulty)],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return SessionControlCache(
+            session_id=self.session_id,
+            start_ms=int(start_ms),
+            target_start_frame=target_start_frame,
+            normalized_difficulty=float(full_cache.normalized_difficulty),
+            control_slice_start_frames=control_slice_start_frames,
+            target_start_frame_tensor=target_start_frame_tensor,
+            normalized_difficulty_tensor=normalized_difficulty_tensor,
+            control_memory_8s=full_cache.control_memory_8s[index : index + 1].contiguous(),
+            density_teacher_8s=full_cache.density_teacher_8s[index : index + 1].contiguous(),
+        )
 
 
 def _resolve_session_device(model_runtime: ModelRuntime, requested: str | torch.device | None) -> torch.device:
@@ -708,33 +772,53 @@ def _as_batched_float32_device_tensor(
 
 
 def _as_global_attention_kv_cache(value: Any, *, device: torch.device) -> GlobalAttentionKVCache:
+    return _as_attention_kv_cache(value, device=device, name="global_attention_kv_cache", source_steps=None)
+
+
+def _as_control_attention_kv_cache(value: Any, *, device: torch.device) -> ControlAttentionKVCache:
+    return _as_attention_kv_cache(
+        value,
+        device=device,
+        name="control_attention_kv_cache",
+        source_steps=MAPPER_DENSITY_FRAMES,
+    )
+
+
+def _as_attention_kv_cache(
+    value: Any,
+    *,
+    device: torch.device,
+    name: str,
+    source_steps: int | None,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
     if not isinstance(value, (tuple, list)):
-        raise ValueError("global_attention_kv_cache must be a tuple/list of per-layer key/value tensors")
+        raise ValueError(f"{name} must be a tuple/list of per-layer key/value tensors")
     cache: list[tuple[torch.Tensor, torch.Tensor]] = []
     expected_shape: tuple[int, ...] | None = None
     for layer_index, layer_cache in enumerate(value):
         if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) != 2:
-            raise ValueError(f"global_attention_kv_cache layer {layer_index} must be a key/value pair")
+            raise ValueError(f"{name} layer {layer_index} must be a key/value pair")
         key, attn_value = layer_cache
         if not isinstance(key, torch.Tensor) or not isinstance(attn_value, torch.Tensor):
-            raise ValueError(f"global_attention_kv_cache layer {layer_index} key/value must be tensors")
+            raise ValueError(f"{name} layer {layer_index} key/value must be tensors")
         key = key.detach().to(device=device, dtype=torch.float32).contiguous()
         attn_value = attn_value.detach().to(device=device, dtype=torch.float32).contiguous()
         if key.ndim != 4:
-            raise ValueError(
-                f"global_attention_kv_cache layer {layer_index} key must have shape [B,H,G,Dh], "
-                f"got {tuple(key.shape)}"
-            )
+            raise ValueError(f"{name} layer {layer_index} key must have shape [B,H,T,Dh], got {tuple(key.shape)}")
         if tuple(attn_value.shape) != tuple(key.shape):
             raise ValueError(
-                f"global_attention_kv_cache layer {layer_index} value must match key shape, "
+                f"{name} layer {layer_index} value must match key shape, "
                 f"got {tuple(attn_value.shape)} vs {tuple(key.shape)}"
+            )
+        if source_steps is not None and int(key.shape[2]) != int(source_steps):
+            raise ValueError(
+                f"{name} layer {layer_index} key source length must be {source_steps}, got {key.shape[2]}"
             )
         if expected_shape is None:
             expected_shape = tuple(key.shape)
         elif tuple(key.shape) != expected_shape:
             raise ValueError(
-                f"global_attention_kv_cache layer {layer_index} key shape must match layer 0, "
+                f"{name} layer {layer_index} key shape must match layer 0, "
                 f"got {tuple(key.shape)} vs {expected_shape}"
             )
         cache.append((key, attn_value))
@@ -829,6 +913,7 @@ def _validate_max_batch_size(max_batch_size: int) -> int:
 
 
 __all__ = [
+    "ControlAttentionKVCache",
     "DEFAULT_MAX_CONTROL_BATCH_SIZE",
     "DENSE_TIMING_V2_CHANNELS",
     "PACKED_MEL_CHANNELS",

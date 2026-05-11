@@ -282,7 +282,11 @@ class MapperV2InferenceBackend:
         write_end_ms = int(window.end_ms)
         if write_end_ms - write_start_ms != int(self.config.decoder_window_ms):
             raise ValueError("decoder window span does not match config.decoder_window_ms")
-        mapper_window_cache = session_runtime.prepare_mapper_window(start_ms=write_start_ms, end_ms=write_end_ms)
+        mapper_window_cache = session_runtime.prepare_mapper_window(
+            start_ms=write_start_ms,
+            end_ms=write_end_ms,
+            include_control_attention_kv_cache=bool(self.config.use_incremental_mapper_decode),
+        )
 
         vocab = self._vocab()
         carry_in = self._carry_in_for_window(session_id, write_start_ms)
@@ -629,6 +633,7 @@ def _mapper_v2_logits_fn(
     difficulty_tensor = torch.tensor([float(normalized_difficulty)], dtype=torch.float32, device=device)
     carry_in_batch = _carry_state_batch(ln_carry_in, device=device)
     carry_out_batch = _carry_state_batch(ln_carry_out, device=device)
+    control_attention_kv_cache = control_batch.get("control_attention_kv_cache")
 
     def logits_fn(step: MapperGenerationStep) -> torch.Tensor:
         nonlocal decode_state, decoded_prefix_tokens, last_incremental_logits, write_end_ms_tensor
@@ -674,6 +679,7 @@ def _mapper_v2_logits_fn(
                         density_teacher_8s=control_batch["density_teacher_8s"],
                         control_memory_8s=control_batch.get("control_memory_8s"),
                         projected_control_memory_8s=control_batch.get("projected_control_memory_8s"),
+                        control_attention_kv_cache=control_attention_kv_cache,
                         normalized_difficulty=difficulty_tensor,
                         global_memory=control_batch.get("global_memory"),
                         global_memory_padding_mask=control_batch.get("global_memory_padding_mask"),

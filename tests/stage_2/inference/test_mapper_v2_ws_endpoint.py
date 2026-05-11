@@ -56,15 +56,16 @@ class FakeIncrementalMapperModel:
     def __init__(self, vocab_size: int) -> None:
         self.vocab_size = int(vocab_size)
         self.calls: list[tuple[int, int]] = []
+        self.control_attention_kv_cache_args: list[object] = []
 
     def create_empty_decode_state(self, *, batch_size: int, device: torch.device):
         del batch_size, device
         return SimpleNamespace(steps=0)
 
     def incremental_decode_next_token(self, *, decode_state, decoder_input_token, position: int, **kwargs):
-        del kwargs
         token_id = int(decoder_input_token.reshape(-1)[0].item())
         self.calls.append((int(position), token_id))
+        self.control_attention_kv_cache_args.append(kwargs.get("control_attention_kv_cache"))
         logits = torch.zeros((1, self.vocab_size), dtype=torch.float32)
         logits[0, token_id] = 1.0
         return SimpleNamespace(
@@ -218,6 +219,7 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         control_batch = {
             "density_teacher_8s": torch.zeros((1, 400, 1), dtype=torch.float32),
             "projected_control_memory_8s": torch.zeros((1, 400, 16), dtype=torch.float32),
+            "control_attention_kv_cache": ((torch.zeros((1, 1, 400, 16)), torch.zeros((1, 1, 400, 16))),),
         }
         logits_fn = _mapper_v2_logits_fn(
             model=model,
@@ -265,6 +267,9 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         )
 
         self.assertEqual(model.calls, [(0, vocab.bos_id), (1, vocab.time_shift_token_id(10))])
+        self.assertTrue(
+            all(cache is control_batch["control_attention_kv_cache"] for cache in model.control_attention_kv_cache_args)
+        )
         self.assertEqual(int(torch.argmax(logits).item()), vocab.time_shift_token_id(10))
 
 
