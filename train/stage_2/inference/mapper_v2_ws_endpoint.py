@@ -8,10 +8,10 @@ import hashlib
 import json
 import math
 import struct
+import time
 import wave
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -91,8 +91,8 @@ class MapperV2WsConfig:
 @dataclass(frozen=True)
 class ReferenceClock:
     ref_time_ms: int
-    local_computer_time_send_ms: int
-    received_local_computer_time_ms: int
+    local_host_time_send_ms: float
+    received_local_host_time_ms: float
 
 
 @dataclass(frozen=True)
@@ -499,7 +499,7 @@ class InferenceEndpoint:
         await _cancel_task(session.wall_clock_reset_task)
         session.stream_task = asyncio.create_task(self._stream_tokens(session, window, peer))
         session.wall_clock_reset_task = asyncio.create_task(self._reset_after_audio_end(session))
-        reset_local_machine_ms = audio_end_reset_local_machine_ms(
+        reset_local_host_time_ms = audio_end_reset_host_time_ms(
             reference_clock=clock,
             audio_length_ms=audio_length_ms,
             reset_after_audio_end_ms=self.config.reset_after_audio_end_ms,
@@ -509,25 +509,25 @@ class InferenceEndpoint:
             from_status=from_status,
             to_status="streaming",
             reason="reference_time",
-            reference_audio_ms=clock.ref_time_ms,
-            send_local_machine_ms=clock.local_computer_time_send_ms,
-            received_local_machine_ms=clock.received_local_computer_time_ms,
+            ref_time_ms=clock.ref_time_ms,
+            send_local_host_time_ms=clock.local_host_time_send_ms,
+            received_local_host_time_ms=clock.received_local_host_time_ms,
             audio_length_ms=audio_length_ms,
             difficulty=session.difficulty,
-            reset_local_machine_ms=reset_local_machine_ms,
+            reset_local_host_time_ms=reset_local_host_time_ms,
         )
 
     async def _reset_after_audio_end(self, session: SessionState) -> None:
         if session.reference_clock is None or session.audio_length_ms is None:
             return
-        reset_local_machine_ms = audio_end_reset_local_machine_ms(
+        reset_local_host_time_ms = audio_end_reset_host_time_ms(
             reference_clock=session.reference_clock,
             audio_length_ms=session.audio_length_ms,
             reset_after_audio_end_ms=self.config.reset_after_audio_end_ms,
         )
         check_interval_s = max(0.01, float(self.config.wall_clock_check_interval_s))
         while self.sessions.get(session.session_id) is session:
-            if local_machine_ms_reached(reset_local_machine_ms):
+            if host_time_ms_reached(reset_local_host_time_ms):
                 await self.stop_session(session.session_id, reason="wall_clock_audio_end")
                 return
             await asyncio.sleep(check_interval_s)
@@ -839,8 +839,6 @@ def parse_json_message(raw_message: str | bytes | Mapping[str, Any]) -> Mapping[
 def infer_message_type(message: Mapping[str, Any]) -> str:
     raw_type = message.get("type")
     if isinstance(raw_type, str) and raw_type:
-        if raw_type == "reference_ms":
-            return "reference_time"
         return raw_type
     control = message.get("control")
     if control == "ready":
@@ -849,11 +847,9 @@ def infer_message_type(message: Mapping[str, Any]) -> str:
         return "stop"
     if "audio_path" in message or "audio" in message:
         return "audio_path"
-    has_reference_audio_ms = (
-        "ref_time_ms" in message or "reference_audio_ms" in message or "reference_ms" in message
-    )
-    has_send_local_machine_ms = "local_computer_time_send_ms" in message or "send_local_machine_ms" in message
-    if has_reference_audio_ms and has_send_local_machine_ms:
+    has_ref_time_ms = "ref_time_ms" in message
+    has_send_local_host_time_ms = "local_host_time_send_ms" in message
+    if has_ref_time_ms and has_send_local_host_time_ms:
         return "reference_time"
     raise ProtocolError("message must include type or a recognized control field")
 
@@ -881,24 +877,20 @@ def audio_path_from_message(message: Mapping[str, Any]) -> str | None:
 
 def reference_clock_from_message(message: Mapping[str, Any]) -> ReferenceClock:
     return ReferenceClock(
-        ref_time_ms=_required_int_alias(message, "ref_time_ms", "reference_audio_ms", "reference_ms"),
-        local_computer_time_send_ms=_required_int_alias(
-            message,
-            "local_computer_time_send_ms",
-            "send_local_machine_ms",
-        ),
-        received_local_computer_time_ms=local_machine_ms_since_midnight(),
+        ref_time_ms=_required_int(message, "ref_time_ms"),
+        local_host_time_send_ms=_required_float(message, "local_host_time_send_ms"),
+        received_local_host_time_ms=current_host_time_ms(),
     )
 
 
 def choose_decoder_window(clock: ReferenceClock, config: MapperV2WsConfig) -> DecoderWindow:
-    elapsed_ms = max(0, clock.received_local_computer_time_ms - clock.local_computer_time_send_ms)
+    elapsed_ms = max(0.0, clock.received_local_host_time_ms - clock.local_host_time_send_ms)
     estimated_ref_ms = max(0, clock.ref_time_ms + elapsed_ms)
     target_ms = estimated_ref_ms + max(0, int(config.decoder_lead_ms))
     window_ms = int(config.decoder_window_ms)
     if window_ms <= 0:
         raise ValueError("decoder_window_ms must be positive")
-    start_ms = ((target_ms + window_ms - 1) // window_ms) * window_ms
+    start_ms = int((target_ms + window_ms - 1) // window_ms) * window_ms
     return DecoderWindow(start_ms=start_ms, end_ms=start_ms + window_ms)
 
 
@@ -939,38 +931,26 @@ def decoder_windows_until_audio_end(
     )
 
 
-def local_computer_time_ms_since_midnight(now: datetime | None = None) -> int:
-    return local_machine_ms_since_midnight(now)
+def current_host_time_ms() -> float:
+    return time.monotonic() * 1000.0
 
 
-def local_machine_ms_since_midnight(now: datetime | None = None) -> int:
-    now = datetime.now().astimezone() if now is None else now
-    # Protocol simplification: this is local time-of-day milliseconds and does
-    # not account for crossing midnight between App send and Server receive.
-    return (
-        now.hour * 60 * 60 * 1000
-        + now.minute * 60 * 1000
-        + now.second * 1000
-        + now.microsecond // 1000
-    )
-
-
-def audio_end_reset_local_machine_ms(
+def audio_end_reset_host_time_ms(
     *,
     reference_clock: ReferenceClock,
     audio_length_ms: int,
     reset_after_audio_end_ms: int,
-) -> int:
+) -> float:
     remaining_audio_ms = max(0, int(audio_length_ms) - int(reference_clock.ref_time_ms))
-    return int(reference_clock.local_computer_time_send_ms) + remaining_audio_ms + max(
-        0,
-        int(reset_after_audio_end_ms),
+    return float(reference_clock.local_host_time_send_ms) + remaining_audio_ms + max(
+        0.0,
+        float(reset_after_audio_end_ms),
     )
 
 
-def local_machine_ms_reached(deadline_ms: int, now_ms: int | None = None) -> bool:
-    now_ms = local_machine_ms_since_midnight() if now_ms is None else int(now_ms)
-    return now_ms >= int(deadline_ms)
+def host_time_ms_reached(deadline_ms: float, now_ms: float | None = None) -> bool:
+    now_ms = current_host_time_ms() if now_ms is None else float(now_ms)
+    return now_ms >= float(deadline_ms)
 
 
 def ws_status_log_payload(
@@ -983,7 +963,7 @@ def ws_status_log_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "event": "ws_status",
-        "local_machine_ms": local_machine_ms_since_midnight(),
+        "local_host_time_ms": current_host_time_ms(),
         "session_id": session_id,
         "from": from_status,
         "to": to_status,
@@ -1079,10 +1059,13 @@ def _required_int(message: Mapping[str, Any], key: str) -> int:
     return int(value)
 
 
-def _required_int_alias(message: Mapping[str, Any], *keys: str) -> int:
-    value = _optional_int_alias(message, *keys)
-    if value is None:
-        raise ProtocolError(f"{'/'.join(keys)} must be an integer")
+def _required_float(message: Mapping[str, Any], key: str) -> float:
+    value = message.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProtocolError(f"{key} must be numeric")
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ProtocolError(f"{key} must be finite and non-negative")
     return value
 
 

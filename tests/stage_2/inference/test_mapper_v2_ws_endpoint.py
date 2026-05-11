@@ -5,7 +5,6 @@ import tempfile
 import unittest
 import wave
 from collections.abc import AsyncIterator
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,15 +22,15 @@ from train.stage_2.inference.mapper_v2_ws_endpoint import (
     _handle_websocket_client,
     _mapper_v2_logits_fn,
     _time_shift_length_penalty_tensors,
-    audio_end_reset_local_machine_ms,
+    audio_end_reset_host_time_ms,
     audio_path_from_message,
     choose_decoder_window,
     clamp_decoder_window_to_audio,
+    current_host_time_ms,
     decoder_windows_until_audio_end,
     difficulty_from_message,
     infer_message_type,
-    local_machine_ms_reached,
-    local_computer_time_ms_since_midnight,
+    host_time_ms_reached,
     parse_json_message,
     reference_clock_from_message,
     ws_status_log_payload,
@@ -92,7 +91,7 @@ class MapperV2WsProtocolTests(unittest.TestCase):
     def test_infer_message_type_accepts_control_fallbacks(self) -> None:
         self.assertEqual(infer_message_type({"type": "audio_path"}), "audio_path")
         self.assertEqual(infer_message_type({"type": "audio"}), "audio")
-        self.assertEqual(infer_message_type({"type": "reference_ms"}), "reference_time")
+        self.assertEqual(infer_message_type({"type": "reference_time"}), "reference_time")
         self.assertEqual(infer_message_type({"control": "ready"}), "ready")
         self.assertEqual(infer_message_type({"control": "end_session"}), "stop")
         self.assertEqual(infer_message_type({"session_id": "s1", "audio_path": "/tmp/song.wav"}), "audio_path")
@@ -101,8 +100,8 @@ class MapperV2WsProtocolTests(unittest.TestCase):
             infer_message_type(
                 {
                     "session_id": "s1",
-                    "reference_ms": 100,
-                    "send_local_machine_ms": 200,
+                    "ref_time_ms": 100,
+                    "local_host_time_send_ms": 200.25,
                 },
             ),
             "reference_time",
@@ -119,37 +118,39 @@ class MapperV2WsProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "difficulty"):
             difficulty_from_message({"difficulty": 7.0}, default=4.0)
 
-    def test_local_time_ms_uses_local_time_of_day(self) -> None:
-        value = local_computer_time_ms_since_midnight(datetime(2026, 5, 10, 1, 2, 3, 456_000))
+    def test_current_host_time_ms_uses_monotonic_milliseconds(self) -> None:
+        first = current_host_time_ms()
+        second = current_host_time_ms()
 
-        self.assertEqual(value, 3_723_456)
+        self.assertGreaterEqual(first, 0.0)
+        self.assertGreaterEqual(second, first)
 
-    def test_reference_clock_accepts_app_alias_names(self) -> None:
+    def test_reference_clock_accepts_pulsefield_host_time(self) -> None:
         clock = reference_clock_from_message(
             {
                 "session_id": "s1",
-                "reference_ms": 1_000,
-                "send_local_machine_ms": 50_000,
+                "ref_time_ms": 1_000,
+                "local_host_time_send_ms": 50_000.25,
             },
         )
 
         self.assertEqual(clock.ref_time_ms, 1_000)
-        self.assertEqual(clock.local_computer_time_send_ms, 50_000)
+        self.assertEqual(clock.local_host_time_send_ms, 50_000.25)
 
-    def test_audio_end_reset_deadline_uses_sent_clock_and_reference_audio_ms(self) -> None:
-        deadline = audio_end_reset_local_machine_ms(
+    def test_audio_end_reset_deadline_uses_sent_host_time_and_ref_time_ms(self) -> None:
+        deadline = audio_end_reset_host_time_ms(
             reference_clock=ReferenceClock(
                 ref_time_ms=1_000,
-                local_computer_time_send_ms=50_000,
-                received_local_computer_time_ms=50_250,
+                local_host_time_send_ms=50_000.25,
+                received_local_host_time_ms=50_250.25,
             ),
             audio_length_ms=10_000,
             reset_after_audio_end_ms=2_000,
         )
 
-        self.assertEqual(deadline, 61_000)
-        self.assertFalse(local_machine_ms_reached(deadline, now_ms=60_999))
-        self.assertTrue(local_machine_ms_reached(deadline, now_ms=61_000))
+        self.assertEqual(deadline, 61_000.25)
+        self.assertFalse(host_time_ms_reached(deadline, now_ms=61_000.0))
+        self.assertTrue(host_time_ms_reached(deadline, now_ms=61_000.25))
 
     def test_ws_status_log_payload_includes_status_transition(self) -> None:
         payload = ws_status_log_payload(
@@ -157,23 +158,24 @@ class MapperV2WsProtocolTests(unittest.TestCase):
             from_status="audio_ready",
             to_status="streaming",
             reason="reference_time",
-            reference_audio_ms=1_234,
-            reset_local_machine_ms=90_000,
+            ref_time_ms=1_234,
+            reset_local_host_time_ms=90_000.25,
         )
 
         self.assertEqual(payload["event"], "ws_status")
+        self.assertIn("local_host_time_ms", payload)
         self.assertEqual(payload["session_id"], "s1")
         self.assertEqual(payload["from"], "audio_ready")
         self.assertEqual(payload["to"], "streaming")
         self.assertEqual(payload["reason"], "reference_time")
-        self.assertEqual(payload["reference_audio_ms"], 1_234)
-        self.assertEqual(payload["reset_local_machine_ms"], 90_000)
+        self.assertEqual(payload["ref_time_ms"], 1_234)
+        self.assertEqual(payload["reset_local_host_time_ms"], 90_000.25)
 
     def test_choose_decoder_window_rounds_up_to_later_control_window(self) -> None:
         clock = ReferenceClock(
             ref_time_ms=1_234,
-            local_computer_time_send_ms=10_000,
-            received_local_computer_time_ms=10_500,
+            local_host_time_send_ms=10_000.0,
+            received_local_host_time_ms=10_500.0,
         )
 
         window = choose_decoder_window(
@@ -186,8 +188,8 @@ class MapperV2WsProtocolTests(unittest.TestCase):
     def test_choose_decoder_window_keeps_exact_later_boundary(self) -> None:
         clock = ReferenceClock(
             ref_time_ms=5_500,
-            local_computer_time_send_ms=10_000,
-            received_local_computer_time_ms=10_500,
+            local_host_time_send_ms=10_000.0,
+            received_local_host_time_ms=10_500.0,
         )
 
         window = choose_decoder_window(
@@ -348,7 +350,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "type": "reference_time",
                 "session_id": "s1",
                 "ref_time_ms": 1_234,
-                "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+                "local_host_time_send_ms": current_host_time_ms(),
             },
             peer,
         )
@@ -396,7 +398,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "type": "reference_time",
                 "session_id": "s1",
                 "ref_time_ms": 1_234,
-                "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+                "local_host_time_send_ms": current_host_time_ms(),
             },
             DisconnectingPeer(),
         )
@@ -477,7 +479,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "type": "reference_time",
                     "session_id": "s1",
                     "ref_time_ms": 0,
-                    "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+                    "local_host_time_send_ms": current_host_time_ms(),
                 },
                 peer,
             )
@@ -531,7 +533,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "type": "reference_time",
                 "session_id": "s1",
                 "ref_time_ms": 0,
-                "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+                "local_host_time_send_ms": current_host_time_ms(),
                 "difficulty": 3.0,
             },
             peer,
@@ -647,7 +649,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
                 "type": "reference_time",
                 "session_id": "s1",
                 "ref_time_ms": 0,
-                "local_computer_time_send_ms": local_computer_time_ms_since_midnight(),
+                "local_host_time_send_ms": current_host_time_ms(),
             },
             peer,
         )
@@ -665,7 +667,7 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         endpoint = InferenceEndpoint(config=config, backend=FakeInferenceBackend())
         peer = FakePeer()
-        now_ms = local_computer_time_ms_since_midnight()
+        now_ms = current_host_time_ms()
 
         await endpoint.handle_message({"control": "ready"}, peer)
         await endpoint.handle_message(
@@ -679,8 +681,8 @@ class MapperV2WsEndpointTests(unittest.IsolatedAsyncioTestCase):
         await endpoint.handle_message(
             {
                 "session_id": "s1",
-                "reference_audio_ms": 1,
-                "send_local_machine_ms": now_ms,
+                "ref_time_ms": 1,
+                "local_host_time_send_ms": now_ms,
             },
             peer,
         )
