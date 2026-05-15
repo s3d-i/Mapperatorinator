@@ -15,6 +15,7 @@ mania-dataset/*
 train/artifacts/cache/
 train/artifacts/reports/
 train/artifacts/runs/
+train/artifacts/inference/mapper_v2_step*_random*/
 train/artifacts/splits/
 train/artifacts/timing_diagnostics/*.json
 train/artifacts/features/control_timeseries_4k_no_timing_anomalies_2to6.parquet
