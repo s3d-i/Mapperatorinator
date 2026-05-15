@@ -919,6 +919,10 @@ def collate_mapper_v1_windows(samples: Sequence[dict[str, Any]], *, pad_id: int 
         ).reshape(batch_size),
         "metadata": [sample.get("metadata", {}) for sample in samples],
     }
+    if all("chart_end_ms" in sample for sample in samples):
+        batch["chart_end_ms"] = torch.stack(
+            [sample["chart_end_ms"].to(dtype=torch.long) for sample in samples],
+        ).reshape(batch_size)
 
     has_control_teacher_cache = [
         "control_memory_8s" in sample or "density_teacher_8s" in sample

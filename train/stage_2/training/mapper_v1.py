@@ -135,6 +135,7 @@ MAPPER_BATCH_TENSOR_KEYS = frozenset(
         "control_memory_padding_mask_8s",
         "write_start_ms",
         "write_end_ms",
+        "chart_end_ms",
         "is_full_chart_start",
         "is_full_chart_end",
         "difficulty",
